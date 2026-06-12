@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/tripolskypetr/volume-anomaly/raw/master/assets/logo.png" height="115px" alt="pump-anomaly" />
+  <img src="https://github.com/tripolskypetr/pump-anomaly/raw/master/assets/logo.png" height="115px" alt="pump-anomaly" />
 </p>
 
 <p align="center">

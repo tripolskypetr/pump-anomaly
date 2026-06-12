@@ -1,5 +1,5 @@
 import { Direction } from "./types";
-import { GetCandles, alignTs } from "./candle";
+import { GetCandles, alignTs, ICandleData } from "./candle";
 import { ExitParams, replayExit, ReplayResult } from "./replay";
 
 /**
@@ -37,7 +37,17 @@ export async function labelBurst(
   const maxLife = Math.max(...exitSets.map((e) => e.staleMinutes));
   const since = alignTs(ts, "1m");
   const limit = maxLife * 2 + 5; // запас на поиск входа в зону
-  const candles = await getCandles(symbol, "1m", limit, since);
+
+  // getCandles может бросить (look-ahead guard на хвосте истории, дыры в данных
+  // символа — частое у меме-коинов с делистингом/паузами торгов, строгий count-match
+  // адаптера). Тогда этот кандидат НЕ размечается и пропускается — но обучение в целом
+  // не падает. Один битый символ не должен ронять весь fit.
+  let candles: ICandleData[];
+  try {
+    candles = await getCandles(symbol, "1m", limit, since);
+  } catch {
+    return null;
+  }
   if (!candles || candles.length === 0) return null;
 
   const from = entryFromPrice ?? candles[0].open;
@@ -45,11 +55,18 @@ export async function labelBurst(
 
   const byExit = new Map<string, ReplayResult>();
   for (const ex of exitSets) {
-    byExit.set(exitKey(ex), replayExit(candles, direction, from, to, ex));
+    const r = replayExit(candles, direction, from, to, ex);
+    // отбрасываем метку с НЕПОЛНЫМ горизонтом: в боковике вход случился поздно,
+    // и после него не хватило свечей на полный life-cap. Иначе 24ч-горизонт
+    // сравнивался бы с 1ч-горизонтом по обрезанному до пары часов пути — это
+    // прямо корраптит impactHorizonMinutes (главный исследовательский выход).
+    // no-entry (entered=false без truncated) сохраняем — это валидная метка «не вошли».
+    if (r.truncated && r.entered) continue;
+    byExit.set(exitKey(ex), r);
   }
 
   const anyEntered = [...byExit.values()].some((r) => r.entered);
-  if (!anyEntered) return null;
+  if (byExit.size === 0 || !anyEntered) return null;
 
   return { symbol, direction, ts, byExit };
 }

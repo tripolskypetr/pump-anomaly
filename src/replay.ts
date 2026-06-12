@@ -61,6 +61,8 @@ export interface ReplayResult {
   volRegime: VolRegime;
   /** была ли позиция инвертирована (policy=invert сработал) */
   inverted: boolean;
+  /** замер горизонта неполный: после входа не хватило свечей на полный life-cap */
+  truncated: boolean;
 }
 
 const signed = (entry: number, price: number, dir: Direction): number =>
@@ -99,7 +101,7 @@ export function replayExit(
   if (entryIdx < 0 || !(entryPrice > 0)) {
     return {
       pnl: 0, reason: "no-entry", peak: 0, heldMinutes: 0, entered: false,
-      volZ: 0, squeezePressure: 0, volRegime: "calm", inverted: false,
+      volZ: 0, squeezePressure: 0, volRegime: "calm", inverted: false, truncated: false,
     };
   }
 
@@ -117,7 +119,7 @@ export function replayExit(
   if (p.squeezePolicy === "veto" && sqPressure >= sqThr) {
     return {
       pnl: 0, reason: "cascade-veto", peak: 0, heldMinutes: 0, entered: false,
-      volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+      volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated: false,
     };
   }
 
@@ -151,7 +153,13 @@ export function replayExit(
   let peakMinute = 0;          // минута достижения пика
   let lastPositivePeak = 0;    // последний плюсовой пик — к нему откатываем при hard-stop
 
-  const lifeCap = Math.min(p.staleMinutes, candles.length - entryIdx - 1);
+  const forwardAvail = candles.length - entryIdx - 1;
+  const lifeCap = Math.min(p.staleMinutes, forwardAvail);
+  // Боковик/край данных: если после входа осталось МЕНЬШЕ свечей, чем требует
+  // life-cap, замер горизонта неполный. Помечаем — labelBurst отбросит такую метку,
+  // чтобы не сравнивать 24ч-горизонт по обрезанному до пары часов пути.
+  // Допуск 5% — мелкая нехватка в конце не критична.
+  const truncated = forwardAvail < p.staleMinutes * 0.95;
 
   for (let k = 0; k <= lifeCap; k++) {
     const c = candles[entryIdx + k];
@@ -173,7 +181,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
 
@@ -194,7 +202,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
 
@@ -206,7 +214,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
   }
@@ -221,6 +229,6 @@ export function replayExit(
     peak,
     heldMinutes: lifeCap,
     entered: true,
-    volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+    volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
   };
 }

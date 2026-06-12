@@ -1,5 +1,6 @@
 import { Direction } from "./types";
 import { GetCandles, alignTs, ICandleData } from "./candle";
+import { fetchCandlesChunked } from "./chunked-candles";
 import { ExitParams, replayExit, ReplayResult } from "./replay";
 
 /**
@@ -44,7 +45,7 @@ export async function labelBurst(
   // не падает. Один битый символ не должен ронять весь fit.
   let candles: ICandleData[];
   try {
-    candles = await getCandles(symbol, "1m", limit, since);
+    candles = await fetchCandlesChunked(getCandles, symbol, "1m", limit, since);
   } catch {
     return null;
   }

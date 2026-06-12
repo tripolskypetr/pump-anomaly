@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  Demons to some angels to others
+  <b>Demons to some angels to others</b>
 </p>
 
 ## Overview

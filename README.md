@@ -12,6 +12,8 @@
 
 ## Overview
 
+> **Emergency!** `The box. You opened it. We Came.` - Be aware of meeting a tax officers or telegram channel owner
+
 A black box for detecting **synchronized pump signals** in a stream of trading recommendations from Telegram channels, and turning that detection into a ready-to-execute trade plan.
 
 It solves three problems:

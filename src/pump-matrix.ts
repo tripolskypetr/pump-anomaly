@@ -210,7 +210,7 @@ export class PumpMatrix {
     const probe = resolveExit(this.params.exit, v.source, ch, v.symbol, dir, "calm");
     const volZThr = probe.exit.volZThreshold ?? 2.0;
     const baseWin = probe.exit.volBaselineWindow ?? 20;
-    const horizon = probe.exit.staleMinutes;
+    const horizon = probe.exit.cascadeWindowMinutes ?? probe.exit.staleMinutes;
 
     let sqPressure: number | null = null;
     if (candles && candles.length > 0) {

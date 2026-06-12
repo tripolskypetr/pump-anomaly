@@ -19,7 +19,7 @@ export interface LabeledBurst {
 /** Стабильный строковый ключ exit-набора для кэша/grid. */
 export const exitKey = (p: ExitParams): string =>
   `tt${p.trailingTake}|hs${p.hardStop}|sp${p.stalenessSinceProfit}|sm${p.stalenessSinceMinutes}|life${p.staleMinutes}` +
-  `|vz${p.volZThreshold ?? "_"}|pol${p.squeezePolicy ?? "none"}|sqt${p.squeezeThreshold ?? "_"}|bw${p.volBaselineWindow ?? "_"}`;
+  `|vz${p.volZThreshold ?? "_"}|pol${p.squeezePolicy ?? "none"}|sqt${p.squeezeThreshold ?? "_"}|bw${p.volBaselineWindow ?? "_"}|cw${p.cascadeWindowMinutes ?? "_"}`;
 
 /**
  * Достаёт 1m-свечи от события вперёд на покрытие максимального life-cap и

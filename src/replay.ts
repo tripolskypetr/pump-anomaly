@@ -33,6 +33,14 @@ export interface ExitParams {
   squeezeThreshold?: number;
   /** множитель ужатия trailing при policy="tighten" (0.5 = вдвое туже) */
   tightenFactor?: number;
+  /**
+   * Окно детекции каскада ликвидаций в минутах — НЕЗАВИСИМО от staleMinutes.
+   * Сквиз/каскад это БЫСТРОЕ событие (минуты), его нельзя мерить на 24ч-горизонте
+   * удержания: длинное окно размывает резкий разворот. Раньше брался staleMinutes,
+   * что связывало два несвязанных концерна (жизнь позиции и окно детектора).
+   * Если не задано — fallback на staleMinutes (обратная совместимость).
+   */
+  cascadeWindowMinutes?: number;
 }
 
 export type ExitReason =
@@ -108,7 +116,9 @@ export function replayExit(
   // ── объёмные признаки на входе (симметрично для long/short) ──
   const baseWin = p.volBaselineWindow ?? 20;
   const volZThr = p.volZThreshold ?? 2.0;
-  const sqHorizon = p.staleMinutes;
+  // окно детекции каскада — СВОЁ, не life-cap. Сквиз быстрый: мерить его на всём
+  // горизонте удержания неверно (длинное окно размывает резкий разворот).
+  const sqHorizon = p.cascadeWindowMinutes ?? p.staleMinutes;
   const volZ = volumeZScore(candles, entryIdx, baseWin);
   const sqPressure = squeezePressureFn(candles, entryIdx, dir, sqHorizon);
   const volRegime = volRegimeOf(volZ, volZThr);

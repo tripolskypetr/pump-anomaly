@@ -52,6 +52,11 @@ export interface TrainGrid {
   /** baseline-окно для volZ (свечей до входа) */
   volBaselineWindow: number[];
   /**
+   * Окно детекции каскада в минутах — НЕЗАВИСИМО от staleMinutes. Сквиз быстрый,
+   * окно должно быть коротким (минуты). Перебирается отдельно от горизонта удержания.
+   */
+  cascadeWindowMinutes: number[];
+  /**
    * Окно стационарности, мс: на длинном горизонте статистики (τ, author-матрица)
    * считаются по локальному окну, а не по всей истории. Infinity = вся история.
    * train перебирает варианты и выбирает по CV.
@@ -73,6 +78,7 @@ export const DEFAULT_GRID: TrainGrid = {
   squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
   squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
   volBaselineWindow: [20],
+  cascadeWindowMinutes: [15, 30, 60], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
   // вся история + конечные окна (4 / 8 недель); train выберет по CV
   stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
 };
@@ -222,12 +228,14 @@ export async function train(
               for (const pol of grid.squeezePolicy)
                 for (const sqt of grid.squeezeThreshold)
                   for (const bw of grid.volBaselineWindow)
-                    exitSets.push({
-                      trailingTake: tt, hardStop: hs,
-                      stalenessSinceProfit: sp, stalenessSinceMinutes: sm, staleMinutes: life,
-                      volZThreshold: vz, squeezePolicy: pol,
-                      squeezeThreshold: sqt, volBaselineWindow: bw,
-                    });
+                    for (const cw of grid.cascadeWindowMinutes)
+                      exitSets.push({
+                        trailingTake: tt, hardStop: hs,
+                        stalenessSinceProfit: sp, stalenessSinceMinutes: sm, staleMinutes: life,
+                        volZThreshold: vz, squeezePolicy: pol,
+                        squeezeThreshold: sqt, volBaselineWindow: bw,
+                        cascadeWindowMinutes: cw,
+                      });
 
   // кэш: ключ кластеризации → размеченные всплески.
   // храним полный ReplayResult (нужен volRegime + entered для tensor и veto-метрики).

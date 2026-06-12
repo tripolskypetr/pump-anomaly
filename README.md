@@ -1,4 +1,4 @@
-# 📦 Pump Anomaly
+# 🧿 Pump Anomaly
 
 > Pump signals detection · Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection.
 

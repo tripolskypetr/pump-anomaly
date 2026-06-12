@@ -132,7 +132,7 @@ export {
   volumeZScore, squeezePressure, volumeFeatures, volRegimeOf,
 } from "./volume";
 export type { VolumeFeatures, VolRegime } from "./volume";
-export { shrinkageExpectancy, winrate, percentile, riskRewardStats } from "./objective";
+export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect } from "./objective";
 export type { RiskRewardStats } from "./objective";
 export {
   computeReliability,

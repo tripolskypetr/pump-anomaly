@@ -22,6 +22,56 @@ export function winrate(returns: number[]): number {
 }
 
 /**
+ * Стандартная ошибка среднего по фолдам: SE = std(foldScores) / sqrt(n).
+ * std — выборочное (делитель n-1). При n<2 SE=0 (разброс не оценить).
+ */
+export function standardError(foldScores: number[]): number {
+  const n = foldScores.length;
+  if (n < 2) return 0;
+  const mean = foldScores.reduce((s, x) => s + x, 0) / n;
+  const variance = foldScores.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1);
+  return Math.sqrt(variance) / Math.sqrt(n);
+}
+
+/**
+ * One-standard-error rule (Breiman 1984) — против winner's curse при grid-search.
+ *
+ * Проблема: argmax по CV-score из N конфигураций систематически завышен — максимум
+ * шумных оценок смещён вверх на ~sigma·sqrt(2·ln N) даже при истинном edge=0. Чем
+ * больше grid, тем сильнее переобучение на шум выборки.
+ *
+ * Правило: берём НЕ максимум, а самую КОНСЕРВАТИВНУЮ конфигурацию среди тех, чей
+ * score в пределах 1 SE от максимума. Разница внутри 1 SE статистически незначима
+ * (внутри шума), поэтому вместо счастливого выброса выбираем робастную конфигурацию.
+ *
+ * @param entries    кандидаты
+ * @param scoreOf    извлечь CV-score кандидата
+ * @param foldsOf    извлечь fold-scores кандидата (для SE максимума)
+ * @param isSimpler  компаратор «a консервативнее b» (true → предпочесть a)
+ */
+export function oneStandardErrorSelect<T>(
+  entries: T[],
+  scoreOf: (e: T) => number,
+  foldsOf: (e: T) => number[],
+  isSimpler: (a: T, b: T) => boolean,
+): T | null {
+  if (entries.length === 0) return null;
+  let best = entries[0];
+  for (const e of entries) if (scoreOf(e) > scoreOf(best)) best = e;
+
+  // SE по фолдам ПОБЕДИТЕЛЯ — разброс его собственной оценки
+  const se = standardError(foldsOf(best));
+  const threshold = scoreOf(best) - se;
+
+  let chosen = best;
+  for (const e of entries) {
+    if (scoreOf(e) < threshold) continue;       // вне коридора 1 SE
+    if (isSimpler(e, chosen)) chosen = e;        // консервативнее → берём
+  }
+  return chosen;
+}
+
+/**
  * Перцентиль p (0..1) по выборке методом линейной интерполяции (type-7, как в numpy).
  * percentile([...], 0.95) = P95. Пустая выборка → 0.
  */

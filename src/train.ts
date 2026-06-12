@@ -18,7 +18,7 @@ import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect } from "./objective";
 import {
   computeReliability,
   Reliability,
@@ -332,7 +332,7 @@ export async function train(
   type Entry = {
     config: DetectorConfig; exit: ExitParams;
     cvScore: number; cvWinrate: number; cvSupport: number;
-    _foldMeans: number[]; _foldSizes: number[]; _returns: number[];
+    _foldMeans: number[]; _foldSizes: number[]; _returns: number[]; _foldScores: number[];
   };
   const board: Entry[] = [];
 
@@ -357,7 +357,7 @@ export async function train(
             const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode, sw);
             if (selected.length === 0) {
               board.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0,
-                _foldMeans: [], _foldSizes: [], _returns: [] });
+                _foldMeans: [], _foldSizes: [], _returns: [], _foldScores: [] });
               continue;
             }
             const foldSpecs = timeSeriesFolds(selected.length, folds);
@@ -377,15 +377,46 @@ export async function train(
               cvScore: +avg(foldScores).toFixed(6),
               cvWinrate: +avg(foldWins).toFixed(6),
               cvSupport: +avg(foldSupp).toFixed(2),
-              _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet,
+              _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet, _foldScores: foldScores,
             });
           }
         scoreDone++;
         progress({ done: scoreDone, total: scoreTotal, phase: "score", label: `${wK}|${jac}|${lag}|${sw === Infinity ? "all" : sw}` });
       }
 
+  // ── выбор победителя: one-standard-error rule (против winner's curse) ──
+  // вместо argmax по cvScore берём самую КОНСЕРВАТИВНУЮ конфигурацию среди тех,
+  // чей score в пределах 1 SE от максимума. Это убирает переобучение на шум grid:
+  // разница внутри 1 SE статистически незначима, поэтому robustness > удача.
+  //
+  // «Консервативнее» для трейдинга = меньше риска и экспозиции, при равенстве — проще:
+  //   1) меньший hardStop (меньше риск на сделку)
+  //   2) короче staleMinutes (меньше время в позиции)
+  //   3) более мягкая реакция на каскад (none < tighten < veto < invert по агрессии)
+  //   4) детерминированный tie-break по cvScore (стабильность выбора)
+  const policyAggression: Record<string, number> = { none: 0, tighten: 1, veto: 2, invert: 3 };
+  const conservatismKey = (e: Entry): number[] => [
+    e.exit.hardStop,
+    e.exit.staleMinutes,
+    policyAggression[e.exit.squeezePolicy ?? "none"] ?? 0,
+    -e.cvScore, // при полном равенстве — выше score (меньше отрицание)
+  ];
+  const isSimpler = (a: Entry, b: Entry): boolean => {
+    const ka = conservatismKey(a), kb = conservatismKey(b);
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] < kb[i]) return true;
+      if (ka[i] > kb[i]) return false;
+    }
+    return false;
+  };
+  const top = oneStandardErrorSelect(
+    board,
+    (e) => e.cvScore,
+    (e) => e._foldScores,
+    isSimpler,
+  )!;
+  // board всё равно сортируем по score — для отчёта/аудита (gridSize, диагностика)
   board.sort((a, b) => b.cvScore - a.cvScore);
-  const top = board[0];
 
   const reliability = computeReliability(
     { foldMeans: top._foldMeans, foldSizes: top._foldSizes, allReturns: top._returns },

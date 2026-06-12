@@ -406,11 +406,17 @@ export async function train(
   type DirCell = Partial<Record<"long" | "short", Partial<Record<import("./volume").VolRegime, ExitParams>>>>;
   const cells: Record<string, Record<string, DirCell>> = {};
 
+  // ключ канала для ячейки: в matrix-режиме всплеск МЕЖКАНАЛЬНЫЙ (нет одного
+  // владельца), поэтому ячейки кладём под канонический "_matrix" — ровно тот ключ,
+  // которым их потом ищет buildPlan для matrix-вердиктов (у них channel=null).
+  // В single-режиме канал реальный — exit персонален каналу.
+  const cellChannel = (realChannel: string) => effMode === "matrix" ? "_matrix" : realChannel;
+
   // группировка
   const group = new Map<string, Labeled[]>(); // key = channel|symbol|direction
   const groupSD = new Map<string, Labeled[]>(); // key = symbol|direction
   for (const b of winSelected) {
-    const gk = `${b.channel}\u0001${b.symbol}\u0001${b.direction}`;
+    const gk = `${cellChannel(b.channel)}\u0001${b.symbol}\u0001${b.direction}`;
     (group.get(gk) ?? group.set(gk, []).get(gk)!).push(b);
     const sk = `${b.symbol}\u0001${b.direction}`;
     (groupSD.get(sk) ?? groupSD.set(sk, []).get(sk)!).push(b);

@@ -63,11 +63,12 @@ export interface TradePlan {
   /** доля объёма против позиции (из свечей) или null */
   squeezePressure: number | null;
   /**
-   * Итоговая рекомендация с учётом каскада:
-   *   "enter"  — входить по плану,
-   *   "tighten"— входить, но trailing ужат (squeezePolicy=tighten сработал),
-   *   "veto"   — НЕ входить (squeezePolicy=veto, обнаружен каскад ликвидаций).
-   * Без свечей всегда "enter" (каскад не оценить).
+   * Итоговая рекомендация с учётом каскада ликвидаций:
+   *   "enter"   — входить по плану в direction,
+   *   "tighten" — входить, но trailing уже ужат (squeezePolicy=tighten сработал),
+   *   "veto"    — НЕ входить (squeezePolicy=veto, обнаружен каскад),
+   *   "invert"  — войти ПРОТИВ поста (squeezePolicy=invert): direction уже развёрнут.
+   * Каскад оценивается только при наличии свечей (squeezePressure). Без свечей — "enter".
    */
   recommendation: "enter" | "tighten" | "veto" | "invert";
   /** доверие к самой модели на момент обучения (0..1) */

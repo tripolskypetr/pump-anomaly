@@ -12,7 +12,7 @@
 
 ## Overview
 
-> **Emergency!** `The box. You opened it. We Came.` — Be aware of meeting a tax officers or telegram channel owner
+> **Emergency!** [The box. You opened it. We Came.](https://hellraiser.fandom.com/wiki/Lament_Configuration) — Be aware of meeting the Tax Officers or Telegram channel owner
 
 A black box for detecting **synchronized pump signals** in a stream of trading recommendations from Telegram channels, and turning that detection into a ready-to-execute trade plan.
 

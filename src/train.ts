@@ -13,6 +13,7 @@ import { lagXCorr } from "./layers/lag-xcorr";
 import { clusterAuthors } from "./layers/cluster-authors";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
 import { ViabilityConfig } from "./types";
+import { ProgressFn, silentProgress } from "./progress";
 import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
@@ -44,7 +45,7 @@ export interface TrainGrid {
   /** порог volZ для разметки calm/anomalous — эмпирически */
   volZThreshold: number[];
   /** политика реакции на каскад: train выберет по CV (или зафиксируй параметром) */
-  squeezePolicy: Array<"none" | "tighten" | "veto">;
+  squeezePolicy: Array<"none" | "tighten" | "veto" | "invert">;
   /** порог squeezePressure для срабатывания policy */
   squeezeThreshold: number[];
   /** baseline-окно для volZ (свечей до входа) */
@@ -62,7 +63,7 @@ export const DEFAULT_GRID: TrainGrid = {
   stalenessSinceMinutes: [240],
   staleMinutes: [60, 240, 720, 1440], // 1ч / 4ч / 12ч / 24ч — какой импакт-горизонт лучше
   volZThreshold: [1.5, 2.5],          // когда считать объём аномальным (накопление топлива)
-  squeezePolicy: ["none", "tighten", "veto"], // train выберет реакцию по CV
+  squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
   squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
   volBaselineWindow: [20],
 };
@@ -81,6 +82,8 @@ export interface TrainOptions {
   mode?: "auto" | "matrix" | "single";
   /** переопределение порогов жизнеспособности матрицы (auto-режим) */
   viability?: Partial<ViabilityConfig>;
+  /** колбэк прогресса обучения (по умолчанию тихо; передай stdoutProgress для бара) */
+  onProgress?: ProgressFn;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -208,7 +211,10 @@ export async function train(
   const labeledCache = new Map<string, Labeled[]>();
   const seenCluster = new Set<string>();
 
-  const labelCandidates = async (cands: ReturnType<typeof enumerateBursts>): Promise<Labeled[]> => {
+  const labelCandidates = async (
+    cands: ReturnType<typeof enumerateBursts>,
+    onTick?: (symbol: string) => void,
+  ): Promise<Labeled[]> => {
     const labeled: Labeled[] = [];
     for (const b of cands) {
       const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
@@ -216,6 +222,7 @@ export async function train(
         getCandles, b.symbol, b.direction, b.ts, exitSets,
         src?.entryFromPrice, src?.entryToPrice,
       );
+      onTick?.(b.symbol);
       if (!lb) continue;
       const byExit = new Map<string, { pnl: number; volRegime: import("./volume").VolRegime; entered: boolean }>();
       // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
@@ -234,25 +241,50 @@ export async function train(
     return labeled;
   };
 
+  // ── фаза разметки с прогрессом ──
+  // предварительно перечисляем кандидатов по каждому ключу кластеризации (дёшево,
+  // pure CPU без IO), чтобы знать ГЛОБАЛЬНЫЙ total медленных labelBurst-вызовов.
+  const progress = opts.onProgress ?? silentProgress;
+  type Pass = { ckey: string; skey?: string; cands: ReturnType<typeof enumerateBursts> };
+  const passes: Pass[] = [];
   for (const wK of grid.windowK)
     for (const jac of grid.jaccardThreshold)
       for (const lag of grid.lagPeakThreshold) {
         const ckey = `${wK}|${jac}|${lag}`;
         if (seenCluster.has(ckey)) continue;
         seenCluster.add(ckey);
-        let labeled: Labeled[];
         if (effMode === "single") {
-          // кандидаты зависят только от окна (windowK), не от jac/lag
           const skey = `single|${wK}`;
-          if (!labeledCache.has(skey)) {
-            labeledCache.set(skey, await labelCandidates(enumeratePosts(items, wK, maxBurstWindowMs)));
-          }
-          labeled = labeledCache.get(skey)!;
+          if (labeledCache.has(`__enum_${skey}`)) { passes.push({ ckey, skey, cands: [] }); continue; }
+          labeledCache.set(`__enum_${skey}`, []); // маркер «уже перечислили»
+          passes.push({ ckey, skey, cands: enumeratePosts(items, wK, maxBurstWindowMs) });
         } else {
-          labeled = await labelCandidates(enumerateBursts(items, wK, jac, lag, maxBurstWindowMs));
+          passes.push({ ckey, cands: enumerateBursts(items, wK, jac, lag, maxBurstWindowMs) });
         }
-        labeledCache.set(ckey, labeled);
       }
+  labeledCache.clear();
+  seenCluster.clear();
+
+  const totalTicks = passes.reduce((s, p) => s + p.cands.length, 0);
+  let doneTicks = 0;
+  const tick = (symbol: string) => {
+    doneTicks++;
+    progress({ done: doneTicks, total: totalTicks, phase: "label", label: symbol });
+  };
+
+  for (const p of passes) {
+    let labeled: Labeled[];
+    if (p.skey) {
+      if (!labeledCache.has(p.skey)) {
+        labeledCache.set(p.skey, await labelCandidates(p.cands, tick));
+      }
+      labeled = labeledCache.get(p.skey)!;
+    } else {
+      labeled = await labelCandidates(p.cands, tick);
+    }
+    labeledCache.set(p.ckey, labeled);
+  }
+  if (totalTicks > 0) progress({ done: totalTicks, total: totalTicks, phase: "label", label: "done" });
 
   // grid: детектор × exit, CV-score под K-fold
   // в single-режиме minClusters не применяется (всегда 1) — кандидаты уже все посты
@@ -263,6 +295,10 @@ export async function train(
     _foldMeans: number[]; _foldSizes: number[]; _returns: number[];
   };
   const board: Entry[] = [];
+
+  // total для фазы score = число (wK×jac×lag) комбинаций (тик на каждую)
+  const scoreTotal = grid.windowK.length * grid.jaccardThreshold.length * grid.lagPeakThreshold.length;
+  let scoreDone = 0;
 
   for (const wK of grid.windowK)
     for (const jac of grid.jaccardThreshold)
@@ -302,6 +338,8 @@ export async function train(
               _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet,
             });
           }
+        scoreDone++;
+        progress({ done: scoreDone, total: scoreTotal, phase: "score", label: `${wK}|${jac}|${lag}` });
       }
 
   board.sort((a, b) => b.cvScore - a.cvScore);

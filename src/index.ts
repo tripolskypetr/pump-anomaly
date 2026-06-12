@@ -42,9 +42,11 @@ function normalize(items: ParserItem[]): SignalEvent[] {
  * Два режима отбора входов (config.mode):
  *   - "matrix": вход = синхронный всплеск независимых кластеров-авторов.
  *   - "single": fallback — каждый пост = вход, исход решает обученный exit.
- *   - "auto":   ≥2 каналов и матрица дала сигналы → matrix, иначе → single.
+ *   - "auto":   матрица только если корреляция жизнеспособна, иначе single.
  *
- * Слой выхода (trailing/hardStop) один на оба режима — меняется только условие входа.
+ * Exit НЕ единый: подбирается отдельно под каждую ячейку тензора
+ * [mode][channel][symbol][direction][volRegime] — математика разных источников
+ * не смешивается (matrix/single, long/short, calm/anomalous — свои критерии).
  */
 export function predict(
   parserItems: ParserItem[],
@@ -144,4 +146,6 @@ export type {
   TrainResult,
 } from "./train";
 export { PumpMatrix } from "./pump-matrix";
-export type { TradePlan } from "./pump-matrix";
+export type { TradePlan, RuntimeOptions } from "./pump-matrix";
+export { stdoutProgress, silentProgress } from "./progress";
+export type { ProgressFn, ProgressEvent } from "./progress";

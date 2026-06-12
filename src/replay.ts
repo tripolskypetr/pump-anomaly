@@ -28,7 +28,7 @@ export interface ExitParams {
   /** порог volZ для разметки режима calm/anomalous */
   volZThreshold?: number;
   /** политика реакции на каскад: tighten (туже trailing) | veto (не входить) | none */
-  squeezePolicy?: "none" | "tighten" | "veto";
+  squeezePolicy?: "none" | "tighten" | "veto" | "invert";
   /** порог squeezePressure, выше которого срабатывает policy */
   squeezeThreshold?: number;
   /** множитель ужатия trailing при policy="tighten" (0.5 = вдвое туже) */
@@ -41,6 +41,7 @@ export type ExitReason =
   | "peak-staleness"
   | "life-cap"
   | "cascade-veto"
+  | "invert"
   | "no-entry";
 
 export interface ReplayResult {
@@ -58,6 +59,8 @@ export interface ReplayResult {
   squeezePressure: number;
   /** режим объёма на входе: calm | anomalous */
   volRegime: VolRegime;
+  /** была ли позиция инвертирована (policy=invert сработал) */
+  inverted: boolean;
 }
 
 const signed = (entry: number, price: number, dir: Direction): number =>
@@ -96,7 +99,7 @@ export function replayExit(
   if (entryIdx < 0 || !(entryPrice > 0)) {
     return {
       pnl: 0, reason: "no-entry", peak: 0, heldMinutes: 0, entered: false,
-      volZ: 0, squeezePressure: 0, volRegime: "calm",
+      volZ: 0, squeezePressure: 0, volRegime: "calm", inverted: false,
     };
   }
 
@@ -114,6 +117,24 @@ export function replayExit(
   if (p.squeezePolicy === "veto" && sqPressure >= sqThr) {
     return {
       pnl: 0, reason: "cascade-veto", peak: 0, heldMinutes: 0, entered: false,
+      volZ, squeezePressure: sqPressure, volRegime, inverted: false,
+    };
+  }
+
+  // INVERT: каскад уверенно сносит толпу в обратную сторону (stop hunt из 1028592).
+  // Вместо защиты — заходим ПРОТИВ поста и снимаем сам сквиз. Метку ставит replay
+  // противоположного направления из той же точки; exit берётся из инверс-ячейки тензора.
+  if (p.squeezePolicy === "invert" && sqPressure >= sqThr) {
+    const opposite: Direction = dir === "long" ? "short" : "long";
+    // прогон без повторной инверсии (policy=none), чтобы не зациклиться
+    const inv = replayExit(candles, opposite, entryFrom, entryTo, {
+      ...p, squeezePolicy: "none",
+    });
+    return {
+      ...inv,
+      reason: inv.entered ? "invert" : inv.reason,
+      inverted: inv.entered,
+      // объёмные признаки оставляем от исходного входа (они про сам каскад)
       volZ, squeezePressure: sqPressure, volRegime,
     };
   }
@@ -152,7 +173,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
       };
     }
 
@@ -173,7 +194,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
       };
     }
 
@@ -185,7 +206,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
-        volZ, squeezePressure: sqPressure, volRegime,
+        volZ, squeezePressure: sqPressure, volRegime, inverted: false,
       };
     }
   }
@@ -200,6 +221,6 @@ export function replayExit(
     peak,
     heldMinutes: lifeCap,
     entered: true,
-    volZ, squeezePressure: sqPressure, volRegime,
+    volZ, squeezePressure: sqPressure, volRegime, inverted: false,
   };
 }

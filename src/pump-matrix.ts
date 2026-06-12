@@ -27,7 +27,12 @@ import {
 /** Сигнал к открытию с приложенным prod-планом выхода. */
 export interface TradePlan {
   symbol: string;
+  /** направление к ИСПОЛНЕНИЮ (при инверсии — уже развёрнутое против поста) */
   direction: "long" | "short";
+  /** исходное направление поста (отличается от direction при инверсии) */
+  originalDirection: "long" | "short";
+  /** была ли позиция инвертирована детектором каскада */
+  inverted: boolean;
   /** канал-источник (single) или null (matrix, межканальный) */
   channel: string | null;
   ts: number;
@@ -43,8 +48,8 @@ export interface TradePlan {
   stalenessSinceProfit: number;
   /** пик-протухание: минут без нового пика */
   stalenessSinceMinutes: number;
-  /** политика реакции на каскад ликвидаций: none | tighten | veto */
-  squeezePolicy: "none" | "tighten" | "veto";
+  /** политика реакции на каскад ликвидаций: none | tighten | veto | invert */
+  squeezePolicy: "none" | "tighten" | "veto" | "invert";
   /** порог squeezePressure для срабатывания policy */
   squeezeThreshold: number;
   /** порог volZ для режима calm/anomalous */
@@ -64,13 +69,27 @@ export interface TradePlan {
    *   "veto"   — НЕ входить (squeezePolicy=veto, обнаружен каскад ликвидаций).
    * Без свечей всегда "enter" (каскад не оценить).
    */
-  recommendation: "enter" | "tighten" | "veto";
+  recommendation: "enter" | "tighten" | "veto" | "invert";
   /** доверие к самой модели на момент обучения (0..1) */
   modelConfidence: number;
   /** надёжна ли модель (хватило ли данных) */
   modelReliable: boolean;
   /** источник сигнала: matrix (корреляция авторов) | single (fallback на пост) */
   source: "matrix" | "single";
+}
+
+/** Рантайм-опции исполнения (без переобучения модели). */
+export interface RuntimeOptions {
+  /**
+   * Заглушить инверсию: invert→veto. Полезно временно отключить разворот в проде,
+   * не трогая обученные params. По умолчанию false (инверсия активна, если обучена).
+   */
+  disableInvert?: boolean;
+  /**
+   * Заглушить ВСЮ реакцию на каскад (veto/tighten/invert) → всегда enter в направлении
+   * поста с базовым exit. Жёсткий обход squeeze-логики. По умолчанию false.
+   */
+  disableSqueeze?: boolean;
 }
 
 export class PumpMatrix {
@@ -130,8 +149,8 @@ export class PumpMatrix {
    * volRegime неизвестен → exit резолвится на уровне symbol-dir, recommendation="enter".
    * Для точного cell-exit и детекции каскада используй plan() со свечами.
    */
-  signals(items: ParserItem[]): TradePlan[] {
-    return this._predict(items).signals.map((v) => this.buildPlan(v, null));
+  signals(items: ParserItem[], opts: RuntimeOptions = {}): TradePlan[] {
+    return this._predict(items).signals.map((v) => this.buildPlan(v, null, opts));
   }
 
   /**
@@ -142,13 +161,16 @@ export class PumpMatrix {
    *
    * candlesBySymbol[symbol] — свечи для этого тикера. Если для символа свечей нет,
    * план строится как в signals() (symbol-dir fallback, recommendation="enter").
+   *
+   * opts.disableInvert — рантайм-глушитель инверсии без переобучения: invert→veto.
    */
   plan(
     items: ParserItem[],
     candlesBySymbol: Record<string, ICandleData[]>,
+    opts: RuntimeOptions = {},
   ): TradePlan[] {
     return this._predict(items).signals.map((v) =>
-      this.buildPlan(v, candlesBySymbol[v.symbol] ?? null),
+      this.buildPlan(v, candlesBySymbol[v.symbol] ?? null, opts),
     );
   }
 
@@ -161,10 +183,11 @@ export class PumpMatrix {
     direction: Direction,
     channel: string | null,
     candles: ICandleData[],
+    opts: RuntimeOptions = {},
   ): TradePlan {
     // live: вход = последняя свеча окна (текущий бар), история перед ней даёт volZ.
     const entryTs = candles[candles.length - 1]?.timestamp ?? 0;
-    return this.planForAt(symbol, direction, channel, candles, entryTs);
+    return this.planForAt(symbol, direction, channel, candles, entryTs, opts);
   }
 
   /**
@@ -177,13 +200,14 @@ export class PumpMatrix {
     channel: string | null,
     candles: ICandleData[],
     entryTs: number,
+    opts: RuntimeOptions = {},
   ): TradePlan {
     const v: PumpVerdict = {
       symbol, direction, action: "open", ts: entryTs,
       independentClusters: 1, totalChannels: 1, confidence: 0.5,
       reason: "planFor", source: this.params.meta.mode, channel,
     };
-    return this.buildPlan(v, candles);
+    return this.buildPlan(v, candles, opts);
   }
 
   /** Полный отчёт (все вердикты + карта авторства) — для разбора. */
@@ -196,7 +220,7 @@ export class PumpMatrix {
   }
 
   // ── единый построитель плана: с/без свечей ──
-  private buildPlan(v: PumpVerdict, candles: ICandleData[] | null): TradePlan {
+  private buildPlan(v: PumpVerdict, candles: ICandleData[] | null, opts: RuntimeOptions = {}): TradePlan {
     const ch = v.channel ?? "_matrix";
     const dir = v.direction!;
 
@@ -220,17 +244,37 @@ export class PumpMatrix {
     }
 
     // финальный exit: при известном volRegime → cell-уровень;
-    // без свечей НЕ резолвим cell (volRegime неизвестен) → symbol-dir через спец-маркер.
-    const resolved = volRegime
+    // без свечей НЕ резолвим cell (volRegime неизвестен) → symbol-dir.
+    let resolved = volRegime
       ? resolveExit(this.params.exit, v.source, ch, v.symbol, dir, volRegime)
       : this.resolveNoRegime(v.source, ch, v.symbol, dir);
-    const exit = resolved.exit;
+    let exit = resolved.exit;
 
     // рекомендация по каскаду
-    let recommendation: "enter" | "tighten" | "veto" = "enter";
-    if (sqPressure !== null && sqPressure >= (exit.squeezeThreshold ?? 0.6)) {
+    let recommendation: "enter" | "tighten" | "veto" | "invert" = "enter";
+    let finalDir = dir;
+    const fires = !opts.disableSqueeze
+      && sqPressure !== null && sqPressure >= (exit.squeezeThreshold ?? 0.6);
+    if (fires) {
       if (exit.squeezePolicy === "veto") recommendation = "veto";
       else if (exit.squeezePolicy === "tighten") recommendation = "tighten";
+      else if (exit.squeezePolicy === "invert") {
+        if (opts.disableInvert) {
+          // инверсия заглушена рантайм-флагом → не разворачиваем, а защищаемся: veto.
+          // Безопаснее, чем войти в направление поста, который детектор считает ловушкой.
+          recommendation = "veto";
+        } else {
+          // ИНВЕРСИЯ: разворачиваем позицию против поста и тянем exit из ИНВЕРС-ячейки
+          // тензора [mode][channel][symbol][oppositeDir][volRegime]. signals отдаёт
+          // уже развёрнутый direction — прод думать не должен.
+          recommendation = "invert";
+          finalDir = dir === "long" ? "short" : "long";
+          resolved = volRegime
+            ? resolveExit(this.params.exit, v.source, ch, v.symbol, finalDir, volRegime)
+            : this.resolveNoRegime(v.source, ch, v.symbol, finalDir);
+          exit = resolved.exit;
+        }
+      }
     }
 
     // при tighten отдаём уже ужатый trailing, чтобы прод не считал сам
@@ -241,7 +285,9 @@ export class PumpMatrix {
 
     return {
       symbol: v.symbol,
-      direction: dir,
+      direction: finalDir,
+      originalDirection: dir,
+      inverted: recommendation === "invert",
       channel: v.channel,
       ts: v.ts,
       confidence: v.confidence,

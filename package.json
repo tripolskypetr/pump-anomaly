@@ -1,5 +1,5 @@
 {
-  "name": "pump-matrix",
+  "name": "pump-anomaly",
   "version": "0.1.0",
   "description": "Detector of synchronized trading pump signals via author-cluster deduplication, with path-aware exit replay and liquidation-cascade detection.",
   "keywords": [

@@ -18,7 +18,7 @@ import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, pnlStats, PnlStats } from "./objective";
 import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
@@ -47,7 +47,7 @@ export interface TrainGrid {
   /** порог volZ для разметки calm/anomalous — эмпирически */
   volZThreshold: number[];
   /** политика реакции на каскад: train выберет по CV (или зафиксируй параметром) */
-  squeezePolicy: Array<"none" | "tighten" | "veto" | "invert">;
+  squeezePolicy: Array<"none" | "tighten" | "veto" | "invert" | "ignore">;
   /** порог squeezePressure для срабатывания policy */
   squeezeThreshold: number[];
   /** baseline-окно для volZ (свечей до входа) */
@@ -111,6 +111,33 @@ export interface TrainOptions {
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
 
+/**
+ * Запись истории одного сигнала для внешней аналитики (dump()).
+ * Все цены абсолютные; pnl/peak в долях (0.05 = +5%); ts в мс.
+ */
+export interface SignalRecord {
+  symbol: string;
+  direction: "long" | "short";
+  channel: string;
+  /** время сигнала (ts всплеска), мс */
+  ts: number;
+  /** вошли ли в позицию (false для no-entry / cascade-veto) */
+  entered: boolean;
+  entryPrice: number;
+  exitPrice: number;
+  /** реализованный PnL в долях */
+  pnl: number;
+  /** пиковый PnL за жизнь позиции, доли */
+  peak: number;
+  reason: string;
+  heldMinutes: number;
+  /** была ли позиция инвертирована (policy=invert) */
+  inverted: boolean;
+  volRegime: import("./volume").VolRegime;
+  /** число независимых кластеров авторства на всплеске (1 в single-режиме) */
+  independentClusters: number;
+}
+
 export interface TrainedParams {
   version: 3;
   config: DetectorConfig;
@@ -130,6 +157,22 @@ export interface TrainedParams {
     bySymbol: Record<string, RiskRewardStats>;
     global: RiskRewardStats;
   };
+  /**
+   * Устойчивая к выбросам статистика реализованного PnL (median + перцентили),
+   * чтобы одна плохая/жирная сделка не определяла оценку выигрыша системы.
+   * Per-symbol + global. Сериализуется, в исполнении readonly.
+   */
+  pnl: {
+    bySymbol: Record<string, PnlStats>;
+    global: PnlStats;
+  };
+  /**
+   * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
+   * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
+   * цена входа/выхода, реализованный pnl, причина и длительность. Сериализуется в
+   * save()/load(); удобнее получать через dump() (плоский JSON-массив).
+   */
+  history?: SignalRecord[];
   meta: {
     trainedAt: number;
     folds: number;
@@ -142,6 +185,8 @@ export interface TrainedParams {
     gridSize: number;
     /** эффективный режим обучения: matrix | single */
     mode: "matrix" | "single";
+    /** честная диагностика: ПОЧЕМУ выбран этот режим (auto-критерий или явный) */
+    modeReason: string;
     // импакт-горизонт отдельно — главный исследовательский выход
     impactHorizonMinutes: number;
     confidence: number;
@@ -198,8 +243,9 @@ export async function train(
   // разрешаем эффективный режим обучения — тем же строгим критерием, что и predict
   const reqMode = opts.mode ?? "auto";
   let effMode: "matrix" | "single";
-  if (reqMode === "matrix") effMode = "matrix";
-  else if (reqMode === "single") effMode = "single";
+  let modeReason: string;
+  if (reqMode === "matrix") { effMode = "matrix"; modeReason = "matrix задан явно (opts.mode)"; }
+  else if (reqMode === "single") { effMode = "single"; modeReason = "single задан явно (opts.mode)"; }
   else {
     // auto: пробный прогон матрицы на средних порогах + оценка жизнеспособности
     const probeTbl = buildTable(
@@ -217,6 +263,8 @@ export async function train(
       ...DEFAULT_VIABILITY, ...opts.viability,
     });
     effMode = v.viable ? "matrix" : "single";
+    // честная авто-диагностика: ПОЧЕМУ выбран режим (видно в meta.modeReason)
+    modeReason = `auto → ${effMode}: ${v.reason}`;
   }
 
   // индекс зоны входа по (symbol|direction|ts) — убирает O(n²) find
@@ -245,10 +293,16 @@ export async function train(
 
   // кэш: ключ кластеризации → размеченные всплески.
   // храним полный ReplayResult (нужен volRegime + entered для tensor и veto-метрики).
+  // ExitRec несёт и поля для dump() — цены входа/выхода, причину, длительность.
+  type ExitRec = {
+    pnl: number; volRegime: import("./volume").VolRegime; entered: boolean;
+    entryPrice: number; exitPrice: number; reason: string; heldMinutes: number;
+    peak: number; inverted: boolean;
+  };
   type Labeled = {
     channel: string; symbol: string; direction: "long" | "short"; ts: number;
     independentClusters: number;
-    byExit: Map<string, { pnl: number; volRegime: import("./volume").VolRegime; entered: boolean }>;
+    byExit: Map<string, ExitRec>;
   };
   const labeledCache = new Map<string, Labeled[]>();
   const seenCluster = new Set<string>();
@@ -266,12 +320,16 @@ export async function train(
       );
       onTick?.(b.symbol);
       if (!lb) continue;
-      const byExit = new Map<string, { pnl: number; volRegime: import("./volume").VolRegime; entered: boolean }>();
+      const byExit = new Map<string, ExitRec>();
       // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
       // и он ДОЛЖЕН учитываться как «не вошли и не потеряли», иначе policy=veto нечестно
       // сравнивать с policy=none. Поэтому храним и не-entered, помечая флагом.
       for (const [k, r] of lb.byExit) {
-        byExit.set(k, { pnl: r.pnl, volRegime: r.volRegime, entered: r.entered });
+        byExit.set(k, {
+          pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
+          entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
+          heldMinutes: r.heldMinutes, peak: r.peak, inverted: r.inverted,
+        });
       }
       if (byExit.size === 0) continue;
       labeled.push({
@@ -498,7 +556,7 @@ export async function train(
       const ekey = exitKey(ex);
       const rows = subset
         .map((b) => b.byExit.get(ekey))
-        .filter((r): r is { pnl: number; volRegime: import("./volume").VolRegime; entered: boolean } =>
+        .filter((r): r is ExitRec =>
           !!r && (regime === undefined || r.volRegime === regime));
       if (rows.length === 0) continue;
       const foldSpecs = timeSeriesFolds(rows.length, folds);
@@ -576,6 +634,11 @@ export async function train(
   // тому, что прод исполнит.
   const rrTradesBySymbol = new Map<string, Array<{ pnl: number; hardStop: number }>>();
   const rrTradesGlobal: Array<{ pnl: number; hardStop: number }> = [];
+  const pnlsBySymbol = new Map<string, number[]>();
+  const pnlsGlobal: number[] = [];
+  // история сигналов выбранной конфигурации (для dump → внешней аналитики).
+  // Берём exit, выбранный для каждого (symbol,direction) — то, что исполнит прод.
+  const history: SignalRecord[] = [];
   for (const [sk, subset] of groupSD) {
     const [symbol, direction] = sk.split("\u0001") as [string, "long" | "short"];
     const ex = bySymbolDir[symbol]?.[direction];
@@ -583,17 +646,37 @@ export async function train(
     const ekey = exitKey(ex);
     for (const b of subset) {
       const r = b.byExit.get(ekey);
-      if (!r || !r.entered) continue;
+      if (!r) continue;
+      // запись истории — для ВСЕХ сигналов (вошли/не вошли), чтобы аналитика
+      // могла считать и пропуски (veto/no-entry), и реализованные сделки
+      history.push({
+        symbol, direction, channel: b.channel, ts: b.ts,
+        entered: r.entered, entryPrice: r.entryPrice, exitPrice: r.exitPrice,
+        pnl: r.pnl, peak: r.peak, reason: r.reason, heldMinutes: r.heldMinutes,
+        inverted: r.inverted, volRegime: r.volRegime,
+        independentClusters: b.independentClusters,
+      });
+      if (!r.entered) continue;
       const trade = { pnl: r.pnl, hardStop: ex.hardStop };
       (rrTradesBySymbol.get(symbol) ?? rrTradesBySymbol.set(symbol, []).get(symbol)!).push(trade);
       rrTradesGlobal.push(trade);
+      (pnlsBySymbol.get(symbol) ?? pnlsBySymbol.set(symbol, []).get(symbol)!).push(r.pnl);
+      pnlsGlobal.push(r.pnl);
     }
   }
+  history.sort((a, b) => a.ts - b.ts);
   const riskRewardBySymbol: Record<string, RiskRewardStats> = {};
   for (const [symbol, trades] of rrTradesBySymbol) {
     riskRewardBySymbol[symbol] = riskRewardStats(trades);
   }
   const riskRewardGlobal = riskRewardStats(rrTradesGlobal);
+  // устойчивая к выбросам статистика PnL: median + перцентили, чтобы одна плохая
+  // (или одна жирная) сделка не определяла оценку выигрыша системы.
+  const pnlBySymbol: Record<string, PnlStats> = {};
+  for (const [symbol, pnls] of pnlsBySymbol) {
+    pnlBySymbol[symbol] = pnlStats(pnls);
+  }
+  const pnlGlobal = pnlStats(pnlsGlobal);
 
   const params: TrainedParams = {
     version: 3,
@@ -601,11 +684,14 @@ export async function train(
     exit: tensor,
     policy: opts.policy ?? DEFAULT_POLICY,
     riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
+    pnl: { bySymbol: pnlBySymbol, global: pnlGlobal },
+    history,
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,
       cvScore: top.cvScore, nestedScore, cvWinrate: top.cvWinrate, cvSupport: top.cvSupport,
       gridSize: board.length,
       mode: effMode,
+      modeReason,
       impactHorizonMinutes: globalExit.staleMinutes,
       confidence: reliability.confidence, reliable: reliability.reliable,
       support: reliability.support, stability: reliability.stability,

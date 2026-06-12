@@ -69,7 +69,7 @@ function rrModel(): PumpMatrix {
     },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.05, nestedScore: null, cvWinrate: 0.6, cvSupport: 20,
-      gridSize: 100, mode: "single", impactHorizonMinutes: 240,
+      gridSize: 100, mode: "single", modeReason: "test fixture", impactHorizonMinutes: 240,
       confidence: 0.7, reliable: true, support: 0.8, stability: 0.7, significance: 0.8, totalSamples: 55,
     },
   };

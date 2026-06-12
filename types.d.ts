@@ -316,7 +316,7 @@ interface ExitParams {
     /** порог volZ для разметки режима calm/anomalous */
     volZThreshold?: number;
     /** политика реакции на каскад: tighten (туже trailing) | veto (не входить) | none */
-    squeezePolicy?: "none" | "tighten" | "veto" | "invert";
+    squeezePolicy?: "none" | "tighten" | "veto" | "invert" | "ignore";
     /** порог squeezePressure, выше которого срабатывает policy */
     squeezeThreshold?: number;
     /** множитель ужатия trailing при policy="tighten" (0.5 = вдвое туже) */
@@ -332,7 +332,7 @@ interface ExitParams {
 }
 type ExitReason = "trailing-take" | "hard-stop" | "peak-staleness" | "life-cap" | "cascade-veto" | "invert" | "no-entry";
 interface ReplayResult {
-    /** реализованный PnL% (в долях: 0.05 = +5%). При hard-stop — откат к последнему плюсовому пику. */
+    /** реализованный PnL% (в долях: 0.05 = +5%). При hard-stop = -hardStop% (честный убыток). */
     pnl: number;
     reason: ExitReason;
     /** пиковый PnL% за жизнь позиции */
@@ -340,6 +340,10 @@ interface ReplayResult {
     /** минут от входа до выхода */
     heldMinutes: number;
     entered: boolean;
+    /** цена входа (close в зоне либо clamp midpoint). 0 если не вошли. */
+    entryPrice: number;
+    /** цена выхода, по которой реализован pnl. 0 если не вошли. */
+    exitPrice: number;
     /** z-score объёма входной свечи (накопление плечевого топлива) */
     volZ: number;
     /** доля объёма против позиции (сигнатура каскада ликвидаций) */
@@ -355,7 +359,8 @@ interface ReplayResult {
  * Прогоняет 1m-свечи через prod-выход. candles должны быть отсортированы по ts
  * и покрывать окно от события вперёд (минимум до staleMinutes).
  *
- * entryFrom/entryTo — зона входа: вход на первой свече, чьё [low,high] пересекает зону.
+ * entryFrom/entryTo — зона входа: вход на первой свече, чей хвост пересекает зону.
+ * entryPrice = close, если он попал в зону, иначе clamp midpoint к [low,high].
  * Цена входа = кламп середины зоны в диапазон свечи (консервативно — фактическое касание).
  */
 declare function replayExit(candles: ICandleData[], dir: Direction, entryFrom: number, entryTo: number, p: ExitParams): ReplayResult;
@@ -536,6 +541,31 @@ declare function riskRewardStats(trades: Array<{
     pnl: number;
     hardStop: number;
 }>): RiskRewardStats;
+/**
+ * Устойчивая к выбросам статистика реализованного PnL системы (в долях).
+ * Дополняет mean процентилями и медианой, чтобы ОДНА плохая (или одна жирная)
+ * сделка не определяла оценку выигрыша:
+ *   - median — робастный центр, полностью иммунный к выбросам (50-й перцентиль);
+ *   - p5     — нижний хвост (насколько плохи худшие 5% сделок);
+ *   - p95/p99— верхний хвост (вклад редких крупных выигрышей).
+ * mean остаётся для сравнения, но median/перцентили показывают систему без
+ * искажения единичными экстремумами. NaN/Infinity отбрасываются.
+ */
+interface PnlStats {
+    /** среднее PnL (чувствительно к выбросам — для сравнения) */
+    mean: number;
+    /** медиана PnL (робастный центр, иммунный к выбросам) */
+    median: number;
+    /** P5 — нижний хвост (худшие сделки) */
+    p5: number;
+    /** P95 — верхний хвост */
+    p95: number;
+    /** P99 — крайний верхний хвост */
+    p99: number;
+    /** число сделок в выборке */
+    n: number;
+}
+declare function pnlStats(pnls: number[]): PnlStats;
 
 /**
  * Достоверность обучения. Отвечает на вопрос «можно ли доверять подобранным
@@ -708,8 +738,10 @@ interface SelectionConfig {
 declare const DEFAULT_SELECTION: SelectionConfig;
 /**
  * Порядок агрессии реакции на каскад: чем выше, тем агрессивнее вмешательство.
- * none (просто вход) < tighten (ужать) < veto (не входить) < invert (развернуться).
+ * ignore (вход вопреки каскаду) ≈ none (просто вход) < tighten (ужать) <
+ * veto (не входить) < invert (развернуться).
  * Используется как ось консервативности: при near-tie выбираем менее агрессивную.
+ * ignore намеренно НЕ реагирует на каскад → наименее консервативная реакция (0).
  */
 declare const CASCADE_AGGRESSION: Record<string, number>;
 declare const cascadeAggressionOf: (policy: string | undefined) => number;
@@ -747,7 +779,7 @@ interface TrainGrid {
     /** порог volZ для разметки calm/anomalous — эмпирически */
     volZThreshold: number[];
     /** политика реакции на каскад: train выберет по CV (или зафиксируй параметром) */
-    squeezePolicy: Array<"none" | "tighten" | "veto" | "invert">;
+    squeezePolicy: Array<"none" | "tighten" | "veto" | "invert" | "ignore">;
     /** порог squeezePressure для срабатывания policy */
     squeezeThreshold: number[];
     /** baseline-окно для volZ (свечей до входа) */
@@ -789,6 +821,32 @@ interface TrainOptions {
     /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
     selection?: Partial<SelectionConfig>;
 }
+/**
+ * Запись истории одного сигнала для внешней аналитики (dump()).
+ * Все цены абсолютные; pnl/peak в долях (0.05 = +5%); ts в мс.
+ */
+interface SignalRecord {
+    symbol: string;
+    direction: "long" | "short";
+    channel: string;
+    /** время сигнала (ts всплеска), мс */
+    ts: number;
+    /** вошли ли в позицию (false для no-entry / cascade-veto) */
+    entered: boolean;
+    entryPrice: number;
+    exitPrice: number;
+    /** реализованный PnL в долях */
+    pnl: number;
+    /** пиковый PnL за жизнь позиции, доли */
+    peak: number;
+    reason: string;
+    heldMinutes: number;
+    /** была ли позиция инвертирована (policy=invert) */
+    inverted: boolean;
+    volRegime: VolRegime;
+    /** число независимых кластеров авторства на всплеске (1 в single-режиме) */
+    independentClusters: number;
+}
 interface TrainedParams {
     version: 3;
     config: DetectorConfig;
@@ -808,6 +866,22 @@ interface TrainedParams {
         bySymbol: Record<string, RiskRewardStats>;
         global: RiskRewardStats;
     };
+    /**
+     * Устойчивая к выбросам статистика реализованного PnL (median + перцентили),
+     * чтобы одна плохая/жирная сделка не определяла оценку выигрыша системы.
+     * Per-symbol + global. Сериализуется, в исполнении readonly.
+     */
+    pnl: {
+        bySymbol: Record<string, PnlStats>;
+        global: PnlStats;
+    };
+    /**
+     * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
+     * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
+     * цена входа/выхода, реализованный pnl, причина и длительность. Сериализуется в
+     * save()/load(); удобнее получать через dump() (плоский JSON-массив).
+     */
+    history?: SignalRecord[];
     meta: {
         trainedAt: number;
         folds: number;
@@ -820,6 +894,8 @@ interface TrainedParams {
         gridSize: number;
         /** эффективный режим обучения: matrix | single */
         mode: "matrix" | "single";
+        /** честная диагностика: ПОЧЕМУ выбран этот режим (auto-критерий или явный) */
+        modeReason: string;
         impactHorizonMinutes: number;
         confidence: number;
         reliable: boolean;
@@ -874,6 +950,21 @@ declare class PumpMatrix {
     static load(json: string | TrainedParams): PumpMatrix;
     /** Сериализовать модель в JSON-строку (включая policy). */
     save(): string;
+    /**
+     * Экспорт истории сигналов выбранной конфигурации для внешней аналитики.
+     * Возвращает плоский массив записей (цена входа/выхода, pnl, причина выхода,
+     * длительность и т.д.) — посчитать метрики можно отдельным скриптом.
+     *
+     * Включает и НЕ вошедшие сигналы (no-entry / cascade-veto) с entered=false,
+     * чтобы аналитика видела пропуски, а не только реализованные сделки.
+     * Доступно после fit() и сохраняется в save()/load().
+     *
+     * @param asString true → JSON-строка; иначе массив объектов (по умолчанию массив)
+     */
+    dump(asString: true): string;
+    dump(asString?: false): SignalRecord[];
+    /** Число записей в истории сигналов (0 если модель загружена без истории). */
+    get historySize(): number;
     /** Полный exit-tensor (для аудита). */
     get exit(): ExitTensor;
     /** Политика разрешённых исходов, зашитая в модель (readonly-копия). */
@@ -886,6 +977,8 @@ declare class PumpMatrix {
     get impactHorizonMinutes(): number;
     /** Режим, которым обучена модель: matrix (корреляция) | single (fallback). */
     get mode(): "matrix" | "single";
+    /** Честная диагностика: ПОЧЕМУ выбран этот режим (auto-критерий или явный выбор). */
+    get modeReason(): string;
     /**
      * Risk-reward по бэктесту: per-symbol + global. Главный исследовательский выход.
      * RR = pnl/hardStop в единицах риска (сколько R снято). bySymbol используется
@@ -894,6 +987,15 @@ declare class PumpMatrix {
     get riskReward(): {
         bySymbol: Record<string, RiskRewardStats>;
         global: RiskRewardStats;
+    };
+    /**
+     * Устойчивая к выбросам статистика реализованного PnL: median + перцентили
+     * (p5/p95/p99) per-symbol и global. median/перцентили показывают выигрыш
+     * системы без искажения единичной плохой или жирной сделкой.
+     */
+    get pnl(): {
+        bySymbol: Record<string, PnlStats>;
+        global: PnlStats;
     };
     /**
      * Главный prod-вызов БЕЗ свечей. Возвращает ТОЛЬКО исполняемые сигналы — veto
@@ -940,5 +1042,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, clusterAuthors, computeReliability, conservatismKey, earlyWarning, enumerateBursts, enumeratePosts, exitKey, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, labelBurst, lagXCorr, loadPredict, oneStandardErrorSelect, percentile, predict, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, shrinkageExpectancy, silentProgress, singleChannelSignals, squeezePressure, standardError, stdoutProgress, train, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, CandleInterval, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, clusterAuthors, computeReliability, conservatismKey, earlyWarning, enumerateBursts, enumeratePosts, exitKey, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, labelBurst, lagXCorr, loadPredict, oneStandardErrorSelect, percentile, pnlStats, predict, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, shrinkageExpectancy, silentProgress, singleChannelSignals, squeezePressure, standardError, stdoutProgress, train, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
+export type { AuthorMap, CandleInterval, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

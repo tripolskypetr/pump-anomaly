@@ -2,7 +2,7 @@ import { ParserItem, PumpVerdict, Direction } from "./types";
 import { GetCandles, ICandleData } from "./candle";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
 import { volumeZScore, squeezePressure, volRegimeOf, VolRegime } from "./volume";
-import { RiskRewardStats } from "./objective";
+import { RiskRewardStats, PnlStats } from "./objective";
 import {
   TradeSignal, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
   intersectPolicy, DEFAULT_POLICY,
@@ -11,6 +11,7 @@ import {
   train,
   loadPredict,
   TrainedParams,
+  SignalRecord,
   TrainOptions,
   TrainResult,
 } from "./train";
@@ -50,12 +51,36 @@ export class PumpMatrix {
     const params: TrainedParams = typeof json === "string" ? JSON.parse(json) : json;
     if (!params.policy) params.policy = DEFAULT_POLICY; // обратная совместимость
     if (!params.riskReward) params.riskReward = { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } };
+    if (!params.pnl) params.pnl = { bySymbol: {}, global: { mean: 0, median: 0, p5: 0, p95: 0, p99: 0, n: 0 } };
     return new PumpMatrix(params, loadPredict(params));
   }
 
   /** Сериализовать модель в JSON-строку (включая policy). */
   save(): string {
     return JSON.stringify(this.params);
+  }
+
+  /**
+   * Экспорт истории сигналов выбранной конфигурации для внешней аналитики.
+   * Возвращает плоский массив записей (цена входа/выхода, pnl, причина выхода,
+   * длительность и т.д.) — посчитать метрики можно отдельным скриптом.
+   *
+   * Включает и НЕ вошедшие сигналы (no-entry / cascade-veto) с entered=false,
+   * чтобы аналитика видела пропуски, а не только реализованные сделки.
+   * Доступно после fit() и сохраняется в save()/load().
+   *
+   * @param asString true → JSON-строка; иначе массив объектов (по умолчанию массив)
+   */
+  dump(asString: true): string;
+  dump(asString?: false): SignalRecord[];
+  dump(asString = false): string | SignalRecord[] {
+    const history = this.params.history ?? [];
+    return asString ? JSON.stringify(history) : history.map((h) => ({ ...h }));
+  }
+
+  /** Число записей в истории сигналов (0 если модель загружена без истории). */
+  get historySize(): number {
+    return this.params.history?.length ?? 0;
   }
 
   /** Полный exit-tensor (для аудита). */
@@ -88,6 +113,11 @@ export class PumpMatrix {
     return this.params.meta.mode;
   }
 
+  /** Честная диагностика: ПОЧЕМУ выбран этот режим (auto-критерий или явный выбор). */
+  get modeReason(): string {
+    return this.params.meta.modeReason ?? "(не записано)";
+  }
+
   /**
    * Risk-reward по бэктесту: per-symbol + global. Главный исследовательский выход.
    * RR = pnl/hardStop в единицах риска (сколько R снято). bySymbol используется
@@ -95,6 +125,15 @@ export class PumpMatrix {
    */
   get riskReward(): { bySymbol: Record<string, RiskRewardStats>; global: RiskRewardStats } {
     return this.params.riskReward;
+  }
+
+  /**
+   * Устойчивая к выбросам статистика реализованного PnL: median + перцентили
+   * (p5/p95/p99) per-symbol и global. median/перцентили показывают выигрыш
+   * системы без искажения единичной плохой или жирной сделкой.
+   */
+  get pnl(): { bySymbol: Record<string, PnlStats>; global: PnlStats } {
+    return this.params.pnl;
   }
 
   /**
@@ -200,7 +239,8 @@ export class PumpMatrix {
     // ── readonly RR-фильтр: режем символы с backtest-RR ниже порога ──
     if (policy.minRiskReward !== undefined) {
       const rr = this.params.riskReward?.bySymbol?.[v.symbol];
-      const metric = policy.rrMetric ?? "mean";
+      // rrMetric гарантированно задан intersectPolicy (там ?? "mean"), здесь не дефолтим
+      const metric = policy.rrMetric!;
       // нет статистики по символу → нечем подтвердить RR → режем (консервативно)
       if (!rr || rr[metric] < policy.minRiskReward) return null;
     }
@@ -242,14 +282,19 @@ export class PumpMatrix {
         action = "invert";
         finalDir = dir === "long" ? "short" : "long";
         invertedFrom = dir;
-        resolved = volRegime
-          ? resolveExit(this.params.exit, v.source, ch, v.symbol, finalDir, volRegime)
-          : resolveExitNoRegime(this.params.exit, v.source, v.symbol, finalDir);
+        // fires=true ⇒ были свечи ⇒ volRegime гарантированно посчитан (calm|anomalous),
+        // поэтому здесь всегда cell-резолв по режиму — без noRegime-ветки.
+        resolved = resolveExit(this.params.exit, v.source, ch, v.symbol, finalDir, volRegime!);
         exit = resolved.exit;
       } else if (pol === "tighten") {
         if (!allow.has("tighten")) return null;
         action = "tighten";
       }
+      // pol === "ignore": каскад замечен, но НАМЕРЕННО игнорируется — входим в
+      // исходном направлении (action остаётся "enter"). В отличие от veto/invert
+      // сигнал НЕ отсекается; реализуется реальный (обычно плохой) pnl. Это даёт
+      // контрфакт «что если не реагировать на каскад» прямо в выдаче, а не только
+      // в стороннем анализе. pol === "none" ведёт себя так же (вход без реакции).
     }
 
     if (action === "enter" && !allow.has("enter")) return null;

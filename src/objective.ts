@@ -78,9 +78,11 @@ export function oneStandardErrorSelect<T>(
  * percentile([...], 0.95) = P95. Пустая выборка → 0.
  */
 export function percentile(xs: number[], p: number): number {
-  if (xs.length === 0) return 0;
-  if (xs.length === 1) return xs[0];
-  const sorted = [...xs].sort((a, b) => a - b);
+  // отбрасываем NaN/Infinity: одна битая свеча не должна молча отравить перцентиль
+  const clean = xs.filter((x) => Number.isFinite(x));
+  if (clean.length === 0) return 0;
+  if (clean.length === 1) return clean[0];
+  const sorted = [...clean].sort((a, b) => a - b);
   const idx = p * (sorted.length - 1);
   const lo = Math.floor(idx);
   const hi = Math.ceil(idx);
@@ -111,7 +113,8 @@ export function riskRewardStats(
 ): RiskRewardStats {
   const rr: number[] = [];
   for (const t of trades) {
-    if (t.hardStop > 0) rr.push(t.pnl / (t.hardStop / 100)); // hardStop в %, pnl в долях
+    // только конечные значения: битый pnl/hardStop не должен отравить RR
+    if (t.hardStop > 0 && Number.isFinite(t.pnl)) rr.push(t.pnl / (t.hardStop / 100));
   }
   if (rr.length === 0) return { mean: 0, p95: 0, p99: 0, n: 0 };
   const mean = rr.reduce((s, x) => s + x, 0) / rr.length;
@@ -120,5 +123,44 @@ export function riskRewardStats(
     p95: +percentile(rr, 0.95).toFixed(6),
     p99: +percentile(rr, 0.99).toFixed(6),
     n: rr.length,
+  };
+}
+
+/**
+ * Устойчивая к выбросам статистика реализованного PnL системы (в долях).
+ * Дополняет mean процентилями и медианой, чтобы ОДНА плохая (или одна жирная)
+ * сделка не определяла оценку выигрыша:
+ *   - median — робастный центр, полностью иммунный к выбросам (50-й перцентиль);
+ *   - p5     — нижний хвост (насколько плохи худшие 5% сделок);
+ *   - p95/p99— верхний хвост (вклад редких крупных выигрышей).
+ * mean остаётся для сравнения, но median/перцентили показывают систему без
+ * искажения единичными экстремумами. NaN/Infinity отбрасываются.
+ */
+export interface PnlStats {
+  /** среднее PnL (чувствительно к выбросам — для сравнения) */
+  mean: number;
+  /** медиана PnL (робастный центр, иммунный к выбросам) */
+  median: number;
+  /** P5 — нижний хвост (худшие сделки) */
+  p5: number;
+  /** P95 — верхний хвост */
+  p95: number;
+  /** P99 — крайний верхний хвост */
+  p99: number;
+  /** число сделок в выборке */
+  n: number;
+}
+
+export function pnlStats(pnls: number[]): PnlStats {
+  const clean = pnls.filter((x) => Number.isFinite(x));
+  if (clean.length === 0) return { mean: 0, median: 0, p5: 0, p95: 0, p99: 0, n: 0 };
+  const mean = clean.reduce((s, x) => s + x, 0) / clean.length;
+  return {
+    mean: +mean.toFixed(6),
+    median: +percentile(clean, 0.5).toFixed(6),
+    p5: +percentile(clean, 0.05).toFixed(6),
+    p95: +percentile(clean, 0.95).toFixed(6),
+    p99: +percentile(clean, 0.99).toFixed(6),
+    n: clean.length,
   };
 }

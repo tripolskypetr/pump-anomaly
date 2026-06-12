@@ -15,7 +15,7 @@
 ```bash
 npm i
 npm run build   # tsc -p tsconfig.json
-npm test        # vitest run — 219 тестов
+npm test        # vitest run — 387 тестов
 ```
 
 Стек: TypeScript + vitest, без CLI и монорепо. Единственная публичная точка входа высокого уровня — класс `PumpMatrix`.
@@ -367,3 +367,7 @@ fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); //
 ## Лицензия
 
 MIT
+
+
+
+**Честная авто-диагностика режима.** `model.modeReason` объясняет, ПОЧЕМУ выбран single или matrix — не нужно гадать. Примеры: `auto → single: один канал — корреляция невозможна`, `auto → matrix: 3 острых связей, перекрытие 5, кластеров >1: 2`. Matrix требует ≥2 НЕЗАВИСИМЫХ кластеров авторов на одном тикере; каналы-эхо (всегда бьющие вместе) корректно слипаются в 1 кластер и не дают ложный matrix-сигнал. На одноканальных данных всегда single fallback.

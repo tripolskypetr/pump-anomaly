@@ -18,10 +18,13 @@ export const DEFAULT_SELECTION: SelectionConfig = {
 
 /**
  * Порядок агрессии реакции на каскад: чем выше, тем агрессивнее вмешательство.
- * none (просто вход) < tighten (ужать) < veto (не входить) < invert (развернуться).
+ * ignore (вход вопреки каскаду) ≈ none (просто вход) < tighten (ужать) <
+ * veto (не входить) < invert (развернуться).
  * Используется как ось консервативности: при near-tie выбираем менее агрессивную.
+ * ignore намеренно НЕ реагирует на каскад → наименее консервативная реакция (0).
  */
 export const CASCADE_AGGRESSION: Record<string, number> = {
+  ignore: 0,
   none: 0,
   tighten: 1,
   veto: 2,

@@ -28,7 +28,7 @@ export interface ExitParams {
   /** порог volZ для разметки режима calm/anomalous */
   volZThreshold?: number;
   /** политика реакции на каскад: tighten (туже trailing) | veto (не входить) | none */
-  squeezePolicy?: "none" | "tighten" | "veto" | "invert";
+  squeezePolicy?: "none" | "tighten" | "veto" | "invert" | "ignore";
   /** порог squeezePressure, выше которого срабатывает policy */
   squeezeThreshold?: number;
   /** множитель ужатия trailing при policy="tighten" (0.5 = вдвое туже) */
@@ -53,7 +53,7 @@ export type ExitReason =
   | "no-entry";
 
 export interface ReplayResult {
-  /** реализованный PnL% (в долях: 0.05 = +5%). При hard-stop — откат к последнему плюсовому пику. */
+  /** реализованный PnL% (в долях: 0.05 = +5%). При hard-stop = -hardStop% (честный убыток). */
   pnl: number;
   reason: ExitReason;
   /** пиковый PnL% за жизнь позиции */
@@ -61,6 +61,10 @@ export interface ReplayResult {
   /** минут от входа до выхода */
   heldMinutes: number;
   entered: boolean;
+  /** цена входа (close в зоне либо clamp midpoint). 0 если не вошли. */
+  entryPrice: number;
+  /** цена выхода, по которой реализован pnl. 0 если не вошли. */
+  exitPrice: number;
   /** z-score объёма входной свечи (накопление плечевого топлива) */
   volZ: number;
   /** доля объёма против позиции (сигнатура каскада ликвидаций) */
@@ -76,11 +80,16 @@ export interface ReplayResult {
 const signed = (entry: number, price: number, dir: Direction): number =>
   dir === "long" ? (price - entry) / entry : (entry - price) / entry;
 
+/** Обратная к signed: цена выхода по entry, реализованному pnl и направлению. */
+const exitPriceOf = (entry: number, pnl: number, dir: Direction): number =>
+  dir === "long" ? entry * (1 + pnl) : entry * (1 - pnl);
+
 /**
  * Прогоняет 1m-свечи через prod-выход. candles должны быть отсортированы по ts
  * и покрывать окно от события вперёд (минимум до staleMinutes).
  *
- * entryFrom/entryTo — зона входа: вход на первой свече, чьё [low,high] пересекает зону.
+ * entryFrom/entryTo — зона входа: вход на первой свече, чей хвост пересекает зону.
+ * entryPrice = close, если он попал в зону, иначе clamp midpoint к [low,high].
  * Цена входа = кламп середины зоны в диапазон свечи (консервативно — фактическое касание).
  */
 export function replayExit(
@@ -93,15 +102,21 @@ export function replayExit(
   const lo = Math.min(entryFrom, entryTo);
   const hi = Math.max(entryFrom, entryTo);
 
-  // ── поиск входа: первая свеча, пересёкшая зону ──
+  // ── поиск входа: первая свеча, пересёкшая зону хвостом ──
   let entryIdx = -1;
   let entryPrice = 0;
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
     if (c.low <= hi && c.high >= lo) {
-      // зона задета — входим по точке зоны, ближайшей к open свечи (консервативно)
-      const mid = (lo + hi) / 2;
-      entryPrice = Math.min(Math.max(mid, c.low), c.high);
+      // зона задета хвостом. Уточняем цену входа: если close свечи попал В ЗОНУ,
+      // берём его (реальное закрытие в зоне — точнее фитиля). Иначе — точка зоны,
+      // ближайшая к диапазону свечи (clamp midpoint к [low,high], консервативно).
+      if (c.close >= lo && c.close <= hi) {
+        entryPrice = c.close;
+      } else {
+        const mid = (lo + hi) / 2;
+        entryPrice = Math.min(Math.max(mid, c.low), c.high);
+      }
       entryIdx = i;
       break;
     }
@@ -109,6 +124,7 @@ export function replayExit(
   if (entryIdx < 0 || !(entryPrice > 0)) {
     return {
       pnl: 0, reason: "no-entry", peak: 0, heldMinutes: 0, entered: false,
+      entryPrice: 0, exitPrice: 0,
       volZ: 0, squeezePressure: 0, volRegime: "calm", inverted: false, truncated: false,
     };
   }
@@ -129,6 +145,7 @@ export function replayExit(
   if (p.squeezePolicy === "veto" && sqPressure >= sqThr) {
     return {
       pnl: 0, reason: "cascade-veto", peak: 0, heldMinutes: 0, entered: false,
+      entryPrice, exitPrice: 0,
       volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated: false,
     };
   }
@@ -144,7 +161,9 @@ export function replayExit(
     });
     return {
       ...inv,
-      reason: inv.entered ? "invert" : inv.reason,
+      // reason СОХРАНЯЕТ настоящий механизм выхода инвертированной позиции
+      // (hard-stop/trailing-take/life-cap), а факт инверсии несёт флаг inverted.
+      // Раньше reason затирался на "invert", что скрывало, КАК закрылась инверсия.
       inverted: inv.entered,
       // объёмные признаки оставляем от исходного входа (они про сам каскад)
       volZ, squeezePressure: sqPressure, volRegime,
@@ -161,7 +180,6 @@ export function replayExit(
 
   let peak = 0;                 // пиковый PnL за жизнь (доли)
   let peakMinute = 0;          // минута достижения пика
-  let lastPositivePeak = 0;    // последний плюсовой пик — к нему откатываем при hard-stop
 
   const forwardAvail = candles.length - entryIdx - 1;
   const lifeCap = Math.min(p.staleMinutes, forwardAvail);
@@ -184,13 +202,17 @@ export function replayExit(
     // 1) HARD STOP — внутрисвечной прокол против позиции на hardStop% от входа.
     //    Приоритет стопа над тейком в той же свече (консервативно, как в проде стоп жёсткий).
     if (worst <= -hardStopFrac) {
-      // откат метрики к последнему плюсовому trailing-пику (твоё требование)
+      // ЧЕСТНЫЙ реализованный PnL: стоп исполняется на уровне -hardStop%, это и есть
+      // результат сделки. Раньше возвращался lastPositivePeak (≥0), из-за чего стоп
+      // НИКОГДА не показывал убыток — это завышало pnl и отравляло RR/CV-объектив
+      // (оптимизатор не видел риск стопов). peak сохраняется отдельно для диагностики.
       return {
-        pnl: lastPositivePeak,
+        pnl: -hardStopFrac,
         reason: "hard-stop",
         peak,
         heldMinutes: minute,
         entered: true,
+        entryPrice, exitPrice: exitPriceOf(entryPrice, -hardStopFrac, dir),
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
@@ -199,7 +221,7 @@ export function replayExit(
     if (best > peak) {
       peak = best;
       peakMinute = minute;
-      if (peak > 0) lastPositivePeak = peak;
+
     }
 
     // 2) TRAILING TAKE — позиция в плюсе и откат от пика ≥ trailingTake%.
@@ -212,6 +234,7 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
+        entryPrice, exitPrice: exitPriceOf(entryPrice, peak, dir),
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
@@ -224,13 +247,14 @@ export function replayExit(
         peak,
         heldMinutes: minute,
         entered: true,
+        entryPrice, exitPrice: exitPriceOf(entryPrice, peak, dir),
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
   }
 
-  // 4) LIFE CAP — потолок жизни позиции. Выход по close последней свечи окна,
-  //    но не хуже последнего плюсового пика (метрика не опускается ниже зафиксированного).
+  // 4) LIFE CAP — потолок жизни позиции. Выход по close последней свечи окна.
+  //    Честный реализованный PnL (может быть отрицательным, если позиция в минусе).
   const lastIdx = entryIdx + lifeCap;
   const finalPnl = signed(entryPrice, candles[lastIdx].close, dir);
   return {
@@ -239,6 +263,7 @@ export function replayExit(
     peak,
     heldMinutes: lifeCap,
     entered: true,
+    entryPrice, exitPrice: exitPriceOf(entryPrice, finalPnl, dir),
     volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
   };
 }

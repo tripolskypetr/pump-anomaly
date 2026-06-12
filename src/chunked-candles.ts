@@ -46,10 +46,15 @@ export async function fetchCandlesChunked(
     if (remaining > 0) currentSince = currentSince + chunkLimit * step;
   }
 
-  // дедуп по timestamp (на стыках чанков адаптер может вернуть пограничную свечу дважды)
-  const unique = Array.from(
-    new Map(all.map((c) => [c.timestamp, c])).values(),
-  ).sort((a, b) => a.timestamp - b.timestamp);
+  // дедуп по timestamp (на стыках чанков адаптер может вернуть пограничную свечу
+  // дважды). Оставляем ПЕРВОЕ вхождение: при forward-пагинации первая свеча с данным
+  // ts пришла из более раннего/авторитетного чанка. Last-write мог бы подменить её
+  // повторной/битой копией из следующего чанка.
+  const seen = new Map<number, ICandleData>();
+  for (const c of all) {
+    if (!seen.has(c.timestamp)) seen.set(c.timestamp, c);
+  }
+  const unique = Array.from(seen.values()).sort((a, b) => a.timestamp - b.timestamp);
 
   return unique;
 }

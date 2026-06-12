@@ -110,11 +110,19 @@ export function intersectPolicy(
 ): SignalPolicy {
   const allow = !requested?.allow
     ? [...trained.allow]
-    : requested.allow.filter((a) => new Set(trained.allow).has(a));
+    : [...new Set(requested.allow.filter((a) => new Set(trained.allow).has(a)))]; // ∩ + дедуп
+  // minRiskReward: запрос может только УЖЕСТОЧИТЬ (поднять порог), не ослабить.
+  // Берём максимум из обученного и запрошенного — иначе рантайм-запрос мог бы
+  // снизить вшитый защитный порог риска, что нарушает инвариант «только сужение».
+  let minRiskReward: number | undefined;
+  if (trained.minRiskReward !== undefined && requested?.minRiskReward !== undefined) {
+    minRiskReward = Math.max(trained.minRiskReward, requested.minRiskReward);
+  } else {
+    minRiskReward = requested?.minRiskReward ?? trained.minRiskReward;
+  }
   return {
     allow,
-    // RR-фильтр берём из запроса (рантайм), иначе из обученной (если вшита)
-    minRiskReward: requested?.minRiskReward ?? trained.minRiskReward,
+    minRiskReward,
     rrMetric: requested?.rrMetric ?? trained.rrMetric ?? "mean",
   };
 }

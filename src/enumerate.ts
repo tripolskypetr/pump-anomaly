@@ -32,15 +32,21 @@ export function enumerateBursts(
   const events = items as SignalEvent[];
   const fullTbl: EventTable = buildTable(events);
 
-  // author-матрица + τ считаются по ОКНУ СТАЦИОНАРНОСТИ, чтобы на длинном горизонте
-  // не усреднять дрейфующие режимы. Без окна (Infinity) — старое поведение.
-  // Для эффективности: если окно бесконечно, считаем матрицу один раз.
+  // ── ДВА РАЗНЫХ ОКНА (их легко перепутать) ──
+  // 1) stationarityWindowMs — окно ИСТОРИИ для построения author-матрицы: как далеко
+  //    назад смотреть, чтобы понять КАКИЕ каналы — братский кластер. Infinity =
+  //    вся история (кластеры стабильны). НЕ длительность пампа и НЕ время удержания.
+  // 2) burst window = min(windowK·τ, maxBurstWindowMs) (ниже) — окно СИНХРОННОСТИ
+  //    самого пампа: события в этом окне на одном тикере = один всплеск. Ограничено
+  //    maxBurstWindowMs (обычно 1ч), поэтому ПАМП ВСЕГДА КОРОТКИЙ — растянутые на
+  //    часы/дни события НЕ собираются в один памп. Время удержания позиции — отдельно
+  //    (staleMinutes в replay), тоже конечное.
   const buildAuthorCtx = (anchorTs: number) => {
     const tbl = Number.isFinite(stationarityWindowMs)
       ? buildWindowedTable(events, anchorTs, stationarityWindowMs)
       : fullTbl;
     const tau = selfTuneLag(tbl);
-    const window = Math.min(windowK * tau, maxBurstWindowMs);
+    const window = Math.min(windowK * tau, maxBurstWindowMs); // окно СИНХРОННОСТИ пампа
     const screened = jaccardScreen(tbl, window, jaccardThreshold);
     const directed = lagXCorr(tbl, screened, lagPeakThreshold, window);
     const clusterOf = clusterAuthors(tbl.channels, directed);

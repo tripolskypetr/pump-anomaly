@@ -45,17 +45,17 @@ describe("replayExit — все последовательности окна (L
     expect(r.pnl).toBeGreaterThan(0);
   });
 
-  it("STOP HUNT: прокол вверх, потом разворот вниз → hard-stop, метка к последнему плюсовому пику", () => {
-    // вход ~100, сходили на +0.6% (недостаточно для фикс. пика), потом провал на -1.2% → hard stop
+  it("STOP HUNT: прокол вверх, потом разворот вниз → hard-stop, ЧЕСТНЫЙ убыток -hardStop%", () => {
+    // вход ~100, сходили на +0.6% (трейлинг не сработал), потом провал на -1.2% → hard stop
     const cs = candles([
-      [100, 100.6, 99.9, 100.5],   // пик +0.6%
+      [100, 100.6, 99.9, 100.5],   // пик +0.6% (не зафиксирован)
       [100.5, 100.5, 98.8, 98.9],  // прокол вниз -1.2% от входа → hard stop @1%
     ]);
     const r = replayExit(cs, "long", 99.5, 100.5, EXIT({ hardStop: 1.0, trailingTake: 1.0 }));
     expect(r.reason).toBe("hard-stop");
-    // последний плюсовой пик был ~+0.5..0.6%, метка откатывается к нему (не к -1%)
-    expect(r.pnl).toBeGreaterThanOrEqual(0);
-    expect(r.pnl).toBeLessThan(0.01);
+    // ЧЕСТНО: стоп исполнен на -1% (не фиктивный откат к пику). peak остаётся для диагностики.
+    expect(r.pnl).toBeCloseTo(-0.01, 9);
+    expect(r.peak).toBeGreaterThan(0); // пик был, но не реализован
   });
 
   it("trailing take: вырос на +3%, откатил на 1% → выход по пику", () => {
@@ -91,11 +91,11 @@ describe("replayExit — все последовательности окна (L
     expect(r.pnl).toBeCloseTo(0.012, 3);
   });
 
-  it("мгновенный обвал на первой же свече → hard-stop, нет плюсового пика → метка 0", () => {
+  it("мгновенный обвал на первой же свече → hard-stop, ЧЕСТНЫЙ убыток -hardStop%", () => {
     const cs = candles([[100, 100.0, 98.5, 98.6]]); // сразу -1.5%
     const r = replayExit(cs, "long", 99.5, 100.5, EXIT({ hardStop: 1.0 }));
     expect(r.reason).toBe("hard-stop");
-    expect(r.pnl).toBe(0); // не было плюсового пика — откатывать не к чему
+    expect(r.pnl).toBeCloseTo(-0.01, 9); // стоп на -1%, не фиктивный 0
   });
 });
 
@@ -118,8 +118,7 @@ describe("replayExit — SHORT (gravebag, стоп ВЫШЕ входа)", () => 
     ]);
     const r = replayExit(cs, "short", 99.5, 100.5, EXIT({ hardStop: 1.0, trailingTake: 1.0 }));
     expect(r.reason).toBe("hard-stop");
-    expect(r.pnl).toBeGreaterThanOrEqual(0);
-    expect(r.pnl).toBeLessThan(0.01);
+    expect(r.pnl).toBeCloseTo(-0.01, 9); // честный убыток -hardStop%, не откат к пику
   });
 
   it("trailing take для short: упало на 3%, откат вверх 1% → выход по пику", () => {

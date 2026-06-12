@@ -132,8 +132,8 @@ export {
   volumeZScore, squeezePressure, volumeFeatures, volRegimeOf,
 } from "./volume";
 export type { VolumeFeatures, VolRegime } from "./volume";
-export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect } from "./objective";
-export type { RiskRewardStats } from "./objective";
+export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect, pnlStats } from "./objective";
+export type { RiskRewardStats, PnlStats } from "./objective";
 export {
   computeReliability,
   DEFAULT_RELIABILITY,
@@ -152,6 +152,7 @@ export type {
   TrainGrid,
   TrainOptions,
   TrainedParams,
+  SignalRecord,
   TrainResult,
 } from "./train";
 export { PumpMatrix } from "./pump-matrix";

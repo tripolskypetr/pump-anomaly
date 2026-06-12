@@ -31,8 +31,8 @@ describe("replayExit — invert (stop hunt → разворот)", () => {
   it("policy=invert на short-ловушке → инвертированная long-позиция в плюсе", () => {
     const r = replayExit(shortTrap, "short", 99.5, 100.5,
       EXIT({ squeezePolicy: "invert", squeezeThreshold: 0.6, hardStop: 50, trailingTake: 50, staleMinutes: 5 }));
-    expect(r.reason).toBe("invert");
-    expect(r.inverted).toBe(true);
+    expect(r.inverted).toBe(true);              // флаг инверсии
+    expect(["trailing-take", "life-cap", "peak-staleness"]).toContain(r.reason); // настоящий выход сохранён
     expect(r.pnl).toBeGreaterThan(0); // long снял рост, который убил бы short
   });
 
@@ -52,7 +52,8 @@ describe("replayExit — invert (stop hunt → разворот)", () => {
     ]);
     const r = replayExit(longTrap, "long", 99.5, 100.5,
       EXIT({ squeezePolicy: "invert", squeezeThreshold: 0.6, hardStop: 50, trailingTake: 50, staleMinutes: 5 }));
-    expect(r.reason).toBe("invert");
+    expect(r.inverted).toBe(true);
+    expect(["trailing-take", "life-cap", "peak-staleness"]).toContain(r.reason);
     expect(r.pnl).toBeGreaterThan(0); // short снял падение
   });
 

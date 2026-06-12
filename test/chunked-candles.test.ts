@@ -85,3 +85,33 @@ describe("fetchCandlesChunked", () => {
     expect(MAX_CANDLES_PER_CHUNK).toBe(500);
   });
 });
+
+describe("chunked — дедуп оставляет ПЕРВОЕ вхождение (авторитетное)", () => {
+  const STEP = STEP_MS["1m"];
+  it("дубль ts с разными данными → побеждает первая свеча, не последняя", async () => {
+    // адаптер отдаёт дубль каждого чётного ts с битым объёмом ПОСЛЕ настоящего
+    const dups: GetCandles = async (_s, _i, lim, sd) => {
+      const out: ICandleData[] = [];
+      for (let i = 0; i < (lim ?? 0); i++) {
+        out.push({ timestamp: sd! + i * STEP, open: 100, high: 101, low: 99, close: 100, volume: 1000 });
+        if (i % 2 === 0) out.push({ timestamp: sd! + i * STEP, open: 100, high: 101, low: 99, close: 100, volume: 9999 }); // битый дубль
+      }
+      return out;
+    };
+    const r = await fetchCandlesChunked(dups, "X", "1m", 1000, t0, 500);
+    const first = r.find((c) => c.timestamp === t0);
+    expect(first!.volume).toBe(1000); // первая (настоящая), не битый дубль 9999
+    // все ts уникальны
+    expect(new Set(r.map((c) => c.timestamp)).size).toBe(r.length);
+  });
+
+  it("адаптер возвращает свечи в обратном порядке → результат отсортирован", async () => {
+    const reversed: GetCandles = async (_s, _i, lim, sd) => {
+      const out: ICandleData[] = [];
+      for (let i = (lim ?? 0) - 1; i >= 0; i--) out.push({ timestamp: sd! + i * STEP, open: 100, high: 101, low: 99, close: 100, volume: 1000 });
+      return out;
+    };
+    const r = await fetchCandlesChunked(reversed, "X", "1m", 1000, t0, 500);
+    for (let i = 1; i < r.length; i++) expect(r[i].timestamp).toBeGreaterThan(r[i - 1].timestamp);
+  });
+});

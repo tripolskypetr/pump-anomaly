@@ -13,7 +13,7 @@ import { lagXCorr } from "./layers/lag-xcorr";
 import { clusterAuthors } from "./layers/cluster-authors";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
 import { ViabilityConfig } from "./types";
-import { ProgressFn, silentProgress } from "./progress";
+import { ProgressFn, stdoutProgress } from "./progress";
 import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
@@ -50,6 +50,12 @@ export interface TrainGrid {
   squeezeThreshold: number[];
   /** baseline-окно для volZ (свечей до входа) */
   volBaselineWindow: number[];
+  /**
+   * Окно стационарности, мс: на длинном горизонте статистики (τ, author-матрица)
+   * считаются по локальному окну, а не по всей истории. Infinity = вся история.
+   * train перебирает варианты и выбирает по CV.
+   */
+  stationarityWindowMs: number[];
 }
 
 export const DEFAULT_GRID: TrainGrid = {
@@ -66,6 +72,8 @@ export const DEFAULT_GRID: TrainGrid = {
   squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
   squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
   volBaselineWindow: [20],
+  // вся история + конечные окна (4 / 8 недель); train выберет по CV
+  stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
 };
 
 export interface TrainOptions {
@@ -82,7 +90,7 @@ export interface TrainOptions {
   mode?: "auto" | "matrix" | "single";
   /** переопределение порогов жизнеспособности матрицы (auto-режим) */
   viability?: Partial<ViabilityConfig>;
-  /** колбэк прогресса обучения (по умолчанию тихо; передай stdoutProgress для бара) */
+  /** колбэк прогресса обучения (по умолчанию stdout-бар; передай silentProgress чтобы заглушить) */
   onProgress?: ProgressFn;
 }
 
@@ -244,24 +252,28 @@ export async function train(
   // ── фаза разметки с прогрессом ──
   // предварительно перечисляем кандидатов по каждому ключу кластеризации (дёшево,
   // pure CPU без IO), чтобы знать ГЛОБАЛЬНЫЙ total медленных labelBurst-вызовов.
-  const progress = opts.onProgress ?? silentProgress;
+  const progress = opts.onProgress ?? stdoutProgress;
   type Pass = { ckey: string; skey?: string; cands: ReturnType<typeof enumerateBursts> };
   const passes: Pass[] = [];
+  // окно стационарности влияет ТОЛЬКО на matrix (author-матрица); в single посты
+  // не используют матрицу, поэтому там окно не перебираем (одно значение).
+  const swAxis = effMode === "single" ? [Infinity] : grid.stationarityWindowMs;
   for (const wK of grid.windowK)
     for (const jac of grid.jaccardThreshold)
-      for (const lag of grid.lagPeakThreshold) {
-        const ckey = `${wK}|${jac}|${lag}`;
-        if (seenCluster.has(ckey)) continue;
-        seenCluster.add(ckey);
-        if (effMode === "single") {
-          const skey = `single|${wK}`;
-          if (labeledCache.has(`__enum_${skey}`)) { passes.push({ ckey, skey, cands: [] }); continue; }
-          labeledCache.set(`__enum_${skey}`, []); // маркер «уже перечислили»
-          passes.push({ ckey, skey, cands: enumeratePosts(items, wK, maxBurstWindowMs) });
-        } else {
-          passes.push({ ckey, cands: enumerateBursts(items, wK, jac, lag, maxBurstWindowMs) });
+      for (const lag of grid.lagPeakThreshold)
+        for (const sw of swAxis) {
+          const ckey = `${wK}|${jac}|${lag}|${sw}`;
+          if (seenCluster.has(ckey)) continue;
+          seenCluster.add(ckey);
+          if (effMode === "single") {
+            const skey = `single|${wK}`;
+            if (labeledCache.has(`__enum_${skey}`)) { passes.push({ ckey, skey, cands: [] }); continue; }
+            labeledCache.set(`__enum_${skey}`, []); // маркер «уже перечислили»
+            passes.push({ ckey, skey, cands: enumeratePosts(items, wK, maxBurstWindowMs) });
+          } else {
+            passes.push({ ckey, cands: enumerateBursts(items, wK, jac, lag, maxBurstWindowMs, sw) });
+          }
         }
-      }
   labeledCache.clear();
   seenCluster.clear();
 
@@ -296,23 +308,25 @@ export async function train(
   };
   const board: Entry[] = [];
 
-  // total для фазы score = число (wK×jac×lag) комбинаций (тик на каждую)
-  const scoreTotal = grid.windowK.length * grid.jaccardThreshold.length * grid.lagPeakThreshold.length;
+  // total для фазы score = число (wK×jac×lag×sw) комбинаций (тик на каждую)
+  const scoreTotal = grid.windowK.length * grid.jaccardThreshold.length
+    * grid.lagPeakThreshold.length * swAxis.length;
   let scoreDone = 0;
 
   for (const wK of grid.windowK)
     for (const jac of grid.jaccardThreshold)
-      for (const lag of grid.lagPeakThreshold) {
+      for (const lag of grid.lagPeakThreshold)
+        for (const sw of swAxis) {
         const labeled = effMode === "single"
           ? labeledCache.get(`single|${wK}`)!
-          : labeledCache.get(`${wK}|${jac}|${lag}`)!;
+          : labeledCache.get(`${wK}|${jac}|${lag}|${sw}`)!;
         for (const minC of minClusterAxis)
           for (const ex of exitSets) {
             const ekey = exitKey(ex);
             const selected = labeled
               .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
               .sort((a, b) => a.ts - b.ts);
-            const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode);
+            const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode, sw);
             if (selected.length === 0) {
               board.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0,
                 _foldMeans: [], _foldSizes: [], _returns: [] });
@@ -339,7 +353,7 @@ export async function train(
             });
           }
         scoreDone++;
-        progress({ done: scoreDone, total: scoreTotal, phase: "score", label: `${wK}|${jac}|${lag}` });
+        progress({ done: scoreDone, total: scoreTotal, phase: "score", label: `${wK}|${jac}|${lag}|${sw === Infinity ? "all" : sw}` });
       }
 
   board.sort((a, b) => b.cvScore - a.cvScore);
@@ -355,7 +369,7 @@ export async function train(
   // источников. Каскад ликвидаций симметричен: long-trap и short-trap — РАЗНЫЕ ячейки.
   const winLabeled = effMode === "single"
     ? labeledCache.get(`single|${top.config.windowK}`)!
-    : labeledCache.get(`${top.config.windowK}|${top.config.jaccardThreshold}|${top.config.lagPeakThreshold}`)!;
+    : labeledCache.get(`${top.config.windowK}|${top.config.jaccardThreshold}|${top.config.lagPeakThreshold}|${top.config.stationarityWindowMs}`)!;
   const winSelected = winLabeled
     .filter((b) => b.independentClusters >= top.config.minClusters)
     .sort((a, b) => a.ts - b.ts);
@@ -460,9 +474,9 @@ export async function train(
 function cfgOf(
   windowK: number, minClusters: number, jaccardThreshold: number,
   lagPeakThreshold: number, maxBurstWindowMs: number,
-  mode: "matrix" | "single",
+  mode: "matrix" | "single", stationarityWindowMs: number,
 ): DetectorConfig {
-  return { windowK, minClusters, jaccardThreshold, lagPeakThreshold, maxBurstWindowMs, mode };
+  return { windowK, minClusters, jaccardThreshold, lagPeakThreshold, maxBurstWindowMs, mode, stationarityWindowMs };
 }
 
 // ─────────────────── десериализация: params → predict ─────────────────────────

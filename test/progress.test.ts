@@ -44,9 +44,20 @@ describe("train — прогрессбар", () => {
     expect(last.done).toBe(last.total);
   });
 
-  it("без onProgress (silent по умолчанию) не падает", async () => {
-    const res = await train(fx.items, getCandles, { folds: 3, grid });
-    expect(res.params.version).toBe(3);
+  it("по умолчанию (casual) пишет в stdout — без onProgress", async () => {
+    // setup.ts глушит реальный stdout; перехватываем write, чтобы убедиться, что
+    // дефолтный путь действительно туда пишет (а не молчит).
+    const writes: string[] = [];
+    const real = process.stdout.write;
+    // @ts-expect-error — временно перехватываем
+    process.stdout.write = (chunk: string) => { writes.push(String(chunk)); return true; };
+    try {
+      await train(fx.items, getCandles, { folds: 3, grid }); // без onProgress → stdout по умолчанию
+    } finally {
+      process.stdout.write = real;
+    }
+    expect(writes.length).toBeGreaterThan(0);
+    expect(writes.some((w) => w.includes("label"))).toBe(true);
   });
 
   it("silentProgress — no-op, не бросает", () => {

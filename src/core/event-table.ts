@@ -40,3 +40,33 @@ export function buildTable(raw: SignalEvent[]): EventTable {
 
   return { events, byKey, byChannelKey, channels: [...channelSet] };
 }
+
+/**
+ * Окно стационарности. Статистики (τ, author-матрица, Jaccard) на длинном горизонте
+ * корраптятся: они агрегируются по ВСЕЙ истории, а за 5 месяцев режим дрейфует —
+ * каналы появляются/замолкают, «братские» пары распадаются, τ плывёт. Один глобальный
+ * набор усредняет несопоставимые периоды.
+ *
+ * Решение без новой математики: считать статистики только по локальному окну,
+ * заканчивающемуся в момент anchorTs. windowMs=Infinity → вся история (старое
+ * поведение, для коротких данных). Размер окна перебирается grid'ом в train.
+ */
+export function windowEvents(
+  events: SignalEvent[],
+  anchorTs: number,
+  windowMs: number,
+): SignalEvent[] {
+  if (!Number.isFinite(windowMs)) return events;
+  const lo = anchorTs - windowMs;
+  // events отсортированы по ts → берём срез (lo, anchorTs]
+  return events.filter((e) => e.ts > lo && e.ts <= anchorTs);
+}
+
+/** Таблица, построенная по окну стационарности до anchorTs. */
+export function buildWindowedTable(
+  events: SignalEvent[],
+  anchorTs: number,
+  windowMs: number,
+): EventTable {
+  return buildTable(windowEvents(events, anchorTs, windowMs));
+}

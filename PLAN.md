@@ -116,24 +116,40 @@ for (const p of plans) {
 
 Для бэктеста — `planForAt(symbol, dir, channel, candles, entryTs)`: явный момент входа, история до него, форвардные свечи после для squeezePressure.
 
-## Прогрессбар обучения
+## Окно стационарности (длинный горизонт)
 
-`train`/`fit` делают вложенные циклы (медленная разметка свечами + grid-скоринг). Прогресс пишется в stdout, если передать `onProgress`:
+На 5 месяцах статистики корраптятся: τ и author-матрица агрегируются по ВСЕЙ истории, а режим за это время дрейфует — каналы появляются/замолкают, «братские» пары распадаются. Один глобальный набор усредняет несопоставимые периоды, и матрица «помнит» январскую связь в мае.
+
+Решение без новой математики: статистики считаются по локальному окну, заканчивающемуся в текущем моменте. Размер окна — ось grid, train подбирает по CV:
 
 ```ts
-import { PumpMatrix, stdoutProgress } from "pump-matrix";
+fit(history, getCandles, {
+  grid: {
+    stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
+  },
+});
+```
 
-await PumpMatrix.fit(history, getCandles, { onProgress: stdoutProgress });
+`Infinity` = старое поведение (вся история, годится на коротких данных). На длинном горизонте побеждает конечное окно — оно отбрасывает протухшие связи. В `predict`/live окно применяется автоматически к последнему периоду до самого свежего события. Влияет только на matrix-режим (author-матрица); single-режим от него не зависит.
+
+## Прогрессбар обучения
+
+`train`/`fit` делают вложенные циклы (медленная разметка свечами + grid-скоринг). Прогресс пишется в stdout **по умолчанию** — обучил, сразу видишь:
+
+```ts
+import { PumpMatrix } from "pump-matrix";
+
+await PumpMatrix.fit(history, getCandles); // бар включён сам собой
 // [██████████████░░░░░░░░░░░░░░░░] 47% (42/90) label TRXUSDT
 // [██████████████████████████████] 100% (27/27) score 5|0.4|0.6
 ```
 
-Две фазы: `label` (разметка по 1m-свечам, где идёт IO) и `score` (grid-скоринг по кэшу). По умолчанию тихо (`silentProgress`). Свой колбэк — для лога/UI вместо stdout:
+Две фазы: `label` (разметка по 1m-свечам, где идёт IO) и `score` (grid-скоринг по кэшу). Заглушить (тесты, CI, программное использование) или подменить на свой лог/UI:
 
 ```ts
-fit(history, getCandles, {
-  onProgress: (e) => myLogger.info(`${e.phase} ${e.done}/${e.total}`),
-});
+import { silentProgress } from "pump-matrix";
+fit(history, getCandles, { onProgress: silentProgress });               // тихо
+fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); // свой
 ```
 
 ## Два режима отбора входов
@@ -209,6 +225,6 @@ const model = await PumpMatrix.fit(history, getCandles, {
 
 ```bash
 npm i
-npm test        # vitest run — 98 тестов (replay, volume, invert, plan, progress, tensor)
+npm test        # vitest run — 103 теста (replay, volume, invert, plan, progress, stationarity, tensor)
 npm run build
 ```

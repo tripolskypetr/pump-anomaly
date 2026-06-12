@@ -1,5 +1,5 @@
 import { DetectorConfig, ParserItem, SignalEvent, Direction } from "./types";
-import { buildTable, splitKey, EventTable } from "./core/event-table";
+import { buildTable, splitKey, EventTable, buildWindowedTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
 import { jaccardScreen } from "./layers/jaccard-screen";
 import { lagXCorr } from "./layers/lag-xcorr";
@@ -27,25 +27,41 @@ export function enumerateBursts(
   jaccardThreshold: number,
   lagPeakThreshold: number,
   maxBurstWindowMs: number,
+  stationarityWindowMs: number = Infinity,
 ): CandidateBurst[] {
   const events = items as SignalEvent[];
-  const tbl: EventTable = buildTable(events);
-  const tau = selfTuneLag(tbl);
-  const window = Math.min(windowK * tau, maxBurstWindowMs);
+  const fullTbl: EventTable = buildTable(events);
 
-  const screened = jaccardScreen(tbl, window, jaccardThreshold);
-  const directed = lagXCorr(tbl, screened, lagPeakThreshold, window);
-  const clusterOf = clusterAuthors(tbl.channels, directed);
+  // author-матрица + τ считаются по ОКНУ СТАЦИОНАРНОСТИ, чтобы на длинном горизонте
+  // не усреднять дрейфующие режимы. Без окна (Infinity) — старое поведение.
+  // Для эффективности: если окно бесконечно, считаем матрицу один раз.
+  const buildAuthorCtx = (anchorTs: number) => {
+    const tbl = Number.isFinite(stationarityWindowMs)
+      ? buildWindowedTable(events, anchorTs, stationarityWindowMs)
+      : fullTbl;
+    const tau = selfTuneLag(tbl);
+    const window = Math.min(windowK * tau, maxBurstWindowMs);
+    const screened = jaccardScreen(tbl, window, jaccardThreshold);
+    const directed = lagXCorr(tbl, screened, lagPeakThreshold, window);
+    const clusterOf = clusterAuthors(tbl.channels, directed);
+    return { window, clusterOf };
+  };
+
+  // глобальный контекст для бесконечного окна (один раз)
+  const globalCtx = Number.isFinite(stationarityWindowMs) ? null : buildAuthorCtx(0);
 
   const bursts: CandidateBurst[] = [];
-  for (const [k, evs] of tbl.byKey) {
+  for (const [k, evs] of fullTbl.byKey) {
     const [symbol, direction] = splitKey(k);
-    let lo = 0;
     let best: CandidateBurst | null = null;
     for (let hi = 0; hi < evs.length; hi++) {
-      while (evs[hi].ts - evs[lo].ts > window) lo++;
+      // контекст авторства на момент этого события (его окно стационарности)
+      const ctx = globalCtx ?? buildAuthorCtx(evs[hi].ts);
+      // окно синхронности всплеска внутри контекста
+      let lo = hi;
+      while (lo > 0 && evs[hi].ts - evs[lo - 1].ts <= ctx.window) lo--;
       const slice = evs.slice(lo, hi + 1);
-      const clusters = new Set(slice.map((e) => clusterOf.get(e.channel)));
+      const clusters = new Set(slice.map((e) => ctx.clusterOf.get(e.channel)));
       const channels = new Set(slice.map((e) => e.channel));
       const dedup = clusters.size / channels.size;
       const fill = Math.min(slice.length / 4, 1);

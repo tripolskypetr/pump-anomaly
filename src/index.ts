@@ -5,7 +5,7 @@ import {
   PredictionResult,
   SignalEvent,
 } from "./types";
-import { buildTable } from "./core/event-table";
+import { buildTable, buildWindowedTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
 import { jaccardScreen } from "./layers/jaccard-screen";
 import { lagXCorr } from "./layers/lag-xcorr";
@@ -54,7 +54,14 @@ export function predict(
 ): PredictionResult {
   const cfg: DetectorConfig = { ...DEFAULT_CONFIG, ...config };
   const events = normalize(parserItems);
-  const tbl = buildTable(events);
+  const fullTbl = buildTable(events);
+
+  // окно стационарности: статистики авторства считаем по последнему окну,
+  // заканчивающемуся на самом свежем событии (а не по всей истории).
+  const anchorTs = events.length ? events[events.length - 1].ts : 0;
+  const tbl = Number.isFinite(cfg.stationarityWindowMs)
+    ? buildWindowedTable(events, anchorTs, cfg.stationarityWindowMs)
+    : fullTbl;
 
   const tau = selfTuneLag(tbl);
   const window = Math.min(cfg.windowK * tau, cfg.maxBurstWindowMs);
@@ -105,7 +112,7 @@ export function predict(
 
 export * from "./types";
 export * from "./candle";
-export { buildTable } from "./core/event-table";
+export { buildTable, buildWindowedTable, windowEvents } from "./core/event-table";
 export { selfTuneLag } from "./layers/self-tune-lag";
 export { jaccardScreen, jaccardPair } from "./layers/jaccard-screen";
 export { lagXCorr } from "./layers/lag-xcorr";

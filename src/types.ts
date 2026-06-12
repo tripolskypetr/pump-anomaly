@@ -104,6 +104,12 @@ export interface DetectorConfig {
   mode: DetectorMode;
   /** переопределение порогов жизнеспособности матрицы (auto-режим) */
   viability?: Partial<ViabilityConfig>;
+  /**
+   * Окно стационарности, мс: статистики (τ, author-матрица) считаются по локальному
+   * окну, а не по всей истории — защита от дрейфа режима на длинном горизонте.
+   * Infinity (по умолчанию) = вся история.
+   */
+  stationarityWindowMs: number;
 }
 
 export const DEFAULT_CONFIG: DetectorConfig = {
@@ -113,4 +119,5 @@ export const DEFAULT_CONFIG: DetectorConfig = {
   lagPeakThreshold: 0.5,
   maxBurstWindowMs: 60 * 60 * 1000,
   mode: "auto",
+  stationarityWindowMs: Infinity,
 };

@@ -20,8 +20,6 @@ It solves three problems:
 2. **Separates a pump from stop hunting** — traps where a signal leads the crowd into leverage so it can be wiped out by a liquidation cascade. The training label comes from a simulation of *your* prod exit on 1m candles, not close-to-close.
 3. **Produces a ready-to-trade plan** with trained exit parameters (trailing take / hard stop / impact horizon), tuned separately per source.
 
-Compatible with the `parser-items` schema (`channel`, `symbol`, `direction`, `entry: {from, to}`, …).
-
 ---
 
 ## Installation

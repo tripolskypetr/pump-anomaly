@@ -25,9 +25,7 @@ It solves three problems:
 ## Installation
 
 ```bash
-npm i
-npm run build   # tsc / rollup -> build/
-npm test        # vitest run — 387 tests files
+npm install pump-anomaly
 ```
 
 ---

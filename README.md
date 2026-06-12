@@ -169,7 +169,7 @@ const DEFAULT_GRID = {
   volBaselineWindow:[20],
   cascadeWindowMinutes: [15, 30, 60],           // cascade-detection window — NOT the holding horizon
   // stationarity window (long horizon)
-  stationarityWindowMs: [Infinity, 28*24*3600_000, 56*24*3600_000],
+  stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
 };
 ```
 
@@ -364,10 +364,10 @@ On 5 months of data, statistics get corrupted: τ and the author matrix are aggr
 The fix needs no new math: statistics are computed over a local window ending at the current moment. The window size is a grid axis, tuned by `train` via CV:
 
 ```ts
-stationarityWindowMs: [Infinity, 28*24*3600_000, 56*24*3600_000]
+stationarityWindowMs: [28*24*3600_000, 56*24*3600_000]
 ```
 
-`Infinity` = the whole history (old behavior, fine on short data). On a long horizon a finite window wins — it drops stale connections. In `predict`/live, the window is applied automatically to the most recent period up to the latest event. Affects only matrix mode (author matrix); single mode is independent of it.
+`Infinity` = the whole history. On a long horizon a finite window wins — it drops stale connections. In `predict`/live, the window is applied automatically to the most recent period up to the latest event. Affects only matrix mode (author matrix); single mode is independent of it.
 
 ---
 

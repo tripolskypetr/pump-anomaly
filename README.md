@@ -167,7 +167,7 @@ const DEFAULT_GRID = {
   squeezePolicy:    ["none", "tighten", "veto", "invert"],
   squeezeThreshold: [0.55, 0.7],
   volBaselineWindow:[20],
-  cascadeWindowMinutes: [15, 30, 60],           // cascade-detection window — NOT the holding horizon
+  cascadeWindowMinutes: [15, 30, 60, 120, 240],           // cascade-detection window — NOT the holding horizon
   // stationarity window (long horizon)
   stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
 };

@@ -87,10 +87,10 @@ describe("train — single-channel fallback может стать reliable", () 
     expect(model.mode).toBe("single");
     const plans = model.signals(items);
     expect(plans.length).toBeGreaterThan(0);
-    expect(plans.every((p) => p.source === "single")).toBe(true);
+    expect(plans.every((p) => p.origin.detector === "single")).toBe(true);
     // exit-план приложен
-    expect(plans[0].trailingTake).toBe(1.0);
-    expect(plans[0].hardStop).toBe(2.0);
-    expect(plans[0].impactHorizonMinutes).toBe(240);
+    expect(plans[0].exit.trailingTake).toBe(1.0);
+    expect(plans[0].exit.hardStop).toBe(2.0);
+    expect(plans[0].exit.impactHorizonMinutes).toBe(240);
   });
 });

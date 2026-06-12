@@ -33,6 +33,7 @@ function matrixModel(): PumpMatrix {
       byMode: { matrix: { ...base, trailingTake: 3.0 }, single: { ...base, trailingTake: 1.0 } },
       global: { ...base, trailingTake: 1.0 },
     },
+    policy: { allow: ["enter", "invert", "tighten"] },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.05, cvWinrate: 0.6, cvSupport: 20,
       gridSize: 100, mode: "matrix", impactHorizonMinutes: 240,
@@ -53,9 +54,10 @@ describe("matrix cell-exit резолвится через _matrix ключ (р�
     const cs = candles(rows);
     // matrix planForAt: channel=null (межканальный), но cell должен найтись под _matrix
     const plan = model.planForAt("SOLUSDT", "long", null, cs, cs[20].timestamp);
-    expect(plan.volRegime).toBe("calm");
-    expect(plan.exitSource).toBe("cell");          // ← до фикса было "mode" (cell терялся)
-    expect(plan.trailingTake).toBe(2.5);
+    expect(plan).not.toBe(null);
+    expect(plan!.origin.volRegime).toBe("calm");
+    expect(plan!.origin.exitSource).toBe("cell");   // ← до фикса было "mode" (cell терялся)
+    expect(plan!.exit.trailingTake).toBe(2.5);
   });
 
   it("planForAt без свечей → symbol-dir (cell требует volRegime)", () => {
@@ -63,6 +65,6 @@ describe("matrix cell-exit резолвится через _matrix ключ (р�
     const plan = model.planForAt("SOLUSDT", "long", null, cs, cs[0].timestamp);
     // одна свеча без истории → volZ≈0 → calm, но cell есть → может быть cell;
     // главное: exit разрешается и trailing — число
-    expect(typeof plan.trailingTake).toBe("number");
+    expect(typeof plan!.exit.trailingTake).toBe("number");
   });
 });

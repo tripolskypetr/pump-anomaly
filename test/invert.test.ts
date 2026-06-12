@@ -94,6 +94,7 @@ function invertModel(): PumpMatrix {
       byMode: { single: { ...base, trailingTake: 1.0 }, matrix: { ...base, trailingTake: 2.0 } },
       global: { ...base, trailingTake: 1.0 },
     },
+    policy: { allow: ["enter", "invert", "tighten"] },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.02, cvWinrate: 0.6, cvSupport: 10,
       gridSize: 50, mode: "single", impactHorizonMinutes: 240,
@@ -114,12 +115,12 @@ describe("signals/plan — инверсия прозрачна для прода
     rows.push([101.9, 104, 101.8, 103.9, 9000]);
     const cs = candles(rows);
 
-    const plan = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
-    expect(plan.recommendation).toBe("invert");
-    expect(plan.inverted).toBe(true);
-    expect(plan.originalDirection).toBe("short"); // что сказал канал
-    expect(plan.direction).toBe("long");          // что исполнять (развёрнуто)
-    expect(plan.trailingTake).toBe(0.7);          // exit из инверс-ячейки long-anomalous
+    const s = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
+    expect(s).not.toBe(null);
+    expect(s!.action).toBe("invert");
+    expect(s!.origin.invertedFrom).toBe("short");  // что сказал канал
+    expect(s!.direction).toBe("long");             // что исполнять (развёрнуто)
+    expect(s!.exit.trailingTake).toBe(0.7);        // exit из инверс-ячейки long-anomalous
   });
 
   it("прод НЕ думает: просто открывает plan.direction", () => {
@@ -129,14 +130,14 @@ describe("signals/plan — инверсия прозрачна для прода
     rows.push([100.4, 102, 100.3, 101.9, 9000]);
     rows.push([101.9, 104, 101.8, 103.9, 9000]);
     const cs = candles(rows);
-    const plan = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
-    // приложение просто исполняет plan.direction — здесь long, без единого if
-    expect(["long", "short"]).toContain(plan.direction);
-    expect(plan.direction).toBe("long");
+    const s = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
+    // приложение просто исполняет s.direction — здесь long, без единого if
+    expect(s).not.toBe(null);
+    expect(s!.direction).toBe("long");
   });
 });
 
-describe("RuntimeOptions — выключение инверсии без переобучения", () => {
+describe("allow-политика — выключение инверсии без переобучения", () => {
   const model = invertModel();
   const trapCandles = () => {
     const rows: Array<[number, number, number, number, number]> = [];
@@ -147,26 +148,25 @@ describe("RuntimeOptions — выключение инверсии без пер
     return candles(rows);
   };
 
-  it("disableInvert → инверсия глушится в veto (не разворачиваем)", () => {
+  it("allow без invert → инверсия не разрешена → сигнал не отдаётся (как veto)", () => {
     const cs = trapCandles();
-    const plan = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp, { disableInvert: true });
-    expect(plan.recommendation).toBe("veto");
-    expect(plan.inverted).toBe(false);
-    expect(plan.direction).toBe("short"); // НЕ развёрнут
+    const s = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp, { allow: ["enter", "tighten"] });
+    expect(s).toBe(null); // инверсия запрещена → не входим в ловушку
   });
 
-  it("без флага та же ловушка → invert (для контраста)", () => {
+  it("allow по умолчанию (включая invert) → разворот в long", () => {
     const cs = trapCandles();
-    const plan = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
-    expect(plan.recommendation).toBe("invert");
-    expect(plan.direction).toBe("long");
+    const s = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp);
+    expect(s).not.toBe(null);
+    expect(s!.action).toBe("invert");
+    expect(s!.direction).toBe("long");
   });
 
-  it("disableSqueeze → вся каскад-логика выключена, обычный enter", () => {
+  it("readonly-инвариант: запрос НЕ расширяет обученную политику", () => {
+    // модель обучена с allow=[enter,invert,tighten]; запрос только [enter] → пересечение [enter]
     const cs = trapCandles();
-    const plan = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp, { disableSqueeze: true });
-    expect(plan.recommendation).toBe("enter");
-    expect(plan.inverted).toBe(false);
-    expect(plan.direction).toBe("short");
+    const s = model.planForAt("SOLUSDT", "short", "ch", cs, cs[20].timestamp, { allow: ["enter"] });
+    // invert не в пересечении → не отдаётся
+    expect(s).toBe(null);
   });
 });

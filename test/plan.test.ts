@@ -44,6 +44,7 @@ function makeModel(): PumpMatrix {
       },
       global: { trailingTake: 1.0, hardStop: 1, stalenessSinceProfit: 1, stalenessSinceMinutes: 240, staleMinutes: 240 },
     },
+    policy: { allow: ["enter", "invert", "tighten"] },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.01, cvWinrate: 0.6, cvSupport: 10,
       gridSize: 100, mode: "single", impactHorizonMinutes: 240,
@@ -63,10 +64,11 @@ describe("planFor — свечи на вход, готовый план на в�
     rows.push([100.9, 102, 100.8, 101.9, 1000]);  // forward: рост в сторону long
     const cs = candles(rows);
     const plan = model.planForAt("SOLUSDT", "long", "crypto_yoda", cs, cs[20].timestamp);
-    expect(plan.volRegime).toBe("calm");
-    expect(plan.exitSource).toBe("cell");
-    expect(plan.trailingTake).toBe(2.0);
-    expect(plan.recommendation).toBe("enter");
+    expect(plan).not.toBe(null);
+    expect(plan!.origin.volRegime).toBe("calm");
+    expect(plan!.origin.exitSource).toBe("cell");
+    expect(plan!.exit.trailingTake).toBe(2.0);
+    expect(plan!.action).toBe("enter");
   });
 
   it("аномальный объём + каскад против long → cell anomalous, veto", () => {
@@ -77,11 +79,8 @@ describe("planFor — свечи на вход, готовый план на в�
     rows.push([98.2, 98.3, 96, 96.4, 9000]);
     const cs = candles(rows);
     const plan = model.planForAt("SOLUSDT", "long", "crypto_yoda", cs, cs[20].timestamp);
-    expect(plan.volRegime).toBe("anomalous");
-    expect(plan.volZ).toBeGreaterThan(2);
-    expect(plan.squeezePressure).toBeGreaterThan(0.6);
-    expect(plan.recommendation).toBe("veto"); // каскад ликвидаций — не входим
-    expect(plan.squeezePolicy).toBe("veto");
+    // veto → сигнал НЕ возвращается (фильтр внутри), исполнять нечего
+    expect(plan).toBe(null);
   });
 });
 
@@ -98,8 +97,8 @@ describe("plan — батч сигналов + словарь свечей", () 
     rows.push([100.9, 102, 100.8, 101.9, 1000]);
     const plans = model.plan(items, { SOLUSDT: candles(rows) });
     expect(plans.length).toBe(1);
-    expect(plans[0].volRegime).toBe("calm");
-    expect(plans[0].exitSource).toBe("cell");
+    expect(plans[0].origin.volRegime).toBe("calm");
+    expect(plans[0].origin.exitSource).toBe("cell");
   });
 
   it("символ без свечей → fallback на symbol-dir, recommendation enter, volRegime null", () => {
@@ -107,11 +106,10 @@ describe("plan — батч сигналов + словарь свечей", () 
       { channel: "crypto_yoda", symbol: "SOLUSDT", direction: "long" as const, ts: t0 },
     ];
     const plans = model.plan(items, {}); // свечей нет
-    expect(plans[0].volRegime).toBe(null);
-    expect(plans[0].squeezePressure).toBe(null);
-    expect(plans[0].recommendation).toBe("enter");
-    expect(plans[0].exitSource).toBe("symbol-dir");
-    expect(plans[0].trailingTake).toBe(1.0); // symbol-dir exit
+    expect(plans[0].origin.volRegime).toBe(null);
+    expect(plans[0].action).toBe("enter");
+    expect(plans[0].origin.exitSource).toBe("symbol-dir");
+    expect(plans[0].exit.trailingTake).toBe(1.0); // symbol-dir exit
   });
 });
 
@@ -120,7 +118,7 @@ describe("signals — без свечей остаётся рабочим", () =
     const model = makeModel();
     const items = [{ channel: "crypto_yoda", symbol: "SOLUSDT", direction: "long" as const, ts: t0 }];
     const plans = model.signals(items);
-    expect(plans[0].volRegime).toBe(null);
-    expect(plans[0].recommendation).toBe("enter");
+    expect(plans[0].origin.volRegime).toBe(null);
+    expect(plans[0].action).toBe("enter");
   });
 });

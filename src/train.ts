@@ -17,6 +17,7 @@ import { ProgressFn, stdoutProgress } from "./progress";
 import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
+import { SignalPolicy, DEFAULT_POLICY } from "./signal";
 import { shrinkageExpectancy, winrate } from "./objective";
 import {
   computeReliability,
@@ -92,6 +93,11 @@ export interface TrainOptions {
   viability?: Partial<ViabilityConfig>;
   /** колбэк прогресса обучения (по умолчанию stdout-бар; передай silentProgress чтобы заглушить) */
   onProgress?: ProgressFn;
+  /**
+   * Политика разрешённых исходов, вшиваемая в обученную модель (сериализуется).
+   * По умолчанию все: enter, invert, tighten. В исполнении её можно только сузить.
+   */
+  policy?: SignalPolicy;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -101,6 +107,11 @@ export interface TrainedParams {
   config: DetectorConfig;
   /** prod-выход: tensor3d [mode][channel][symbol] + иерархический fallback */
   exit: ExitTensor;
+  /**
+   * Политика разрешённых исходов, ЗАФИКСИРОВАННАЯ на обучении и сериализуемая.
+   * В исполнении readonly — signals() может только сузить её, не расширить.
+   */
+  policy: SignalPolicy;
   meta: {
     trainedAt: number;
     folds: number;
@@ -458,6 +469,7 @@ export async function train(
     version: 3,
     config: top.config,
     exit: tensor,
+    policy: opts.policy ?? DEFAULT_POLICY,
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,
       cvScore: top.cvScore, cvWinrate: top.cvWinrate, cvSupport: top.cvSupport,

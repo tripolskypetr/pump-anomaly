@@ -154,6 +154,9 @@ export type {
   TrainResult,
 } from "./train";
 export { PumpMatrix } from "./pump-matrix";
-export type { TradePlan, RuntimeOptions } from "./pump-matrix";
+export type {
+  TradeSignal, SignalAction, SignalOrigin, ExitPlan, SignalPolicy,
+} from "./signal";
+export { DEFAULT_POLICY, intersectPolicy } from "./signal";
 export { stdoutProgress, silentProgress } from "./progress";
 export type { ProgressFn, ProgressEvent } from "./progress";

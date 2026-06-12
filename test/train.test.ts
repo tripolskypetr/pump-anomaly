@@ -85,10 +85,10 @@ describe("PumpMatrix — casual API", () => {
     const model = await PumpMatrix.fit(fx.items, getCandles, { folds: 3, grid });
     const plans = model.signals(fx.items);
     for (const p of plans) {
-      expect(p.trailingTake).toBe(1.0);
-      expect(p.hardStop).toBe(2.0);
-      expect(p.impactHorizonMinutes).toBe(240);
-      expect(typeof p.modelReliable).toBe("boolean");
+      expect(p.exit.trailingTake).toBe(1.0);
+      expect(p.exit.hardStop).toBe(2.0);
+      expect(p.exit.impactHorizonMinutes).toBe(240);
+      expect(typeof p.origin.modelReliable).toBe("boolean");
     }
   });
 

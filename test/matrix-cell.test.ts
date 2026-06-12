@@ -34,6 +34,7 @@ function matrixModel(): PumpMatrix {
       global: { ...base, trailingTake: 1.0 },
     },
     policy: { allow: ["enter", "invert", "tighten"] },
+    riskReward: { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.05, cvWinrate: 0.6, cvSupport: 20,
       gridSize: 100, mode: "matrix", impactHorizonMinutes: 240,

@@ -84,6 +84,14 @@ export type AllowAction = "enter" | "invert" | "tighten";
 export interface SignalPolicy {
   /** какие исходы попадают в выдачу. По умолчанию все три. */
   allow: AllowAction[];
+  /**
+   * Минимальный risk-reward символа для допуска сигнала (readonly-фильтр).
+   * Режет символы, у которых backtest-RR ниже порога. Какую метрику сравнивать —
+   * задаёт rrMetric. undefined = без RR-фильтра.
+   */
+  minRiskReward?: number;
+  /** какую RR-метрику символа сравнивать с minRiskReward. По умолчанию "mean". */
+  rrMetric?: "mean" | "p95" | "p99";
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -93,12 +101,20 @@ export const DEFAULT_POLICY: SignalPolicy = {
 /**
  * Пересечение политик: эффективный allow = trained ∩ requested.
  * Реализует readonly-инвариант — запрос не может разрешить то, чего нет в обученной.
+ * RR-фильтр (minRiskReward/rrMetric) — чисто рантаймовый: запрос может его ужесточить,
+ * обученная политика дефолта не несёт (RR-статистика отдельно в params.riskReward).
  */
 export function intersectPolicy(
   trained: SignalPolicy,
   requested?: Partial<SignalPolicy>,
 ): SignalPolicy {
-  if (!requested?.allow) return { allow: [...trained.allow] };
-  const t = new Set(trained.allow);
-  return { allow: requested.allow.filter((a) => t.has(a)) };
+  const allow = !requested?.allow
+    ? [...trained.allow]
+    : requested.allow.filter((a) => new Set(trained.allow).has(a));
+  return {
+    allow,
+    // RR-фильтр берём из запроса (рантайм), иначе из обученной (если вшита)
+    minRiskReward: requested?.minRiskReward ?? trained.minRiskReward,
+    rrMetric: requested?.rrMetric ?? trained.rrMetric ?? "mean",
+  };
 }

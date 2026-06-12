@@ -2,6 +2,7 @@ import { ParserItem, PumpVerdict, Direction } from "./types";
 import { GetCandles, ICandleData } from "./candle";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
 import { volumeZScore, squeezePressure, volRegimeOf, VolRegime } from "./volume";
+import { RiskRewardStats } from "./objective";
 import {
   TradeSignal, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
   intersectPolicy, DEFAULT_POLICY,
@@ -48,6 +49,7 @@ export class PumpMatrix {
   static load(json: string | TrainedParams): PumpMatrix {
     const params: TrainedParams = typeof json === "string" ? JSON.parse(json) : json;
     if (!params.policy) params.policy = DEFAULT_POLICY; // обратная совместимость
+    if (!params.riskReward) params.riskReward = { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } };
     return new PumpMatrix(params, loadPredict(params));
   }
 
@@ -84,6 +86,15 @@ export class PumpMatrix {
   /** Режим, которым обучена модель: matrix (корреляция) | single (fallback). */
   get mode(): "matrix" | "single" {
     return this.params.meta.mode;
+  }
+
+  /**
+   * Risk-reward по бэктесту: per-symbol + global. Главный исследовательский выход.
+   * RR = pnl/hardStop в единицах риска (сколько R снято). bySymbol используется
+   * runtime-фильтром minRiskReward.
+   */
+  get riskReward(): { bySymbol: Record<string, RiskRewardStats>; global: RiskRewardStats } {
+    return this.params.riskReward;
   }
 
   /**
@@ -185,6 +196,14 @@ export class PumpMatrix {
     const ch = v.channel ?? "_matrix";
     const dir = v.direction!;
     const allow = new Set(policy.allow);
+
+    // ── readonly RR-фильтр: режем символы с backtest-RR ниже порога ──
+    if (policy.minRiskReward !== undefined) {
+      const rr = this.params.riskReward?.bySymbol?.[v.symbol];
+      const metric = policy.rrMetric ?? "mean";
+      // нет статистики по символу → нечем подтвердить RR → режем (консервативно)
+      if (!rr || rr[metric] < policy.minRiskReward) return null;
+    }
 
     let volRegime: VolRegime | null = null;
 

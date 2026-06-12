@@ -45,6 +45,7 @@ function makeModel(): PumpMatrix {
       global: { trailingTake: 1.0, hardStop: 1, stalenessSinceProfit: 1, stalenessSinceMinutes: 240, staleMinutes: 240 },
     },
     policy: { allow: ["enter", "invert", "tighten"] },
+    riskReward: { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } },
     meta: {
       trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.01, cvWinrate: 0.6, cvSupport: 10,
       gridSize: 100, mode: "single", impactHorizonMinutes: 240,

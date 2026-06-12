@@ -18,7 +18,7 @@ import { labelBurst, exitKey } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats } from "./objective";
 import {
   computeReliability,
   Reliability,
@@ -112,6 +112,15 @@ export interface TrainedParams {
    * В исполнении readonly — signals() может только сузить её, не расширить.
    */
   policy: SignalPolicy;
+  /**
+   * Risk-reward (pnl/hardStop) по бэктесту: per-symbol (для runtime-фильтра по
+   * символам) + global (отчёт). Главный исследовательский выход наряду с
+   * impactHorizonMinutes. Сериализуем, в исполнении readonly.
+   */
+  riskReward: {
+    bySymbol: Record<string, RiskRewardStats>;
+    global: RiskRewardStats;
+  };
   meta: {
     trainedAt: number;
     folds: number;
@@ -465,11 +474,38 @@ export async function train(
     global: globalExit,
   };
 
+  // ── risk-reward: исследовательский выход бэктеста ──
+  // RR = pnl / hardStop по сделкам с ВЫБРАННЫМ для символа exit. Считаем per-symbol
+  // (для runtime-фильтра по символам) и global (для отчёта). Сделки берём из winSelected
+  // под exit, реально назначенный символу (symbol-dir уровень), чтобы RR соответствовал
+  // тому, что прод исполнит.
+  const rrTradesBySymbol = new Map<string, Array<{ pnl: number; hardStop: number }>>();
+  const rrTradesGlobal: Array<{ pnl: number; hardStop: number }> = [];
+  for (const [sk, subset] of groupSD) {
+    const [symbol, direction] = sk.split("\u0001") as [string, "long" | "short"];
+    const ex = bySymbolDir[symbol]?.[direction];
+    if (!ex) continue;
+    const ekey = exitKey(ex);
+    for (const b of subset) {
+      const r = b.byExit.get(ekey);
+      if (!r || !r.entered) continue;
+      const trade = { pnl: r.pnl, hardStop: ex.hardStop };
+      (rrTradesBySymbol.get(symbol) ?? rrTradesBySymbol.set(symbol, []).get(symbol)!).push(trade);
+      rrTradesGlobal.push(trade);
+    }
+  }
+  const riskRewardBySymbol: Record<string, RiskRewardStats> = {};
+  for (const [symbol, trades] of rrTradesBySymbol) {
+    riskRewardBySymbol[symbol] = riskRewardStats(trades);
+  }
+  const riskRewardGlobal = riskRewardStats(rrTradesGlobal);
+
   const params: TrainedParams = {
     version: 3,
     config: top.config,
     exit: tensor,
     policy: opts.policy ?? DEFAULT_POLICY,
+    riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,
       cvScore: top.cvScore, cvWinrate: top.cvWinrate, cvSupport: top.cvSupport,

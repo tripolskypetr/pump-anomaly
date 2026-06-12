@@ -1,5 +1,6 @@
 import { ParserItem, PumpVerdict, Direction } from "./types";
-import { GetCandles, ICandleData } from "./candle";
+import { GetCandles, ICandleData, alignTs } from "./candle";
+import { fetchCandlesChunked } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
 import { volumeZScore, squeezePressure, volRegimeOf, VolRegime } from "./volume";
 import { RiskRewardStats, PnlStats } from "./objective";
@@ -146,16 +147,55 @@ export class PumpMatrix {
   }
 
   /**
-   * Prod-вызов СО свечами. volRegime из свечей, cell-exit, детекция каскада.
-   * Возвращает только исполняемые сигналы (veto отфильтрован). Нет свечей для
-   * символа → как signals() для него.
+   * Prod-вызов СО свечами: volRegime, cell-exit, детекция каскада. Возвращает
+   * только исполняемые сигналы (veto отфильтрован). Нет свечей для символа → как
+   * signals() для него.
+   *
+   * Источник свечей задаётся ОДНИМ из двух способов (перегрузка):
+   *  1) getCandles — ТА ЖЕ функция, что и в fit(): свечи подгружаются лениво по
+   *     каждому символу (вокруг его ts). Async → Promise. Канонический live-путь:
+   *     один источник свечей и в обучении, и в исполнении, без ручного словаря.
+   *     Если getCandles бросает по символу (дыра в данных) — сигнал отдаётся без
+   *     свечей (как signals()), а не роняет весь вызов.
+   *  2) candlesBySymbol — словарь {symbol: candles[]}, когда свечи УЖЕ в памяти
+   *     (бэктест, переиспользование набора). Sync → массив.
    */
+  plan(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
+  plan(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
   plan(
     items: ParserItem[],
-    candlesBySymbol: Record<string, ICandleData[]>,
+    source: GetCandles | Record<string, ICandleData[]>,
     policy?: Partial<SignalPolicy>,
-  ): TradeSignal[] {
-    return this.collect(items, (v) => candlesBySymbol[v.symbol] ?? null, policy);
+  ): TradeSignal[] | Promise<TradeSignal[]> {
+    if (typeof source === "function") {
+      return this.planViaGetCandles(items, source, policy);
+    }
+    return this.collect(items, (v) => source[v.symbol] ?? null, policy);
+  }
+
+  private async planViaGetCandles(
+    items: ParserItem[],
+    getCandles: GetCandles,
+    policy?: Partial<SignalPolicy>,
+  ): Promise<TradeSignal[]> {
+    const eff = intersectPolicy(this.params.policy, policy);
+    // горизонт свечей: запас на life-cap (как в разметке при обучении)
+    const maxLife = this.params.exit.global.staleMinutes;
+    const limit = maxLife * 2 + 5;
+    const out: TradeSignal[] = [];
+    for (const v of this._predict(items).signals) {
+      let candles: ICandleData[] | null = null;
+      try {
+        const since = alignTs(v.ts, "1m");
+        candles = await fetchCandlesChunked(getCandles, v.symbol, "1m", limit, since);
+        if (!candles.length) candles = null;
+      } catch {
+        candles = null; // битый символ → сигнал без свечей, не рушим весь вызов
+      }
+      const s = this.buildSignal(v, candles, eff);
+      if (s) out.push(s);
+    }
+    return out;
   }
 
   /** Точечно под ОДНУ позицию (live: вход = последняя свеча). null при veto. */

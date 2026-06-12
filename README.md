@@ -1,11 +1,10 @@
 <p align="center">
-  <img src="https://github.com/tripolskypetr/pump-anomaly/raw/master/assets/logo.png" height="115px" alt="pump-anomaly" />
+  <img src="https://github.com/tripolskypetr/volume-anomaly/raw/master/assets/logo.png" height="115px" alt="pump-anomaly" />
 </p>
 
 <p align="center">
-  <strong>Black-box detector for synchronized Telegram pump signals</strong><br>
-  Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection<br>
-  TypeScript. Single entry point: <code>PumpAnomaly</code>.
+  <strong>Pump Anomaly</strong><br>
+  Pump signals detection · Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection.
 </p>
 
 ## Installation

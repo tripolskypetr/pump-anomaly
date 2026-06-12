@@ -1,21 +1,14 @@
+# 📦 Pump Anomaly
+
+> Pump signals detection · Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection.
+
 <p align="center">
-  <img src="https://github.com/tripolskypetr/pump-anomaly/raw/master/assets/logo.png" height="115px" alt="pump-anomaly" />
+  <img src="https://github.com/tripolskypetr/pump-anomaly/raw/master/assets/logo.png" height="325px" alt="pump-anomaly" />
 </p>
 
 <p align="center">
-  <strong>Pump Anomaly</strong><br>
-  Pump signals detection · Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection.
+  Demons to some angels to others
 </p>
-
-## Installation
-
-```bash
-npm i
-npm run build   # tsc / rollup -> build/
-npm test        # vitest run — 387 tests files
-```
-
-Stack: TypeScript + vitest, no CLI, no monorepo. The only public high-level entry point is the `PumpMatrix` class.
 
 ## Overview
 
@@ -28,6 +21,16 @@ It solves three problems:
 3. **Produces a ready-to-trade plan** with trained exit parameters (trailing take / hard stop / impact horizon), tuned separately per source.
 
 Compatible with the `parser-items` schema (`channel`, `symbol`, `direction`, `entry: {from, to}`, …).
+
+---
+
+## Installation
+
+```bash
+npm i
+npm run build   # tsc / rollup -> build/
+npm test        # vitest run — 387 tests files
+```
 
 ---
 

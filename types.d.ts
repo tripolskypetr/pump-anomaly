@@ -1004,11 +1004,22 @@ declare class PumpMatrix {
      */
     signals(items: ParserItem[], policy?: Partial<SignalPolicy>): TradeSignal[];
     /**
-     * Prod-вызов СО свечами. volRegime из свечей, cell-exit, детекция каскада.
-     * Возвращает только исполняемые сигналы (veto отфильтрован). Нет свечей для
-     * символа → как signals() для него.
+     * Prod-вызов СО свечами: volRegime, cell-exit, детекция каскада. Возвращает
+     * только исполняемые сигналы (veto отфильтрован). Нет свечей для символа → как
+     * signals() для него.
+     *
+     * Источник свечей задаётся ОДНИМ из двух способов (перегрузка):
+     *  1) getCandles — ТА ЖЕ функция, что и в fit(): свечи подгружаются лениво по
+     *     каждому символу (вокруг его ts). Async → Promise. Канонический live-путь:
+     *     один источник свечей и в обучении, и в исполнении, без ручного словаря.
+     *     Если getCandles бросает по символу (дыра в данных) — сигнал отдаётся без
+     *     свечей (как signals()), а не роняет весь вызов.
+     *  2) candlesBySymbol — словарь {symbol: candles[]}, когда свечи УЖЕ в памяти
+     *     (бэктест, переиспользование набора). Sync → массив.
      */
+    plan(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
     plan(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
+    private planViaGetCandles;
     /** Точечно под ОДНУ позицию (live: вход = последняя свеча). null при veto. */
     planFor(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], policy?: Partial<SignalPolicy>): TradeSignal | null;
     /** Как planFor, но с явным entryTs (бэктест). null при veto. */

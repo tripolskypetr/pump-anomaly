@@ -3,6 +3,7 @@
 > Pump signals detection · Author-cluster deduplication · Path-aware exit replay · Liquidation-cascade detection.
 
 <p align="center">
+  <br>
   <img src="https://github.com/tripolskypetr/pump-anomaly/raw/master/assets/logo.png" height="325px" alt="pump-anomaly" />
 </p>
 

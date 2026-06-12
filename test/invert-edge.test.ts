@@ -115,7 +115,7 @@ describe("invert edge — фасад: неоднозначный каскад ч
       },
       policy: { allow: ["enter", "invert", "tighten"] },
       riskReward: { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } },
-      meta: { trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.05, cvWinrate: 0.6, cvSupport: 20, gridSize: 100, mode: "single", impactHorizonMinutes: 240, confidence: 0.7, reliable: true, support: 0.8, stability: 0.7, significance: 0.8, totalSamples: 60 },
+      meta: { trainedAt: 0, folds: 4, shrinkageK: 5, cvScore: 0.05, nestedScore: null, cvWinrate: 0.6, cvSupport: 20, gridSize: 100, mode: "single", impactHorizonMinutes: 240, confidence: 0.7, reliable: true, support: 0.8, stability: 0.7, significance: 0.8, totalSamples: 60 },
     };
     return PumpMatrix.load(params);
   }

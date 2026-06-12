@@ -54,18 +54,20 @@ export function oneStandardErrorSelect<T>(
   scoreOf: (e: T) => number,
   foldsOf: (e: T) => number[],
   isSimpler: (a: T, b: T) => boolean,
+  seMultiplier = 1,
 ): T | null {
   if (entries.length === 0) return null;
   let best = entries[0];
   for (const e of entries) if (scoreOf(e) > scoreOf(best)) best = e;
 
-  // SE по фолдам ПОБЕДИТЕЛЯ — разброс его собственной оценки
-  const se = standardError(foldsOf(best));
+  // SE по фолдам ПОБЕДИТЕЛЯ — разброс его собственной оценки. seMultiplier
+  // расширяет/сужает коридор (1 = классический Breiman).
+  const se = standardError(foldsOf(best)) * seMultiplier;
   const threshold = scoreOf(best) - se;
 
   let chosen = best;
   for (const e of entries) {
-    if (scoreOf(e) < threshold) continue;       // вне коридора 1 SE
+    if (scoreOf(e) < threshold) continue;       // вне коридора SE
     if (isSimpler(e, chosen)) chosen = e;        // консервативнее → берём
   }
   return chosen;

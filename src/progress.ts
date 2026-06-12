@@ -18,7 +18,7 @@ export interface ProgressEvent {
   /** всего единиц в текущей фазе */
   total: number;
   /** метка фазы: "label" (разметка свечами) | "score" (grid-скоринг) */
-  phase: "label" | "score";
+  phase: "label" | "score" | "nested";
   /** что сейчас обрабатывается (символ/ключ кластеризации) — для контекста */
   label: string;
 }

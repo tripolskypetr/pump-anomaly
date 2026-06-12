@@ -19,6 +19,7 @@ import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
 import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect } from "./objective";
+import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
   Reliability,
@@ -104,6 +105,8 @@ export interface TrainOptions {
    * По умолчанию все: enter, invert, tighten. В исполнении её можно только сузить.
    */
   policy?: SignalPolicy;
+  /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
+  selection?: Partial<SelectionConfig>;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -132,6 +135,8 @@ export interface TrainedParams {
     folds: number;
     shrinkageK: number;
     cvScore: number;
+    /** несмещённая out-of-sample оценка через nested CV (null если не считалась) */
+    nestedScore: number | null;
     cvWinrate: number;
     cvSupport: number;
     gridSize: number;
@@ -187,6 +192,7 @@ export async function train(
   const grid: TrainGrid = { ...DEFAULT_GRID, ...opts.grid };
   const folds = opts.folds ?? 4;
   const shrinkageK = opts.shrinkageK ?? 5;
+  const selection: SelectionConfig = { ...DEFAULT_SELECTION, ...opts.selection };
   const maxBurstWindowMs = opts.maxBurstWindowMs ?? DEFAULT_CONFIG.maxBurstWindowMs;
 
   // разрешаем эффективный режим обучения — тем же строгим критерием, что и predict
@@ -339,84 +345,134 @@ export async function train(
   // total для фазы score = число (wK×jac×lag×sw) комбинаций (тик на каждую)
   const scoreTotal = grid.windowK.length * grid.jaccardThreshold.length
     * grid.lagPeakThreshold.length * swAxis.length;
-  let scoreDone = 0;
 
-  for (const wK of grid.windowK)
-    for (const jac of grid.jaccardThreshold)
-      for (const lag of grid.lagPeakThreshold)
-        for (const sw of swAxis) {
-        const labeled = effMode === "single"
-          ? labeledCache.get(`single|${wK}`)!
-          : labeledCache.get(`${wK}|${jac}|${lag}|${sw}`)!;
-        for (const minC of minClusterAxis)
-          for (const ex of exitSets) {
-            const ekey = exitKey(ex);
-            const selected = labeled
-              .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
-              .sort((a, b) => a.ts - b.ts);
-            const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode, sw);
-            if (selected.length === 0) {
-              board.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0,
-                _foldMeans: [], _foldSizes: [], _returns: [], _foldScores: [] });
-              continue;
-            }
-            const foldSpecs = timeSeriesFolds(selected.length, folds);
-            const foldScores: number[] = [], foldMeans: number[] = [],
-              foldWins: number[] = [], foldSupp: number[] = [], allRet: number[] = [];
-            for (const { valLo, valHi } of foldSpecs) {
-              const valRet = selected.slice(valLo, valHi).map((b) => b.byExit.get(ekey)!.pnl);
-              foldScores.push(shrinkageExpectancy(valRet, shrinkageK));
-              foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
-              foldWins.push(winrate(valRet));
-              foldSupp.push(valRet.length);
-              allRet.push(...valRet);
-            }
-            const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
-            board.push({
-              config: cfg, exit: ex,
-              cvScore: +avg(foldScores).toFixed(6),
-              cvWinrate: +avg(foldWins).toFixed(6),
-              cvSupport: +avg(foldSupp).toFixed(2),
-              _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet, _foldScores: foldScores,
-            });
+  // буримая функция скоринга: строит board по всем конфигам, учитывая только те
+  // размеченные всплески, что проходят keep(ts). keep=()=>true → весь board.
+  // onTick(label) вызывается после каждой (wK×jac×lag×sw)-комбинации (для прогресса).
+  const buildBoard = (
+    keep: (ts: number) => boolean,
+    onTick?: (label: string) => void,
+  ): Entry[] => {
+    const out: Entry[] = [];
+    for (const wK of grid.windowK)
+      for (const jac of grid.jaccardThreshold)
+        for (const lag of grid.lagPeakThreshold)
+          for (const sw of swAxis) {
+            const labeled = (effMode === "single"
+              ? labeledCache.get(`single|${wK}`)!
+              : labeledCache.get(`${wK}|${jac}|${lag}|${sw}`)!
+            ).filter((b) => keep(b.ts));
+            for (const minC of minClusterAxis)
+              for (const ex of exitSets) {
+                const ekey = exitKey(ex);
+                const selected = labeled
+                  .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
+                  .sort((a, b) => a.ts - b.ts);
+                const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode, sw);
+                if (selected.length === 0) {
+                  out.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0,
+                    _foldMeans: [], _foldSizes: [], _returns: [], _foldScores: [] });
+                  continue;
+                }
+                const foldSpecs = timeSeriesFolds(selected.length, folds);
+                const foldScores: number[] = [], foldMeans: number[] = [],
+                  foldWins: number[] = [], foldSupp: number[] = [], allRet: number[] = [];
+                for (const { valLo, valHi } of foldSpecs) {
+                  const valRet = selected.slice(valLo, valHi).map((b) => b.byExit.get(ekey)!.pnl);
+                  foldScores.push(shrinkageExpectancy(valRet, shrinkageK));
+                  foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
+                  foldWins.push(winrate(valRet));
+                  foldSupp.push(valRet.length);
+                  allRet.push(...valRet);
+                }
+                const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
+                out.push({
+                  config: cfg, exit: ex,
+                  cvScore: +avg(foldScores).toFixed(6),
+                  cvWinrate: +avg(foldWins).toFixed(6),
+                  cvSupport: +avg(foldSupp).toFixed(2),
+                  _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet, _foldScores: foldScores,
+                });
+              }
+            onTick?.(`${wK}|${jac}|${lag}|${sw === Infinity ? "all" : sw}`);
           }
-        scoreDone++;
-        progress({ done: scoreDone, total: scoreTotal, phase: "score", label: `${wK}|${jac}|${lag}|${sw === Infinity ? "all" : sw}` });
-      }
+    return out;
+  };
+
+  // основной board — по всем данным, с прогрессом фазы score
+  let scoreDone = 0;
+  board.push(...buildBoard(() => true, (label) => {
+    scoreDone++;
+    progress({ done: scoreDone, total: scoreTotal, phase: "score", label });
+  }));
 
   // ── выбор победителя: one-standard-error rule (против winner's curse) ──
   // вместо argmax по cvScore берём самую КОНСЕРВАТИВНУЮ конфигурацию среди тех,
-  // чей score в пределах 1 SE от максимума. Это убирает переобучение на шум grid:
-  // разница внутри 1 SE статистически незначима, поэтому robustness > удача.
-  //
-  // «Консервативнее» для трейдинга = меньше риска и экспозиции, при равенстве — проще:
-  //   1) меньший hardStop (меньше риск на сделку)
-  //   2) короче staleMinutes (меньше время в позиции)
-  //   3) более мягкая реакция на каскад (none < tighten < veto < invert по агрессии)
-  //   4) детерминированный tie-break по cvScore (стабильность выбора)
-  const policyAggression: Record<string, number> = { none: 0, tighten: 1, veto: 2, invert: 3 };
-  const conservatismKey = (e: Entry): number[] => [
-    e.exit.hardStop,
-    e.exit.staleMinutes,
-    policyAggression[e.exit.squeezePolicy ?? "none"] ?? 0,
-    -e.cvScore, // при полном равенстве — выше score (меньше отрицание)
-  ];
-  const isSimpler = (a: Entry, b: Entry): boolean => {
-    const ka = conservatismKey(a), kb = conservatismKey(b);
-    for (let i = 0; i < ka.length; i++) {
-      if (ka[i] < kb[i]) return true;
-      if (ka[i] > kb[i]) return false;
-    }
-    return false;
-  };
+  // чей score в пределах SE от максимума. Это убирает переобучение на шум grid:
+  // разница внутри SE статистически незначима, поэтому robustness > удача.
+  // Порядок консервативности и пороги — в selection.ts, без магических литералов.
   const top = oneStandardErrorSelect(
     board,
     (e) => e.cvScore,
     (e) => e._foldScores,
-    isSimpler,
+    (a, b) => isMoreConservative(a, b),
+    selection.seMultiplier,
   )!;
   // board всё равно сортируем по score — для отчёта/аудита (gridSize, диагностика)
   board.sort((a, b) => b.cvScore - a.cvScore);
+
+  // ── nested CV: несмещённая оценка прод-эджа (не меняет ВЫБОР, только оценку) ──
+  // Внешние фолды по времени: на каждом train-срезе заново выбираем конфиг (1-SE),
+  // оцениваем на held-out test-срезе. Среднее out-of-sample = честная оценка того,
+  // что ждёт на проде, без winner's curse. ВЫБОР модели остаётся за полным 1-SE выше.
+  // Прогресс тикает на КАЖДЫЙ внешний фолд → терминал не молчит дольше одного фолда.
+  let nestedScore: number | null = null;
+  if (selection.nestedOuterFolds >= 2) {
+    // временные границы: все ts размеченных всплесков из основного кэша
+    const allBurstTs: number[] = [];
+    for (const [k, labeled] of labeledCache) {
+      if (k.startsWith("__enum_")) continue;
+      for (const b of labeled) allBurstTs.push(b.ts);
+    }
+    allBurstTs.sort((a, b) => a - b);
+    const uniqTs = [...new Set(allBurstTs)];
+
+    if (uniqTs.length >= selection.nestedOuterFolds) {
+      const oosScores: number[] = [];
+      const K = selection.nestedOuterFolds;
+      const foldSize = Math.floor(uniqTs.length / K);
+      for (let f = 0; f < K; f++) {
+        // outer-test = f-й временной блок; outer-train = всё остальное
+        const testLo = uniqTs[f * foldSize];
+        const testHi = f === K - 1 ? Infinity : uniqTs[(f + 1) * foldSize];
+        const inTest = (ts: number) => ts >= testLo && (testHi === Infinity ? true : ts < testHi);
+        const inTrain = (ts: number) => !inTest(ts);
+
+        // на train-срезе выбираем конфиг тем же 1-SE
+        const trainBoard = buildBoard(inTrain);
+        const trainTop = oneStandardErrorSelect(
+          trainBoard, (e) => e.cvScore, (e) => e._foldScores,
+          (a, b) => isMoreConservative(a, b), selection.seMultiplier,
+        );
+        // оцениваем выбранный конфиг на held-out test-срезе
+        if (trainTop) {
+          const testBoard = buildBoard(inTest);
+          const match = testBoard.find((e) =>
+            exitKey(e.exit) === exitKey(trainTop.exit) &&
+            e.config.windowK === trainTop.config.windowK &&
+            e.config.minClusters === trainTop.config.minClusters &&
+            e.config.jaccardThreshold === trainTop.config.jaccardThreshold &&
+            e.config.lagPeakThreshold === trainTop.config.lagPeakThreshold &&
+            e.config.stationarityWindowMs === trainTop.config.stationarityWindowMs);
+          if (match) oosScores.push(match.cvScore);
+        }
+        progress({ done: f + 1, total: K, phase: "nested", label: `fold ${f + 1}/${K}` });
+      }
+      nestedScore = oosScores.length
+        ? +(oosScores.reduce((s, x) => s + x, 0) / oosScores.length).toFixed(6)
+        : null;
+    }
+  }
 
   const reliability = computeReliability(
     { foldMeans: top._foldMeans, foldSizes: top._foldSizes, allReturns: top._returns },
@@ -547,7 +603,7 @@ export async function train(
     riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,
-      cvScore: top.cvScore, cvWinrate: top.cvWinrate, cvSupport: top.cvSupport,
+      cvScore: top.cvScore, nestedScore, cvWinrate: top.cvWinrate, cvSupport: top.cvSupport,
       gridSize: board.length,
       mode: effMode,
       impactHorizonMinutes: globalExit.staleMinutes,

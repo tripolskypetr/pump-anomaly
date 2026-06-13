@@ -66,22 +66,25 @@ export interface TrainGrid {
 }
 
 export const DEFAULT_GRID: TrainGrid = {
-  windowK: [2, 3, 5],
-  minClusters: [2, 3],
+  // detector (authorship matrix)
+  windowK:          [2, 3, 5],
+  minClusters:      [2, 3],
   jaccardThreshold: [0.2, 0.3, 0.4],
   lagPeakThreshold: [0.4, 0.5, 0.6],
-  trailingTake: [0.5, 1.0, 2.0],
-  hardStop: [1.0, 2.0, 3.0],
+  // prod exit (label set by replay)
+  trailingTake:         [0.5, 1.0, 2.0],
+  hardStop:             [1.0, 2.0, 3.0],
   stalenessSinceProfit: [1.0],
-  stalenessSinceMinutes: [240],
-  staleMinutes: [60, 240, 720, 1440], // 1ч / 4ч / 12ч / 24ч — какой импакт-горизонт лучше
-  volZThreshold: [1.5, 2.5],          // когда считать объём аномальным (накопление топлива)
-  squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
-  squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
-  volBaselineWindow: [20],
-  cascadeWindowMinutes: [15, 30, 60], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
-  // вся история + конечные окна (4 / 8 недель); train выберет по CV
-  stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
+  stalenessSinceMinutes:[240],
+  staleMinutes:         [60, 240, 720, 1440],   // impact horizon: 1h / 4h / 12h / 24h
+  // liquidation-cascade detector
+  volZThreshold:    [1.5, 2.5],                 // when volume is anomalous
+  squeezePolicy:    ["none", "tighten", "veto", "invert"],
+  squeezeThreshold: [0.55, 0.7],
+  volBaselineWindow:[20],
+  cascadeWindowMinutes: [15, 30, 60, 120, 240],           // cascade-detection window — NOT the holding horizon
+  // stationarity window (long horizon)
+  stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
 };
 
 export interface TrainOptions {

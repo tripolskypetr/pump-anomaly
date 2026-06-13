@@ -122,6 +122,15 @@ declare const STEP_MS: Record<CandleInterval, number>;
 /** Выравнивание timestamp вниз к границе свечи интервала. */
 declare const alignTs: (t: number, interval: CandleInterval) => number;
 /**
+ * Первая ПОЛНОСТЬЮ сформированная свеча, торгуемая БЕЗ look-ahead: если сигнал
+ * пришёл внутри минуты (ts > границы), свеча, СОДЕРЖАЩАЯ сигнал, ещё формируется —
+ * её close/high/low станут известны только в КОНЦЕ минуты, ПОСЛЕ сигнала. Входить
+ * в неё = заглядывать вперёд. Поэтому старт входа = следующая граница. Если сигнал
+ * ровно на границе (ts === aligned) — эта свеча открывается одновременно с сигналом
+ * и торгуема честно, не пропускаем.
+ */
+declare const entryStartTs: (t: number, interval: CandleInterval) => number;
+/**
  * Источник свечей. Семантика диапазонов (sDate inclusive, eDate exclusive):
  *   (limit)                 → [alignedWhen − limit·step, alignedWhen)
  *   (limit, sDate)          → [align(sDate), align(sDate) + limit·step)
@@ -975,6 +984,26 @@ declare class PumpMatrix {
     get confidence(): number;
     /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */
     get impactHorizonMinutes(): number;
+    /**
+     * Сколько минут истории СВЕЧЕЙ ДО сигнала нужно live-вызову plan() для каждого
+     * сигнала: max(volBaselineWindow, cascadeWindowMinutes) + запас 5 свечей. Столько
+     * 1m-свечей plan() запрашивает у getCandles (строго в прошлое, без look-ahead).
+     * В проде держи доступной историю минимум на это окно для каждого свежего сигнала.
+     */
+    get lookbackMinutes(): number;
+    /**
+     * Минимальное число НЕЗАВИСИМЫХ кластеров авторства, которые должны сойтись на
+     * тикере, чтобы matrix-всплеск считался сигналом. Из config (по умолчанию 2).
+     * В single-режиме не применяется (там всегда 1 кластер).
+     */
+    get minClusters(): number;
+    /**
+     * Минимальное число ОБЩИХ событий между каналами, при котором author-матрица
+     * считается жизнеспособной (не шумовое совпадение) — порог перекрытия для
+     * auto-режима. Из config.viability (по умолчанию DEFAULT_VIABILITY.minSharedEvents).
+     * Грубо: сколько раз кластеры должны совпасть, чтобы их связь была не случайной.
+     */
+    get minSharedEvents(): number;
     /** Режим, которым обучена модель: matrix (корреляция) | single (fallback). */
     get mode(): "matrix" | "single";
     /** Честная диагностика: ПОЧЕМУ выбран этот режим (auto-критерий или явный выбор). */
@@ -1004,37 +1033,64 @@ declare class PumpMatrix {
      */
     signals(items: ParserItem[], policy?: Partial<SignalPolicy>): TradeSignal[];
     /**
-     * Prod-вызов СО свечами: volRegime, cell-exit, детекция каскада. Возвращает
-     * только исполняемые сигналы (veto отфильтрован). Нет свечей для символа → как
-     * signals() для него.
+     * LIVE-решение об открытии позиции — БЕЗ look-ahead. Возвращает только
+     * исполняемые сигналы (veto/инверс-запрет отфильтрованы). Использует свечи
+     * СТРОГО ДО сигнала: volZ-режим по базлайну до входа и каскад-давление по
+     * прошлым свечам (squeezePressureBefore). НИКОГДА не тянет свечи из будущего —
+     * в live их не существует. Это решение «входить ли сейчас и с какими exit».
      *
-     * Источник свечей задаётся ОДНИМ из двух способов (перегрузка):
-     *  1) getCandles — ТА ЖЕ функция, что и в fit(): свечи подгружаются лениво по
-     *     каждому символу (вокруг его ts). Async → Promise. Канонический live-путь:
-     *     один источник свечей и в обучении, и в исполнении, без ручного словаря.
-     *     Если getCandles бросает по символу (дыра в данных) — сигнал отдаётся без
-     *     свечей (как signals()), а не роняет весь вызов.
-     *  2) candlesBySymbol — словарь {symbol: candles[]}, когда свечи УЖЕ в памяти
-     *     (бэктест, переиспользование набора). Sync → массив.
+     * Источник свечей:
+     *  1) getCandles — та же, что в fit(): подгружает историю ДО сигнала. Async.
+     *     Бросок по символу (дыра в данных) → сигнал без свечей (как signals()),
+     *     не роняя весь вызов.
+     *  2) candlesBySymbol — словарь предзагруженной истории ДО сигнала. Sync.
+     *
+     * Для бэктеста (replay вперёд + реализованный pnl) используй backtest().
      */
     plan(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
     plan(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
-    private planViaGetCandles;
-    /** Точечно под ОДНУ позицию (live: вход = последняя свеча). null при veto. */
+    private planLiveViaGetCandles;
+    /**
+     * БЭКТЕСТ — replay вперёд по истории + реализованный pnl/каскад. Тянет свечи
+     * ПОСЛЕ сигнала (life-cap горизонт), прогоняет полный replay. ТОЛЬКО для анализа
+     * завершённого прошлого: в live свечей вперёд нет. Look-ahead отсутствует, т.к.
+     * мы в настоящем смотрим на уже закрытые свечи прошлого.
+     *
+     * Источник свечей — getCandles (async) или словарь {symbol: candles} (sync).
+     */
+    backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
+    backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
+    private backtestViaGetCandles;
+    /** Точечно под ОДНУ позицию в LIVE (вход = последняя свеча, каскад по прошлому). */
     planFor(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], policy?: Partial<SignalPolicy>): TradeSignal | null;
-    /** Как planFor, но с явным entryTs (бэктест). null при veto. */
+    /** Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему). */
     planForAt(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], entryTs: number, policy?: Partial<SignalPolicy>): TradeSignal | null;
     /** Полный отчёт (все вердикты + карта авторства) — для разбора. */
     explain(items: ParserItem[]): PredictionResult;
     private collect;
     private flatExit;
     /**
+     * BACKTEST-сборка сигнала: каскад по свечам ПОСЛЕ входа (forward squeezePressure),
+     * допустимо только на истории. Делегирует в общее ядро с mode="backtest".
+     */
+    private buildSignal;
+    /**
+     * LIVE-сборка сигнала: каскад по свечам ДО входа (backward squeezePressureBefore),
+     * БЕЗ look-ahead. Делегирует в общее ядро с mode="live".
+     */
+    private buildSignalLive;
+    /**
      * Строит ЕДИНЫЙ TradeSignal из вердикта. Возвращает null, если исполнять нечего:
      * каскад дал veto ИЛИ получившийся action не в allow-списке. Инверсия здесь же
      * разворачивает direction и тянет exit из инверс-ячейки — наружу уходит готовое
      * направление, без флагов.
+     *
+     * mode="live": каскад меряется по свечам ДО входа (squeezePressureBefore) — в live
+     *   свечей после входа нет, look-ahead запрещён.
+     * mode="backtest": каскад по свечам ПОСЛЕ входа (squeezePressure) — допустимо на
+     *   завершённой истории.
      */
-    private buildSignal;
+    private buildSignalCore;
 }
 
 /**
@@ -1053,5 +1109,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, clusterAuthors, computeReliability, conservatismKey, earlyWarning, enumerateBursts, enumeratePosts, exitKey, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, labelBurst, lagXCorr, loadPredict, oneStandardErrorSelect, percentile, pnlStats, predict, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, shrinkageExpectancy, silentProgress, singleChannelSignals, squeezePressure, standardError, stdoutProgress, train, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, clusterAuthors, computeReliability, conservatismKey, earlyWarning, entryStartTs, enumerateBursts, enumeratePosts, exitKey, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, labelBurst, lagXCorr, loadPredict, oneStandardErrorSelect, percentile, pnlStats, predict, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, shrinkageExpectancy, silentProgress, singleChannelSignals, squeezePressure, standardError, stdoutProgress, train, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
 export type { AuthorMap, CandleInterval, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

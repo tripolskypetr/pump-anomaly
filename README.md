@@ -49,8 +49,10 @@ const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
 // signals() returns ONLY what's executable — veto is already filtered out
 const trades = model.signals(liveItems);
 
-// with candles, adds volRegime + cascade detection:
-const trades = model.plan(liveItems, { SOLUSDT: solCandles, TRXUSDT: trxCandles });
+// plan() is the live decision (no look-ahead): adds volRegime + cascade detection
+// from candles STRICTLY BEFORE the signal. Source = a getCandles (async) or a
+// preloaded { symbol: candles } map (sync).
+const trades = await model.plan(liveItems, getCandles);
 
 for (const s of trades) {
   openPosition(s.symbol, s.direction, s.exit); // direction is already inverted if needed; exit is ready
@@ -58,6 +60,16 @@ for (const s of trades) {
 ```
 
 `signals`/`plan` do the thinking: they pick the mode, compute `volRegime`, evaluate the cascade, filter veto, and apply inversion. The application just executes `s.direction` with `s.exit` — no `if` statements about veto, inversion, or mode.
+
+Three execution methods, by what candles they're allowed to see:
+
+| method | candles | use |
+|---|---|---|
+| `signals(items, policy?)` | none | fast path; cascade not evaluated → every outcome is `enter` |
+| `plan(items, source, policy?)` | **before** the signal | **live** decision, no look-ahead (`squeezePressureBefore`) |
+| `backtest(items, source, policy?)` | **after** the signal | replay forward over closed history (realized pnl/cascade) |
+
+`plan` and `backtest` each accept either a `getCandles` (async → returns a `Promise`) or a `{ symbol: candles }` map (sync). A broken symbol (data gap) degrades gracefully to a no-candle signal instead of crashing the whole call.
 
 ---
 
@@ -101,7 +113,7 @@ type GetCandles = (
 Range semantics:
 
 ```
-(limit)               → [align(now) − limit·step, align(now))
+(limit)               → [align(when) − limit·step, align(when))
 (limit, sDate)        → [align(sDate), align(sDate) + limit·step)
 (limit, _, eDate)     → [align(eDate) − limit·step, eDate)
 (_, sDate, eDate)     → [align(sDate), eDate), limit from range
@@ -117,17 +129,19 @@ Training labels on `1m` candles, so your `getCandles` must be able to serve them
 The training label comes from an **exact replay of your prod exit on 1m candles** (`replayExit`), not close-to-close. Ported from your code one-to-one:
 
 - **moonbag** (long) — hard stop below entry; **gravebag** (short) — above.
-- **trailing take** — pullback from peak PnL once `currentProfit ≥ 0`.
+- **trailing take** — pullback from peak PnL once `currentProfit ≥ 0`, fixed at the achieved peak.
 - **peak staleness** — peak reached the profit threshold, but went stale for `stalenessSinceMinutes` without a new high (price may never reach the target at all).
-- **life-cap** (`staleMinutes`) — ceiling on position lifetime = **empirical impact horizon**, tuned by the grid.
-- A stop-out **rolls the metric back to the last positive trailing peak**.
+- **life-cap** (`staleMinutes`) — ceiling on position lifetime = **empirical impact horizon**, tuned by the grid. Exits at the close of the last candle in the window (the realized pnl can be negative).
+- A stop-out realizes the **honest `-hardStop%`** — the actual result of the trade. The peak is kept separately for diagnostics, but the pnl is the loss. (An earlier version rolled the metric back to the last positive peak, which meant a stop-out never showed a loss and silently inflated pnl/RR — fixed.)
 
-Why this catches stop hunts: a wick into the trap never reaches `trailingTake`, and the pullback hits the hard stop → the label is negative **even if** `close[t+H]` happens to be positive. Path-aware replay sees the whole OHLC path, not just two points.
+Why this catches stop hunts: a wick into the trap never reaches `trailingTake`, and the pullback hits the hard stop → the label is negative **even if** `close[t+H]` happens to be positive. Path-aware replay sees the whole OHLC path, not just two points, so the optimizer actually sees the risk of stops.
+
+**Entry without look-ahead.** The candle that *contains* the signal is still forming — its close/high/low are only known at the end of the minute, after the signal. Entering it would be peeking ahead. So the entry search starts at the next fully-closed candle (`entryStartTs`); a signal exactly on a candle boundary is tradeable and not skipped.
 
 **Candles and chop.** For each candidate, `labelBurst` requests `1m` candles forward from the event for `staleMinutes·2+5` (buffer for a late entry into the zone). If this exceeds the chunk limit (500), the library **chunks the request itself** (`fetchCandlesChunked`), advancing `since` and deduplicating by timestamp — independent of whether your adapter paginates. Two safety nets:
 
 - **Adapter error** (look-ahead guard at the end of history, a data gap for the symbol — common for meme-coins) is caught: the candidate is skipped, training does not crash. One broken symbol does not bring down the whole `fit`.
-- **Truncated horizon.** In a long chop, entry can happen late, and there may not be enough candles left for the full life-cap. Such a label is marked `truncated` and **dropped per-exit** — otherwise a 24h horizon would be compared against a 1h one on a clipped path, corrupting `impactHorizonMinutes`. Shorter horizons of the same candidate are kept.
+- **Truncated horizon.** In a long chop, entry can happen late, and there may not be enough candles left for the full life-cap. Such a label is marked `truncated` and **dropped per-exit** (only for entered trades) — otherwise a 24h horizon would be compared against a 1h one on a clipped path, corrupting `impactHorizonMinutes`. Shorter horizons of the same candidate are kept; a clean `no-entry` is kept as a valid "didn't enter" label.
 
 ---
 
@@ -145,6 +159,8 @@ interface TrainOptions {
   mode?: "auto" | "matrix" | "single";  // entry-selection mode
   viability?: Partial<ViabilityConfig>; // matrix-viability thresholds
   onProgress?: ProgressFn;              // defaults to a stdout bar
+  policy?: SignalPolicy;                // allowed outcomes, baked into the model
+  selection?: Partial<SelectionConfig>; // SE corridor + nested-CV (see selection.ts)
 }
 ```
 
@@ -240,12 +256,12 @@ Per-signal resolution with hierarchical fallback:
   → global                                        (root)
 ```
 
-- **matrix and single are kept separate** — different entry expectancy → different exit.
+- **matrix and single are kept separate** — different entry expectancy → different exit. In matrix mode the burst is cross-channel (no single owner), so cells are stored under the canonical `_matrix` channel key.
 - **long and short are different cells** (cascade symmetry).
 - **calm and anomalous are kept separate** — trailing is tighter in anomalous volume.
 - **a new channel with no history** falls back to mode/global — the fallback is trained too, no magic constants.
 
-`p.exitSource` shows which level the exit was resolved from: `cell` | `symbol-dir` | `mode` | `global`.
+`origin.exitSource` shows which level the exit was resolved from: `cell` | `symbol-dir` | `mode` | `global`.
 
 ---
 
@@ -259,18 +275,19 @@ Stop hunting is symmetric: a short squeeze and a long cascade are mirrors of the
 No need to parse leverage — the cumulative effect is visible in `volume`:
 
 - **`volZ`** — the z-score of the entry candle's volume against the baseline. High = the crowd synchronously entered on leverage (fuel accumulated).
-- **`squeezePressure`** — the share of volume on candles where price moves **against** the position. Symmetric: for long, "against" = down (a sell cascade); for short, = up (a buy cascade). High = the move is fed by liquidations, not honest flow → a trap.
+- **`squeezePressure`** — the share of volume on candles where price moves **against** the position. Symmetric: for long, "against" = down (a sell cascade); for short, = up (a buy cascade). High = the move is fed by liquidations, not honest flow → a trap. The **live** variant (`squeezePressureBefore`) measures it over candles strictly *before* the entry, since in live there are no candles after the signal yet.
 
 The reaction (`squeezePolicy`) is tuned by training via CV, or fixed in the grid:
 
 - **none** — a normal entry.
-- **tighten** — tighten the trailing, exit before the reversal (`p.trailingTake` is returned already tightened).
-- **veto** — don't enter when squeeze pressure is high.
-- **invert** — enter AGAINST the post (the strategy from 1028592): a channel posted short → the cascade squeezes upward → `signals` returns a signal with `action: "invert"`, `direction: "long"` (already flipped), and the exit from the inverse cell of the tensor. `origin.invertedFrom` holds the original channel direction.
+- **tighten** — tighten the trailing, exit before the reversal (`p.trailingTake` is returned already tightened by `tightenFactor`, 0.5 by default).
+- **veto** — don't enter when squeeze pressure is high (the signal never makes it into the output).
+- **invert** — enter AGAINST the post (the strategy from 1028592): a channel posted short → the cascade squeezes upward → `signals` returns a signal with `action: "invert"`, `direction: "long"` (already flipped), and the exit from the inverse cell of the tensor. `origin.invertedFrom` holds the original channel direction. The exit `reason` keeps the real mechanism (hard-stop/trailing-take/life-cap) of the inverted position; the fact of inversion is carried by a flag, not by overwriting the reason.
+- **ignore** — the cascade is noticed but **deliberately not acted on**: enter in the original direction anyway, realizing the real (usually bad) pnl. This gives the counterfactual "what if we don't react to the cascade" directly in the output, not only in offline analysis. Behaves like `none` for entry, but is labeled distinctly.
 
 The calm/anomalous threshold (`volZThreshold`) and the firing threshold (`squeezeThreshold`) are both grid axes.
 
-**Cascade detection window** (`cascadeWindowMinutes`) is a separate axis, NOT tied to the holding horizon `staleMinutes`. A squeeze is a fast event (minutes): measuring it over a 24h window is wrong — a long window smears out a sharp reversal. Previously the detection window was derived from `staleMinutes`, conflating two unrelated concerns (position lifetime and detector sensitivity); now they're independent.
+**Cascade detection window** (`cascadeWindowMinutes`) is a separate axis, NOT tied to the holding horizon `staleMinutes`. A squeeze is a fast event (minutes): measuring it over a 24h window is wrong — a long window smears out a sharp reversal. Previously the detection window was derived from `staleMinutes`, conflating two unrelated concerns (position lifetime and detector sensitivity); now they're independent (it falls back to `staleMinutes` only for backward compatibility when unset).
 
 ---
 
@@ -313,18 +330,33 @@ interface TradeSignal {
 }
 ```
 
-Methods:
+### Execution methods
 
 ```ts
-model.signals(items, policy?)                       // no candles: action is always "enter"
-model.plan(items, candlesBySymbol, policy?)          // with candles: volRegime, cascade
+// no candles — cascade not evaluated, every outcome is "enter":
+model.signals(items, policy?)                                // TradeSignal[]
+
+// LIVE — candles strictly BEFORE the signal (no look-ahead), source = getCandles | map:
+await model.plan(items, getCandles, policy?)                 // Promise<TradeSignal[]>
+model.plan(items, { SOLUSDT: candles }, policy?)             // TradeSignal[]
+
+// BACKTEST — replay forward over closed history, source = getCandles | map:
+await model.backtest(items, getCandles, policy?)             // Promise<TradeSignal[]>
+model.backtest(items, { SOLUSDT: candles }, policy?)         // TradeSignal[]
+
+// single-position helpers:
 model.planFor(symbol, dir, channel, candles, policy?)        // live, null on veto
 model.planForAt(symbol, dir, channel, candles, ts, policy?)  // backtest, null on veto
+
+// full report (all verdicts + author map) for debugging:
+model.explain(items)
 ```
+
+`plan` vs `backtest` differ only in *which* candles they see: `plan` measures the cascade from candles before the entry (live-safe), `backtest` from candles after the entry (forward replay over already-closed history). Use `backtest` for analysis of the completed past, `plan` for a live "should I enter now" decision.
 
 ### Permissions — allow-list, serialized at training time, readonly at runtime
 
-What's allowed (entries/inversions) is fixed at `fit` time and **baked into model.json**. In prod this is readonly — the second argument to `signals()` can only NARROW it, never widen it:
+What's allowed (entries/inversions) is fixed at `fit` time and **baked into model.json**. In prod this is readonly — the second argument to `signals()`/`plan()`/`backtest()` can only NARROW it, never widen it:
 
 ```ts
 // at training time — bake the policy into the model:
@@ -336,9 +368,59 @@ model.signals(items, { allow: ["enter"] });  // direct entries only
 
 `allow` without `"invert"` → inversion signals are never returned (treated like veto — don't walk into the trap). This replaced the runtime flags `disableInvert`/`disableSqueeze`: instead of state smeared across training-and-prod, there's one serializable policy with the invariant "execution never permits what training forbade."
 
+### Model introspection
+
+```ts
+model.reliable;              // did training have enough data
+model.confidence;            // 0..1 trust in the model
+model.impactHorizonMinutes;  // empirical post impact horizon (global level)
+model.mode;                  // "matrix" | "single" — how the model was trained
+model.modeReason;            // honest diagnostics: WHY this mode was chosen
+model.minClusters;           // min independent clusters for a matrix burst
+model.minSharedEvents;       // min shared events for a viable author matrix
+model.lookbackMinutes;       // how many 1m candles BEFORE the signal plan() needs
+model.exit;                  // the full exit tensor (audit)
+model.policy;                // the baked-in allow-list (readonly copy)
+```
+
+`lookbackMinutes` = `max(volBaselineWindow, cascadeWindowMinutes) + 5` — the amount of pre-signal 1m history `plan()` pulls per signal (strictly in the past, no look-ahead). In prod, keep at least this much history available for every fresh signal.
+
 ---
 
-## Risk-reward (research output + runtime filter)
+## Signal history (`dump`) — for external analytics
+
+`fit` records the full signal history of the selected configuration — one record per candidate, labeled with the chosen exit: entry/exit price, realized pnl, peak, reason, held minutes, inversion flag, volRegime, independent clusters. It includes signals that did NOT enter (`no-entry` / `cascade-veto`, `entered: false`), so analytics can count skips, not just realized trades. Serialized in `save()`/`load()`.
+
+```ts
+model.dump();        // SignalRecord[]  (array of plain objects)
+model.dump(true);    // JSON string
+model.historySize;   // number of records (0 if loaded without history)
+```
+
+```ts
+interface SignalRecord {
+  symbol: string;
+  direction: "long" | "short";
+  channel: string;
+  ts: number;            // signal time (burst ts), ms
+  entered: boolean;      // false for no-entry / cascade-veto
+  entryPrice: number;
+  exitPrice: number;
+  pnl: number;           // realized pnl, fraction (0.05 = +5%)
+  peak: number;          // peak pnl over the position's life
+  reason: string;
+  heldMinutes: number;
+  inverted: boolean;
+  volRegime: "calm" | "anomalous";
+  independentClusters: number;
+}
+```
+
+---
+
+## Risk-reward & PnL (research output + runtime filter)
+
+### Risk-reward
 
 RR per trade = `pnl / hardStop` — realized in units of risk (how many R were captured). Computed on the backtest across folds and baked into the model: **per-symbol** (for the runtime filter) and **global** (report), alongside `impactHorizonMinutes`.
 
@@ -354,7 +436,18 @@ model.signals(items, { minRiskReward: 1.5 });                  // mean RR >= 1.5
 model.signals(items, { minRiskReward: 5.0, rrMetric: "p99" }); // tail P99 >= 5.0
 ```
 
-A symbol with no RR statistics is cut conservatively (nothing to confirm it with). `rrMetric`: `mean` (default), `p95`, `p99` — p99 filters by the right tail, keeping symbols with explosive upside.
+A symbol with no RR statistics is cut conservatively (nothing to confirm it with). `rrMetric`: `mean` (default), `p95`, `p99` — p99 filters by the right tail, keeping symbols with explosive upside. A runtime `minRiskReward` can only *tighten* the baked-in threshold (the max of the two is taken), never loosen it.
+
+### PnL (outlier-robust)
+
+Realized-pnl statistics complement the mean with the median and percentiles, so a single bad (or single fat) trade doesn't define the system's edge:
+
+```ts
+model.pnl.global;            // { mean, median, p5, p95, p99, n }
+model.pnl.bySymbol.SOLUSDT;  // { mean, median, p5, p95, p99, n }
+```
+
+`median` is the outlier-immune center, `p5` is the lower tail (how bad the worst 5% are), `p95`/`p99` the upper tail.
 
 ---
 
@@ -365,7 +458,7 @@ On 5 months of data, statistics get corrupted: τ and the author matrix are aggr
 The fix needs no new math: statistics are computed over a local window ending at the current moment. The window size is a grid axis, tuned by `train` via CV:
 
 ```ts
-stationarityWindowMs: [28*24*3600_000, 56*24*3600_000]
+stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000]
 ```
 
 `Infinity` = the whole history. On a long horizon a finite window wins — it drops stale connections. In `predict`/live, the window is applied automatically to the most recent period up to the latest event. Affects only matrix mode (author matrix); single mode is independent of it.
@@ -382,7 +475,7 @@ await PumpMatrix.fit(history, getCandles); // bar is on automatically
 // [██████████████████████████████] 100% (27/27) score 5|0.4|0.6|all
 ```
 
-Two phases: `label` (slow per-candle labeling, IO-bound) and `score` (grid scoring from cache). Silence or replace it:
+Three phases: `label` (slow per-candle labeling, IO-bound), `score` (grid scoring from cache), and `nested` (one tick per outer nested-CV fold). Silence or replace it:
 
 ```ts
 import { silentProgress } from "pump-anomaly";
@@ -400,7 +493,7 @@ fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); //
 4. **clusterAuthors** — union-find: merges channels belonging to the same author.
 5. **earlyWarning** — density over INDEPENDENT clusters (deduplicating N channels of one actor).
 
-All five are computed over the stationarity window. In single mode the matrix isn't needed — every post becomes an entry directly.
+All five are computed over the stationarity window. In single mode the matrix isn't needed — every post becomes an entry directly (`singleChannelSignals`).
 
 **Honest auto-diagnostics.** `model.modeReason` explains WHY `single` or `matrix` was chosen — no guessing. Examples: `auto → single: one channel — correlation impossible`, `auto → matrix: 3 strong edges, overlap 5, clusters >1: 2`. Matrix requires ≥2 INDEPENDENT author clusters on the same ticker; echo channels (always firing together) correctly collapse into 1 cluster and don't produce a false matrix signal. On single-channel data it's always single fallback.
 

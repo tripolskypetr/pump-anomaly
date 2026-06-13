@@ -49,6 +49,8 @@ export function earlyWarning(
             `в окне ${(window / 60000).toFixed(0)}м (каналов: ${channels.size})`,
           source: "matrix",
           channel: null,
+          entryFromPrice: evs[hi].entryFromPrice,
+          entryToPrice: evs[hi].entryToPrice,
         };
         if (!best || cand.confidence > best.confidence) best = cand;
       }

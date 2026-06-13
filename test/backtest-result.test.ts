@@ -88,4 +88,28 @@ describe("backtest() возвращает realized pnl в result", () => {
     expect("result" in plan[0]).toBe(false);
     expect("result" in sig[0]).toBe(false);
   });
+
+  it("зона входа протянута в TradeSignal (нужна для открытия live-позиции)", () => {
+    const m = model();
+    // plan() — главный live-сценарий: entryFromPrice/entryToPrice должны быть в корне
+    const plan = m.plan([item], { SOLUSDT: rising() });
+    expect(plan[0].entryFromPrice).toBe(99.9);
+    expect(plan[0].entryToPrice).toBe(100.1);
+    // и в signals() (без свечей) тоже
+    const sig = m.signals([item]);
+    expect(sig[0].entryFromPrice).toBe(99.9);
+    expect(sig[0].entryToPrice).toBe(100.1);
+    // и в backtest
+    const bt = m.backtest([item], { SOLUSDT: rising() });
+    expect(bt[0].entryFromPrice).toBe(99.9);
+    expect(bt[0].entryToPrice).toBe(100.1);
+  });
+
+  it("без зоны в item → entryFromPrice/entryToPrice undefined (вход по рынку)", () => {
+    const m = model();
+    const noZone: ParserItem = { channel: "yoda", symbol: "SOLUSDT", direction: "long", ts: t0 + 20 * MIN };
+    const sig = m.signals([noZone]);
+    expect(sig[0].entryFromPrice).toBeUndefined();
+    expect(sig[0].entryToPrice).toBeUndefined();
+  });
 });

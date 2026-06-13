@@ -296,42 +296,22 @@ export class PumpMatrix {
     source: GetCandles | Record<string, ICandleData[]>,
     policy?: Partial<SignalPolicy>,
   ): BacktestSignal[] | Promise<BacktestSignal[]> {
-    const zones = this.entryZoneIndex(items);
     if (typeof source === "function") {
-      return this.backtestViaGetCandles(items, source, zones, policy);
+      return this.backtestViaGetCandles(items, source, policy);
     }
     const eff = intersectPolicy(this.params.policy, policy);
     const out: BacktestSignal[] = [];
     for (const v of this._predict(items).signals) {
-      const z = zones.get(this.zoneKey(v));
-      const s = this.buildSignal(v, source[v.symbol] ?? null, eff, z?.from, z?.to);
+      // зона входа уже в вердикте (протянута из parser-item) → buildSignal её прокинет
+      const s = this.buildSignal(v, source[v.symbol] ?? null, eff);
       if (s) out.push(s);
     }
     return out;
   }
 
-  /** Индекс зон входа (symbol|dir|ts → {from,to}) из parser-items — для replay в backtest. */
-  private entryZoneIndex(items: ParserItem[]): Map<string, { from?: number; to?: number }> {
-    const m = new Map<string, { from?: number; to?: number }>();
-    for (const it of items) {
-      const from = typeof it.entryFromPrice === "number" ? it.entryFromPrice : undefined;
-      const to = typeof it.entryToPrice === "number" ? it.entryToPrice : undefined;
-      m.set(`${it.symbol}|${it.direction}|${it.ts}`, { from, to });
-    }
-    return m;
-  }
-
-  /** Ключ зоны по вердикту: исходное (до инверсии) направление поста. */
-  private zoneKey(v: PumpVerdict): string {
-    // invertedFrom применяется позже в buildSignal; зона привязана к ИСХОДНОМУ посту,
-    // поэтому ключ по direction вердикта (что говорил канал), не по итоговому.
-    return `${v.symbol}|${v.direction}|${v.ts}`;
-  }
-
   private async backtestViaGetCandles(
     items: ParserItem[],
     getCandles: GetCandles,
-    zones: Map<string, { from?: number; to?: number }>,
     policy?: Partial<SignalPolicy>,
   ): Promise<BacktestSignal[]> {
     const eff = intersectPolicy(this.params.policy, policy);
@@ -347,8 +327,7 @@ export class PumpMatrix {
       } catch {
         candles = null;
       }
-      const z = zones.get(this.zoneKey(v));
-      const s = this.buildSignal(v, candles, eff, z?.from, z?.to);
+      const s = this.buildSignal(v, candles, eff);
       if (s) out.push(s);
     }
     return out;
@@ -439,12 +418,10 @@ export class PumpMatrix {
     v: PumpVerdict,
     candles: ICandleData[] | null,
     policy: SignalPolicy,
-    entryFrom?: number,
-    entryTo?: number,
   ): BacktestSignal | null {
     const sig = this.buildSignalCore(v, candles, policy, "backtest");
     if (!sig) return null;
-    return { ...sig, result: this.replayResult(sig, candles, entryFrom, entryTo) };
+    return { ...sig, result: this.replayResult(sig, candles) };
   }
 
   /**
@@ -467,14 +444,13 @@ export class PumpMatrix {
   private replayResult(
     sig: TradeSignal,
     candles: ICandleData[] | null,
-    entryFrom?: number,
-    entryTo?: number,
   ): BacktestResult {
     if (!candles || candles.length === 0) {
       return { entered: false, pnl: 0, peak: 0, reason: "no-candles", heldMinutes: 0, entryPrice: 0, exitPrice: 0, truncated: false };
     }
-    const from = entryFrom ?? candles[0].open;
-    const to = entryTo ?? candles[0].open;
+    // зона входа теперь в самом сигнале (протянута из parser-item); нет → open первой свечи.
+    const from = sig.entryFromPrice ?? candles[0].open;
+    const to = sig.entryToPrice ?? candles[0].open;
     const r = replayExit(candles, sig.direction, from, to, {
       trailingTake: sig.exit.trailingTake,
       hardStop: sig.exit.hardStop,
@@ -598,7 +574,11 @@ export class PumpMatrix {
       ids: v.ids,
     };
 
-    return { symbol: v.symbol, direction: finalDir, action, ts: v.ts, exit: plan, origin };
+    return {
+      symbol: v.symbol, direction: finalDir, action, ts: v.ts,
+      entryFromPrice: v.entryFromPrice, entryToPrice: v.entryToPrice,
+      exit: plan, origin,
+    };
   }
 }
 

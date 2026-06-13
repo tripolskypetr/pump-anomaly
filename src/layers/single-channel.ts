@@ -50,6 +50,8 @@ export function singleChannelSignals(
         channel: e.channel,
         id,
         ids: id != null ? [id] : [],
+        entryFromPrice: e.entryFromPrice,
+        entryToPrice: e.entryToPrice,
       };
       verdicts.push(current);
     }

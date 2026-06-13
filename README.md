@@ -55,7 +55,8 @@ const trades = model.signals(liveItems);
 const trades = await model.plan(liveItems, getCandles);
 
 for (const s of trades) {
-  openPosition(s.symbol, s.direction, s.exit); // direction is already inverted if needed; exit is ready
+  // direction is already inverted if needed; exit is ready; entry zone for the live order
+  openPosition(s.symbol, s.direction, { from: s.entryFromPrice, to: s.entryToPrice }, s.exit);
 }
 ```
 
@@ -400,7 +401,8 @@ The calm/anomalous threshold (`volZThreshold`) and the firing threshold (`squeez
 
 ```ts
 for (const s of model.signals(liveItems)) {
-  openPosition(s.symbol, s.direction, s.exit); // direction is already flipped if inverted
+  // direction is already flipped if inverted; entry zone + exit are ready for the order
+  openPosition(s.symbol, s.direction, { from: s.entryFromPrice, to: s.entryToPrice }, s.exit);
 }
 ```
 
@@ -412,6 +414,8 @@ interface TradeSignal {
   direction: "long" | "short";        // FINAL (inversion already applied)
   action: "enter" | "invert" | "tighten";
   ts: number;
+  entryFromPrice?: number;            // entry zone from the parser-item (for opening the live position)
+  entryToPrice?: number;              // undefined → enter at market
   exit: {                              // flat, ready for openPosition
     trailingTake: number;             // tightened if action="tighten"
     hardStop: number;

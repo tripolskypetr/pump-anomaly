@@ -77,6 +77,9 @@ export interface PumpVerdict {
   id?: string;
   /** id всех parser-item, вошедших в сигнал */
   ids?: string[];
+  /** зона входа из parser-item — нужна для открытия live-позиции */
+  entryFromPrice?: number;
+  entryToPrice?: number;
 }
 
 /** Карта авторства: канал → id кластера-автора. */

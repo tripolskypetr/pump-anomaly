@@ -67,6 +67,10 @@ export interface TradeSignal {
   action: SignalAction;
   /** unix-время сигнала, мс */
   ts: number;
+  /** нижняя граница зоны входа из parser-item (для открытия live-позиции; undefined = вход по рынку) */
+  entryFromPrice?: number;
+  /** верхняя граница зоны входа из parser-item */
+  entryToPrice?: number;
   /** готовый exit-план */
   exit: ExitPlan;
   /** происхождение (аудит), не для ветвления */

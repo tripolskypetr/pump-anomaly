@@ -69,6 +69,9 @@ interface PumpVerdict {
     id?: string;
     /** id всех parser-item, вошедших в сигнал */
     ids?: string[];
+    /** зона входа из parser-item — нужна для открытия live-позиции */
+    entryFromPrice?: number;
+    entryToPrice?: number;
 }
 /** Карта авторства: канал → id кластера-автора. */
 type AuthorMap = Map<string, number>;
@@ -730,6 +733,10 @@ interface TradeSignal {
     action: SignalAction;
     /** unix-время сигнала, мс */
     ts: number;
+    /** нижняя граница зоны входа из parser-item (для открытия live-позиции; undefined = вход по рынку) */
+    entryFromPrice?: number;
+    /** верхняя граница зоны входа из parser-item */
+    entryToPrice?: number;
     /** готовый exit-план */
     exit: ExitPlan;
     /** происхождение (аудит), не для ветвления */
@@ -1368,10 +1375,6 @@ declare class PumpMatrix {
      */
     backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<BacktestSignal[]>;
     backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): BacktestSignal[];
-    /** Индекс зон входа (symbol|dir|ts → {from,to}) из parser-items — для replay в backtest. */
-    private entryZoneIndex;
-    /** Ключ зоны по вердикту: исходное (до инверсии) направление поста. */
-    private zoneKey;
     private backtestViaGetCandles;
     /** Точечно под ОДНУ позицию в LIVE (вход = последняя свеча, каскад по прошлому). */
     planFor(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], policy?: Partial<SignalPolicy>): TradeSignal | null;

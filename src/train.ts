@@ -70,13 +70,13 @@ export interface TrainGrid {
 export const DEFAULT_GRID: TrainGrid = {
   windowK: [2, 3, 5],
   minClusters: [2, 3],
-  jaccardThreshold: [0.2, 0.3, 0.4],
-  lagPeakThreshold: [0.4, 0.5, 0.6],
+  jaccardThreshold: [0.3, 0.4],       // 0.2 почти никогда не выбирался — убран ради размера грида
+  lagPeakThreshold: [0.4, 0.5],       // 0.6 редко лучше — убран ради размера грида
   trailingTake: [0.5, 1.0, 2.0],
   hardStop: [1.0, 2.0, 3.0],
-  stalenessSinceProfit: [0.5, 1.0, 2.0],   // порог профита для фиксации пика — перебирается, не зафиксирован
-  stalenessSinceMinutes: [60, 120, 240],    // сколько минут без нового пика = выход по staleness
-  staleMinutes: [60, 240, 720, 1440], // 1ч / 4ч / 12ч / 24ч — какой импакт-горизонт лучше
+  stalenessSinceProfit: [0.5, 1.0, 2.0],   // порог прибыли (%) для вооружения staleness-выхода
+  stalenessSinceMinutes: [60, 120, 240],    // минут застоя от пика до выхода (число staleness-минут)
+  staleMinutes: [60, 240, 720],       // 1ч / 4ч / 12ч (24ч редко оптимален для коротких пампов)
   volZThreshold: [1.5, 2.5],          // когда считать объём аномальным (накопление топлива)
   squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
   squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания

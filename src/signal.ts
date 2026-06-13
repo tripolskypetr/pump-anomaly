@@ -52,6 +52,10 @@ export interface SignalOrigin {
   modelConfidence: number;
   /** надёжна ли модель (хватило ли данных) */
   modelReliable: boolean;
+  /** id якорного parser-item — для сопоставления live-сигнала с парсингом */
+  id?: string;
+  /** id всех parser-item, вошедших в сигнал */
+  ids?: string[];
 }
 
 /** Единый исполняемый сигнал. Прод читает плоскую часть, origin — для аудита. */

@@ -512,6 +512,8 @@ export class PumpMatrix {
       independentClusters: v.independentClusters,
       modelConfidence: this.params.meta.confidence,
       modelReliable: this.params.meta.reliable,
+      id: v.id,
+      ids: v.ids,
     };
 
     return { symbol: v.symbol, direction: finalDir, action, ts: v.ts, exit: plan, origin };

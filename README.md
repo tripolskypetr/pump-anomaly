@@ -172,14 +172,14 @@ const DEFAULT_GRID = {
   // detector (authorship matrix)
   windowK:          [2, 3, 5],
   minClusters:      [2, 3],
-  jaccardThreshold: [0.2, 0.3, 0.4],
-  lagPeakThreshold: [0.4, 0.5, 0.6],
+  jaccardThreshold: [0.3, 0.4],                 // 0.2 almost never won — dropped to shrink the grid
+  lagPeakThreshold: [0.4, 0.5],                 // 0.6 rarely better — dropped to shrink the grid
   // prod exit (label set by replay)
   trailingTake:         [0.5, 1.0, 2.0],
   hardStop:             [1.0, 2.0, 3.0],
-  stalenessSinceProfit: [0.5, 1.0, 2.0],        // profit threshold that pins the peak — searched, not fixed
+  stalenessSinceProfit: [0.5, 1.0, 2.0],        // profit threshold that arms the staleness exit — searched, not fixed
   stalenessSinceMinutes:[60, 120, 240],         // minutes without a new high before a staleness exit
-  staleMinutes:         [60, 240, 720, 1440],   // impact horizon: 1h / 4h / 12h / 24h
+  staleMinutes:         [60, 240, 720],         // impact horizon: 1h / 4h / 12h (24h rarely optimal for short pumps)
   // liquidation-cascade detector
   volZThreshold:    [1.5, 2.5],                 // when volume is anomalous
   squeezePolicy:    ["none", "tighten", "veto", "invert"],
@@ -309,7 +309,7 @@ if (gate.allowed) {
   const model = await PumpMatrix.fit(history, getCandles, { metaLedger: ledger });
   ledger = recordAttempt(ledger, {                // log EVERY attempt, certified or not
     ts: Date.now(),
-    innerTrials: model.innerTrials ?? 0,          // grid size of this fit
+    innerTrials: model.innerTrials,          // grid size of this fit
     certifiedNaive: !!model.certification?.certified,
   });
   // model.effectiveTrials / model.fitAttempts expose the meta-trial count for audit
@@ -403,6 +403,8 @@ interface TradeSignal {
     independentClusters: number;
     modelConfidence: number;
     modelReliable: boolean;
+    id?: string;                        // anchor parser-item id (traceback to the source post)
+    ids?: string[];                     // all parser-item ids folded into this signal
   };
 }
 ```
@@ -584,7 +586,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ## Tests
 
-**512 tests** across **49 test files**. All passing.
+**518 tests** across **50 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|
@@ -637,6 +639,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 | `e2e/fit-noise-rejection.test.ts` | 1 | Full `fit` on a pure random walk → `certified:false` even though grid argmax picks a "best" config (the certificate catches the brute-force artifact `reliable` alone would miss) |
 | `meta-ledger.test.ts` | 9 | Meta-overfitting guard: cadence guard blocks too-frequent refits, `effectiveTrials` sums ALL fit attempts (not only certified ones), family-wise DSR drops false certificates from 720 noise refits to 0 while a strong edge survives the correction |
 | `staleness-and-id.test.ts` | 7 | `stalenessSinceProfit`/`stalenessSinceMinutes` are searched in `DEFAULT_GRID` (not pinned); a parser-item `id` threads through to every `dump()` record (numeric→string, matches the source post by `ts`, survives save/load, `undefined` without an id) |
+| `id-threading-attack.test.ts` | 6 | `id` threading is leak-proof: time-separated bursts on one symbol both survive (no best-per-symbol loss), collapsed posts keep their `id` in `ids` (`enumeratePosts` + `singleChannelSignals`), and `id`/`ids` reach the LIVE `plan` signal's `origin` (not only `dump`) |
 
 ```bash
 npm test

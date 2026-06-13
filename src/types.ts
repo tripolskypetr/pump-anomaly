@@ -71,6 +71,10 @@ export interface PumpVerdict {
   source: "matrix" | "single";
   /** канал-источник (для single — конкретный пост; для matrix — null, межканальный) */
   channel: string | null;
+  /** id якорного parser-item (для сопоставления live-сигнала с парсингом) */
+  id?: string;
+  /** id всех parser-item, вошедших в сигнал */
+  ids?: string[];
 }
 
 /** Карта авторства: канал → id кластера-автора. */

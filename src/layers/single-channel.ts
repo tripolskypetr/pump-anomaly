@@ -20,14 +20,24 @@ export function singleChannelSignals(
   const window = Math.min(cfg.windowK * tau, cfg.maxBurstWindowMs);
   const verdicts: PumpVerdict[] = [];
 
+  const toId = (e: { id?: unknown }): string | undefined => {
+    const r = e.id;
+    return typeof r === "string" ? r : (typeof r === "number" ? String(r) : undefined);
+  };
   for (const [k, evs] of tbl.byKey) {
     const [symbol, direction] = splitKey(k);
     // схлопываем близкие посты в один вход
     let lastTs = -Infinity;
+    let current: PumpVerdict | null = null;
     for (const e of evs) {
-      if (e.ts - lastTs <= window) continue; // в окне уже открытой позиции — пропускаем
+      const id = toId(e as { id?: unknown });
+      if (e.ts - lastTs <= window) {
+        // схлопнутый пост — его id НЕ теряем (иначе несопоставим с парсингом)
+        if (current && id != null) current.ids!.push(id);
+        continue;
+      }
       lastTs = e.ts;
-      verdicts.push({
+      current = {
         symbol,
         direction,
         action: "open",
@@ -38,7 +48,10 @@ export function singleChannelSignals(
         reason: `single-channel fallback: пост по ${symbol} ${direction} (exit решает исход)`,
         source: "single",
         channel: e.channel,
-      });
+        id,
+        ids: id != null ? [id] : [],
+      };
+      verdicts.push(current);
     }
   }
 

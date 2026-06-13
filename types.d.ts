@@ -63,6 +63,10 @@ interface PumpVerdict {
     source: "matrix" | "single";
     /** канал-источник (для single — конкретный пост; для matrix — null, межканальный) */
     channel: string | null;
+    /** id якорного parser-item (для сопоставления live-сигнала с парсингом) */
+    id?: string;
+    /** id всех parser-item, вошедших в сигнал */
+    ids?: string[];
 }
 /** Карта авторства: канал → id кластера-автора. */
 type AuthorMap = Map<string, number>;
@@ -693,6 +697,10 @@ interface SignalOrigin {
     modelConfidence: number;
     /** надёжна ли модель (хватило ли данных) */
     modelReliable: boolean;
+    /** id якорного parser-item — для сопоставления live-сигнала с парсингом */
+    id?: string;
+    /** id всех parser-item, вошедших в сигнал */
+    ids?: string[];
 }
 /** Единый исполняемый сигнал. Прод читает плоскую часть, origin — для аудита. */
 interface TradeSignal {
@@ -1198,8 +1206,6 @@ declare class PumpMatrix {
      * undefined у моделей до этой версии.
      */
     get effectiveTrials(): number | undefined;
-    /** Число конфигов в гриде текущего fit (внутренние испытания). undefined у моделей до этой версии. */
-    get innerTrials(): number | undefined;
     /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
     get fitAttempts(): number | undefined;
     /**

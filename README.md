@@ -446,18 +446,38 @@ await model.plan(items, getCandles, policy?)                 // Promise<TradeSig
 model.plan(items, { SOLUSDT: candles }, policy?)             // TradeSignal[]
 
 // BACKTEST — replay forward over closed history, source = getCandles | map:
-await model.backtest(items, getCandles, policy?)             // Promise<TradeSignal[]>
-model.backtest(items, { SOLUSDT: candles }, policy?)         // TradeSignal[]
+await model.backtest(items, getCandles, policy?)             // Promise<BacktestSignal[]>
+model.backtest(items, { SOLUSDT: candles }, policy?)         // BacktestSignal[]
 
 // single-position helpers:
-model.planFor(symbol, dir, channel, candles, policy?)        // live, null on veto
-model.planForAt(symbol, dir, channel, candles, ts, policy?)  // backtest, null on veto
+model.planFor(symbol, dir, channel, candles, policy?)        // live → TradeSignal, null on veto
+model.planForAt(symbol, dir, channel, candles, ts, policy?)  // backtest → BacktestSignal, null on veto
 
 // full report (all verdicts + author map) for debugging:
 model.explain(items)
 ```
 
-`plan` vs `backtest` differ only in *which* candles they see: `plan` measures the cascade from candles before the entry (live-safe), `backtest` from candles after the entry (forward replay over already-closed history). Use `backtest` for analysis of the completed past, `plan` for a live "should I enter now" decision.
+`plan` and `backtest` differ in two ways. **(1) Which candles they see:** `plan` measures the cascade from candles *before* the entry (live-safe, no look-ahead); `backtest` from candles *after* the entry (forward replay over already-closed history). **(2) What they return:** `plan` returns a `TradeSignal` (a decision — the position isn't closed yet, so there's no pnl); `backtest` returns a **`BacktestSignal`** — the same signal plus a `result` that *replays the exit plan forward* and reports the realized pnl. That replayed `result` is the whole point of `backtest`:
+
+```ts
+interface BacktestResult {     // present ONLY on BacktestSignal (backtest / planForAt)
+  entered: boolean;            // false → entry zone never touched on the candle window
+  pnl: number;                 // realized, fraction (hard-stop = honest -hardStop%)
+  peak: number;                // peak pnl over the position's life
+  reason: string;              // hard-stop | trailing-take | peak-staleness | life-cap | …
+  heldMinutes: number;
+  entryPrice: number;          // 0 if not entered
+  exitPrice: number;           // 0 if not entered
+  truncated: boolean;          // not enough candles after entry for the full life-cap
+}
+interface BacktestSignal extends TradeSignal { result: BacktestResult }
+
+for (const s of model.backtest(items, getCandles)) {
+  console.log(s.symbol, s.direction, s.result.pnl, s.result.reason); // realized, no join with dump()
+}
+```
+
+The replay uses the signal's FINAL direction (inversion already applied) and its resolved exit plan; the entry zone comes from the parser-item (`entryFromPrice`/`entryToPrice`), falling back to the first candle's open. `dump()` still holds the training-time history; `backtest` is the same machinery applied to whatever items/candles you pass now.
 
 ### Permissions — allow-list, serialized at training time, readonly at runtime
 
@@ -482,6 +502,7 @@ model.certification;         // five-barrier edge certificate (DSR/PBO/SPA/minTR
 model.effectiveTrials;       // family-wise meta-trial count (Σ configs over all fit attempts)
 model.innerTrials;           // grid size of this fit
 model.fitAttempts;           // how many times fit has run in the chain
+model.labeling;              // labeling diagnostics — WHY a fit came out empty
 model.impactHorizonMinutes;  // empirical post impact horizon (global level)
 model.mode;                  // "matrix" | "single" — how the model was trained
 model.modeReason;            // honest diagnostics: WHY this mode was chosen
@@ -493,6 +514,26 @@ model.policy;                // the baked-in allow-list (readonly copy)
 ```
 
 `lookbackMinutes` = `max(volBaselineWindow, cascadeWindowMinutes) + 5` — the amount of pre-signal 1m history `plan()` pulls per signal (strictly in the past, no look-ahead). In prod, keep at least this much history available for every fresh signal.
+
+### Troubleshoot
+
+A `fit` that produces `totalSamples: 0` is otherwise mute — "no data" and "no entries" look identical. `model.labeling` makes it speak: per **unique** candidate burst, what its labeling outcome was (and the raw `getCandles` exception text, deduped):
+
+```ts
+model.labeling;
+// {
+//   candidates: number;                     // unique bursts seen
+//   outcomes: {                             // only non-zero outcomes present
+//     ok?: number;                          // labeled, has an entry
+//     "adapter-error"?: number;             // getCandles threw (look-ahead guard / gap / symbol)
+//     "no-candles"?: number;                // getCandles returned empty (symbol/range gave nothing)
+//     "no-entry"?: number;                  // candles exist, but no exit-set entered the zone
+//   };
+//   errors: Record<string, number>;         // unique getCandles exception messages → count
+// }
+```
+
+So when a trained model is empty, `labeling.outcomes` tells you whether to fix `getCandles` (`adapter-error`), the symbol/range (`no-candles`), or accept there were no entries — and `labeling.errors` carries the exact thrown message (e.g. `{ "ccxt: symbol not found": 32 }`) instead of swallowing it.
 
 ---
 
@@ -612,7 +653,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ## Tests
 
-**518 tests** across **50 test files**. All passing.
+**531 tests** across **52 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|
@@ -666,6 +707,8 @@ All five are computed over the stationarity window. In single mode the matrix is
 | `meta-ledger.test.ts` | 9 | Meta-overfitting guard: cadence guard blocks too-frequent refits, `effectiveTrials` sums ALL fit attempts (not only certified ones), family-wise DSR drops false certificates from 720 noise refits to 0 while a strong edge survives the correction |
 | `staleness-and-id.test.ts` | 7 | `stalenessSinceProfit`/`stalenessSinceMinutes` are searched in `DEFAULT_GRID` (not pinned); a parser-item `id` threads through to every `dump()` record (numeric→string, matches the source post by `ts`, survives save/load, `undefined` without an id) |
 | `id-threading-attack.test.ts` | 6 | `id` threading is leak-proof: time-separated bursts on one symbol both survive (no best-per-symbol loss), collapsed posts keep their `id` in `ids` (`enumeratePosts` + `singleChannelSignals`), and `id`/`ids` reach the LIVE `plan` signal's `origin` (not only `dump`) |
+| `labeling-diagnostics.test.ts` | 8 | `model.labeling` makes an empty `fit` speak: outcomes per unique burst (ok / adapter-error / no-candles / no-entry), counts not inflated by grid size, sum of outcomes = candidates, and the raw `getCandles` exception text is captured in `errors` (incl. non-`Error` throws) |
+| `backtest-result.test.ts` | 5 | `backtest()` returns `BacktestSignal` with a replayed `result` (realized pnl/reason/prices); no candles → `entered:false` not a crash; `planForAt` carries `result` too; `plan()`/`signals()` do NOT carry `result` |
 
 ```bash
 npm test

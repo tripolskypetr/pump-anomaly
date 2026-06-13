@@ -35,7 +35,9 @@ export async function labelBurst(
   entryFromPrice?: number,
   entryToPrice?: number,
 ): Promise<LabeledBurst | null> {
-  const maxLife = Math.max(...exitSets.map((e) => e.staleMinutes));
+  // НЕ Math.max(...arr.map()): spread-в-аргументы переполняет стек на большом наборе.
+  let maxLife = 0;
+  for (const e of exitSets) if (e.staleMinutes > maxLife) maxLife = e.staleMinutes;
   // старт = первая полностью сформированная свеча ПОСЛЕ сигнала (без look-ahead):
   // свеча, содержащая сигнал, ещё формируется — её OHLC известны только в конце минуты.
   const since = entryStartTs(ts, "1m");

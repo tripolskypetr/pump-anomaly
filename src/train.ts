@@ -465,7 +465,7 @@ export async function train(
                   foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
                   foldWins.push(winrate(valRet));
                   foldSupp.push(valRet.length);
-                  allRet.push(...valRet);
+                  for (const r of valRet) allRet.push(r);
                 }
                 const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
                 out.push({
@@ -483,10 +483,13 @@ export async function train(
 
   // основной board — по всем данным, с прогрессом фазы score
   let scoreDone = 0;
-  board.push(...buildBoard(() => true, (label) => {
+  // НЕ спред (board.push(...arr)): на полном гриде arr — десятки тысяч элементов,
+  // и spread-в-аргументы переполняет стек вызовов (Maximum call stack size exceeded).
+  const mainBoard = buildBoard(() => true, (label) => {
     scoreDone++;
     progress({ done: scoreDone, total: scoreTotal, phase: "score", label });
-  }));
+  });
+  for (const entry of mainBoard) board.push(entry);
 
   // ── выбор победителя: one-standard-error rule (против winner's curse) ──
   // вместо argmax по cvScore берём самую КОНСЕРВАТИВНУЮ конфигурацию среди тех,

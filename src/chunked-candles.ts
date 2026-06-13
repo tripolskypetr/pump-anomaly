@@ -41,7 +41,8 @@ export async function fetchCandlesChunked(
     const chunkLimit = Math.min(remaining, chunkSize);
     const chunk = await getCandles(symbol, interval, chunkLimit, currentSince);
     if (!chunk || chunk.length === 0) break; // край истории / дыра — отдаём собранное
-    all.push(...chunk);
+    for (const c of chunk) all.push(c); // НЕ спред: при большом limit чанк переполнит стек
+
     remaining -= chunkLimit;
     if (remaining > 0) currentSince = currentSince + chunkLimit * step;
   }

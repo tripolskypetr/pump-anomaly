@@ -62,7 +62,9 @@ export function sharpe(returns: number[]): number {
   // (масштаб данных × machine epsilon), а НЕ относительно mean. Прошлый порог
   // |mean|·1e-9 ошибочно убивал ВЫСОКИЙ Sharpe (малый std при большом mean — это и
   // есть высокий Sharpe, не пыль). Масштаб = max|x|.
-  const scale = Math.max(...returns.map((x) => Math.abs(x)), Math.abs(m));
+  // НЕ Math.max(...returns): на длинном ряде сделок spread-в-аргументы переполняет стек.
+  let scale = Math.abs(m);
+  for (const x of returns) { const a = Math.abs(x); if (a > scale) scale = a; }
   const dustFloor = scale * 1e-13; // ~500× machine epsilon (2.2e-16) от масштаба данных
   if (s <= dustFloor) return 0;
   return m / s;

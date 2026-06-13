@@ -36,6 +36,8 @@ interface ParserItem {
     entryFromPrice?: number;
     /** верхняя граница зоны входа. */
     entryToPrice?: number;
+    /** идентификатор исходного поста — протягивается до dump() и origin live-сигнала для сопоставления с парсингом. */
+    id?: string | number;
     [extra: string]: unknown;
 }
 /** Нормализованное событие, с которым работают внутренние слои. */

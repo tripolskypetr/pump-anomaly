@@ -41,6 +41,8 @@ export interface ParserItem {
   entryFromPrice?: number;
   /** верхняя граница зоны входа. */
   entryToPrice?: number;
+  /** идентификатор исходного поста — протягивается до dump() и origin live-сигнала для сопоставления с парсингом. */
+  id?: string | number;
   // прочие поля parser-items (targets/stoploss/...) допускаются и игнорируются
   [extra: string]: unknown;
 }

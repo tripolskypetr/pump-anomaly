@@ -499,6 +499,61 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ---
 
+## Tests
+
+**442 tests** across **42 test files**. All passing.
+
+| File | Tests | What is covered |
+|------|-------|-----------------|
+| `predict.test.ts` | 10 | Public facade: τ self-estimation, author-cluster merging, catching a real pump vs skipping a single-actor pump, determinism, garbage-input robustness |
+| `layers.test.ts` | 10 | Detector layers in isolation: `buildTable` indexing, `jaccardPair` sliding window, `selfTuneLag` peak/default, `lagXCorr` leadership + peak sharpness, `clusterAuthors` union-find |
+| `viability.test.ts` | 6 | Two channels ≠ matrix: noisy pair falls back to single, systematic siblings stay matrix, strict-threshold override, single channel not viable |
+| `fallback.test.ts` | 6 | Mode resolution: auto/forced single & matrix, post deduplication in window, single-channel history training into a reliable model |
+| `modes-synthetic.test.ts` | 16 | `enumerateBursts` clustering, honest auto single/matrix choice + diagnostics, single fallback out of the box, matrix on known clusters (not just a flag) |
+| `reliability.test.ts` | 6 | Confidence axes: small→low, large/stable→high, monotonic growth, reliable false→true flip, zero/noisy/negative edge stays unreliable |
+| `exit-tensor.test.ts` | 8 | Hierarchical resolution: exact cell hit, long/short symmetry as different cells, calm vs anomalous, volRegime→symbol-dir→mode→global fallbacks |
+| `matrix-cell.test.ts` | 2 | Regression: matrix cell-exit resolves via the canonical `_matrix` channel key |
+| `replay.test.ts` | 14 | `replayExit` over all window sequences (long), short (gravebag), priorities and window edges |
+| `volume.test.ts` | 10 | `volumeZScore` anomaly, `squeezePressure` long/short symmetry, veto/tighten cascade symmetry in replay, `volRegimeOf` threshold |
+| `volume-metrics.test.ts` | 34 | Deterministic volZ across per-symbol baselines, volZ regime threshold boundary, squeezePressure against-position shares |
+| `entry-zone.test.ts` | 8 | Entry-price resolution: close-in-zone refinement vs clamped midpoint of the entry zone |
+| `label-robustness.test.ts` | 6 | `labelBurst` survives adapter throw / empty result; `replayExit` truncated horizon in chop; truncated exit dropped, full kept |
+| `chunked-candles.test.ts` | 9 | `fetchCandlesChunked` pagination, since-advance, timestamp dedup keeping the first (authoritative) occurrence |
+| `train.test.ts` | 9 | `shrinkageExpectancy` objective, v-params with tuned exit + impact horizon, JSON round-trip, version guard, casual fit→save→load→signals flow |
+| `one-se.test.ts` | 14 | `standardError`, one-standard-error rule against winner's curse, integration: train picks the robust configuration within the SE corridor |
+| `nested-cv.test.ts` | 13 | Conservatism ordering (no magic literals), nested-CV unbiased out-of-sample estimate + progress ticking |
+| `pump-objective.test.ts` | 6 | Honest pump up — deterministic positive outcome through the replay label |
+| `stophunt-objective.test.ts` | 11 | Stop hunting: deterministic stop on a wick against the position, cascade squeeze + policy reaction, inversion (strategy 1028592) |
+| `stophunt-vs-falsepositive.test.ts` | 11 | Inversion saves on a real cascade but hurts on a false one; live decision is identical on the past, correctness lives in the future |
+| `matrix-signal-objective.test.ts` | 5 | Matrix signals — objective outcomes by price shape |
+| `matrix-signal-timing.test.ts` | 7 | Matrix signals under extreme time distance between events |
+| `matrix-signal-long-short.test.ts` | 12 | Long & short matrix signals across price/trend/time spread; long↔short symmetry on the same shape |
+| `honest-pnl.test.ts` | 13 | Regression: hard-stop realizes an honest loss (not a fictitious peak), inversion keeps the real exit reason, percentile NaN/Inf-robust, facade veto depends on volRegime |
+| `pnl-stats.test.ts` | 10 | `pnlStats` outlier robustness (one trade doesn't define the edge) + integration into the model |
+| `risk-reward.test.ts` | 11 | `percentile`, `riskRewardStats` (pnl/hardStop), runtime RR-filter readonly pattern |
+| `invert.test.ts` | 9 | `replayExit` invert (stop hunt → reversal), inversion transparent to prod via signals/plan, allow-policy turning inversion off without retraining |
+| `invert-edge.test.ts` | 10 | Invert edges: squeezePressure threshold, losing inverse position, no forward candles (live), ambiguous cascade via `planForAt`, detection window decoupled from holding horizon |
+| `squeeze-ignore.test.ts` | 8 | `squeezePolicy=ignore`: replay enters despite the cascade (takes the bad pnl), facade keeps the signal (unlike veto/invert), conservatism-axis placement |
+| `plan.test.ts` | 5 | `planFor` candles-in/plan-out, `plan` batch + candle dictionary, `signals` still works with no candles |
+| `plan-getcandles.test.ts` | 4 | `plan(getCandles)` overload: candles fetched via getCandles, no dictionary |
+| `live-vs-backtest.test.ts` | 11 | `squeezePressureBefore` (cascade from candles before entry), live vs backtest cascade window, `lookbackMinutes`, `minClusters`/`minSharedEvents` from config |
+| `no-lookahead.test.ts` | 6 | `entryStartTs` excludes the forming signal candle; fit and live both request candles strictly without look-ahead |
+| `lookahead-adversarial.test.ts` | 7 | Future cascade with calm past (guessable only by peeking); swapping the future doesn't change the live decision; live never requests a candle with `ts ≥ entryStart` |
+| `lookahead-intervals.test.ts` | 16 | Look-ahead guard across intervals (3/5/15m + sub-minute): intra-minute signals never enter the still-forming candle |
+| `stationarity.test.ts` | 5 | Stationarity window vs regime drift: `windowEvents` Infinity vs slice, a false A↔C link persists without a window but disappears with a 4-week one, real links preserved early |
+| `dump.test.ts` | 8 | `dump()` signal-history export (including non-entered no-entry/veto records) |
+| `contract.test.ts` | 10 | Single `TradeSignal` contract, allow-policy, `intersectPolicy` readonly invariant, backward compatibility |
+| `boundary.test.ts` | 43 | Boundary conditions across every module: degenerate replay paths, tensor fallback on holes, selfTuneLag clamps, objective numeric edges, volume thresholds, reliability exactly at thresholds, windowEvents strict bounds, chunked pagination, facade degenerate inputs |
+| `coverage-gaps.test.ts` | 17 | `resolveExitNoRegime` fallback, `volumeFeatures` combined helper, facade getters/methods, `planFor` live path, facade tighten path, `??` default branches, RR-filter branches |
+| `progress.test.ts` | 5 | Training progress: both phases with monotonic `done`, score phase reaches 100%, default stdout writer, `silentProgress` no-op, `stdoutProgress` ignores `total ≤ 0` |
+| `attack-round3.test.ts` | 11 | Regression: significance not maximized on zero variance, `intersectPolicy` minRiskReward only tightens |
+
+```bash
+npm test
+```
+
+---
+
 ## License
 
 MIT

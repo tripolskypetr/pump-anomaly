@@ -655,6 +655,64 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ---
 
+## Integration with backtest-kit
+
+`PumpMatrix` needs one thing from your data layer: a `getCandles` that serves 1m candles by range. [`backtest-kit`](https://www.npmjs.com/package/backtest-kit) already provides exactly that contract via `Exchange.getRawCandles(symbol, interval, { exchangeName }, limit, sDate, eDate)` — the argument order matches `GetCandles` one-to-one, so the adapter is a thin pass-through. Register an exchange schema once, then wire the three phases (train → live → backtest).
+
+```ts
+import { addExchangeSchema, Exchange, roundTicks } from "backtest-kit";
+import { singleshot } from "functools-kit";
+import * as pump from "pump-anomaly";
+import ccxt from "ccxt";
+
+import signals from "./assets/parser-items.json" with { type: "json" };
+import weights from "./assets/model-weights.json" with { type: "json" };
+
+const getExchange = singleshot(async () => {
+  const exchange = new ccxt.binance({ enableRateLimit: true, options: { defaultType: "spot" } });
+  await exchange.loadMarkets();
+  return exchange;
+});
+
+// Register the exchange once. getCandles here is backtest-kit's OHLCV fetch;
+// formatPrice/formatQuantity/getOrderBook/getAggregatedTrades omitted for brevity.
+addExchangeSchema({
+  exchangeName: "ccxt-exchange",
+  getCandles: async (symbol, interval, since, limit) => {
+    const exchange = await getExchange();
+    const rows = await exchange.fetchOHLCV(symbol, interval, since.getTime(), limit);
+    return rows.map(([timestamp, open, high, low, close, volume]) => ({ timestamp, open, high, low, close, volume }));
+  },
+  // ...formatPrice, formatQuantity, getOrderBook, getAggregatedTrades
+});
+
+// Adapter: backtest-kit's getRawCandles → pump-anomaly's GetCandles (same arg order).
+const getCandles = (symbol, interval, limit, sDate, eDate) =>
+  Exchange.getRawCandles(symbol, interval, { exchangeName: "ccxt-exchange" }, limit, sDate, eDate);
+
+// 1) TRAIN once on history → serialize weights (slow: labels replay 1m candles).
+async function trainWeights() {
+  const model = await pump.PumpMatrix.fit(signals, getCandles);
+  return model.save(); // → write to assets/model-weights.json
+}
+
+// 2) LIVE — load weights (no retraining), get ready-to-execute signals.
+async function planLive() {
+  const model = pump.PumpMatrix.load(weights);
+  return model.plan(signals, getCandles); // TradeSignal[] — direction/entry/exit ready
+}
+
+// 3) BACKTEST — same weights, replay forward, realized pnl in result.
+async function runBacktest() {
+  const model = pump.PumpMatrix.load(weights);
+  return model.backtest(signals, getCandles); // BacktestSignal[] — each has result.pnl
+}
+```
+
+`parser-items.json` is your channel history (`ParserItem[]`), `model-weights.json` is `model.save()` output. The same `getCandles` adapter serves all three phases — `fit` pulls 1m candles forward from each signal to label it, `plan` pulls them strictly before the signal (live, no look-ahead), `backtest` after (forward replay). Other anomaly libraries plug into the same `Exchange` schema independently: [`volume-anomaly`](https://www.npmjs.com/package/volume-anomaly) consumes `Exchange.getAggregatedTrades` for entry timing, [`garch`](https://www.npmjs.com/package/garch) consumes `Exchange.getCandles` for TP/SL sizing — pump-anomaly answers *which post to trade and how to exit it*, and they compose without touching each other.
+
+---
+
 ## Tests
 
 **531 tests** across **52 test files**. All passing.

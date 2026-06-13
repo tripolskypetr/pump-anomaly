@@ -27,3 +27,16 @@ const DOGE_GRID = {
         60 * 24 * 3600_000   // ~2 месяца
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: DOGE_GRID,
+    folds: 4,
+    shrinkageK: 6,
+    mode: "auto",
+    maxBurstWindowMs: 6 * 60 * 60 * 1000,   // до 6 часов на всплеск
+    viability: {
+        minSharedEvents: 4,
+        minPeakShare: 0.57,
+        minStrongEdges: 1
+    }
+});

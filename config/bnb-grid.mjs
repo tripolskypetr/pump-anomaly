@@ -27,3 +27,16 @@ const BNB_GRID = {
         90 * 24 * 3600_000    // 3 месяца
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: BNB_GRID,
+    folds: 4,
+    shrinkageK: 6,
+    mode: "auto",
+    maxBurstWindowMs: 8 * 60 * 60 * 1000,   // до 8 часов на всплеск
+    viability: {
+        minSharedEvents: 4,
+        minPeakShare: 0.58,
+        minStrongEdges: 1
+    }
+});

@@ -27,3 +27,15 @@ const FARTCOIN_GRID = {
         21 * 24 * 3600_000   // 3 недели
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: FARTCOIN_GRID,
+    folds: 5,                          // больше фолдов из-за волатильности
+    shrinkageK: 8,                     // сильная усадка (много выбросов)
+    mode: "auto",
+    maxBurstWindowMs: 90 * 60 * 1000,  // максимум 1.5 часа на всплеск
+    viability: {
+        minSharedEvents: 3,
+        minPeakShare: 0.50,            // чуть мягче
+    }
+});

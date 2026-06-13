@@ -27,3 +27,16 @@ const STELLAR_GRID = {
         120 * 24 * 3600_000   // 4 месяца
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: STELLAR_GRID,
+    folds: 4,
+    shrinkageK: 5,
+    mode: "auto",
+    maxBurstWindowMs: 18 * 60 * 60 * 1000,   // до 18 часов на всплеск
+    viability: {
+        minSharedEvents: 4,
+        minPeakShare: 0.62,
+        minStrongEdges: 2
+    }
+});

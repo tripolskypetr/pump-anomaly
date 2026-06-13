@@ -27,3 +27,16 @@ const TRX_GRID = {
         45 * 24 * 3600_000   // ~1.5 месяца
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: TRX_GRID,
+    folds: 4,
+    shrinkageK: 6,
+    mode: "auto",
+    maxBurstWindowMs: 5 * 60 * 60 * 1000,   // до 5 часов на всплеск
+    viability: {
+        minSharedEvents: 3,
+        minPeakShare: 0.56,
+        minStrongEdges: 1
+    }
+});

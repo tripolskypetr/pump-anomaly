@@ -27,3 +27,16 @@ const RIPPLE_GRID = {
         90 * 24 * 3600_000    // 3 месяца
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: RIPPLE_GRID,
+    folds: 4,
+    shrinkageK: 5,
+    mode: "auto",
+    maxBurstWindowMs: 12 * 60 * 60 * 1000,   // до 12 часов на всплеск
+    viability: {
+        minSharedEvents: 4,
+        minPeakShare: 0.60,
+        minStrongEdges: 2
+    }
+});

@@ -27,3 +27,16 @@ const HYPE_GRID = {
         21 * 24 * 3600_000   // 3 недели
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: HYPE_GRID,
+    folds: 5,                    // чуть больше фолдов для надёжности
+    shrinkageK: 7,               // сильнее усадка (HYPE имеет жирные выбросы)
+    mode: "auto",
+    viability: {
+        minSharedEvents: 3,      // чуть мягче
+        minPeakShare: 0.52
+    },
+    maxBurstWindowMs: 45 * 60 * 1000,   // максимум 45 минут на всплеск
+});
+

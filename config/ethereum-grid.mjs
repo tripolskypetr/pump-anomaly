@@ -27,3 +27,16 @@ const HYPE_GRID = {
         21 * 24 * 3600_000   // 3 недели
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: ETHEREUM_GRID,
+    folds: 4,
+    shrinkageK: 5,
+    mode: "auto",
+    viability: {
+        minSharedEvents: 4,      // строже
+        minPeakShare: 0.58,
+        minStrongEdges: 2
+    },
+    maxBurstWindowMs: 4 * 60 * 60 * 1000,   // до 4 часов на всплеск
+});

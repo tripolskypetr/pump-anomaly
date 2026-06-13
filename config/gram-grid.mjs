@@ -27,3 +27,16 @@ const TON_GRID = {
         42 * 24 * 3600_000   // 6 недель
     ],
 };
+
+const model = await PumpMatrix.fit(history, getCandles, {
+    grid: TON_GRID,
+    folds: 4,
+    shrinkageK: 6,
+    mode: "auto",
+    maxBurstWindowMs: 3 * 60 * 60 * 1000,     // до 3 часов на один всплеск
+    viability: {
+        minSharedEvents: 3,
+        minPeakShare: 0.55,
+        minStrongEdges: 1
+    }
+});

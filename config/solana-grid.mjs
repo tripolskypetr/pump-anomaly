@@ -27,3 +27,15 @@ const RECOMMENDED_GRID = {
         28 * 24 * 3600_000   // 4 недели
     ],
 };
+
+await PumpMatrix.fit(history, getCandles, {
+    grid: RECOMMENDED_GRID,
+    folds: 4,
+    shrinkageK: 6,           // чуть сильнее усадки
+    mode: "auto",
+    viability: {             // чуть строже к качеству матрицы
+        minSharedEvents: 4,
+        minPeakShare: 0.55
+    }
+});
+

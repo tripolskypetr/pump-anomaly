@@ -164,3 +164,4 @@ export { DEFAULT_SELECTION, CASCADE_AGGRESSION, cascadeAggressionOf, conservatis
 export type { SelectionConfig } from "./selection";
 export { stdoutProgress, silentProgress } from "./progress";
 export type { ProgressFn, ProgressEvent } from "./progress";
+export * from "./statistics";

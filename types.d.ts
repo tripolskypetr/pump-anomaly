@@ -735,6 +735,130 @@ declare const DEFAULT_POLICY: SignalPolicy;
 declare function intersectPolicy(trained: SignalPolicy, requested?: Partial<SignalPolicy>): SignalPolicy;
 
 /**
+ * Математический аппарат для отличия РЕАЛЬНОГО эджа от ВЫБРОСА/оверфита.
+ *
+ * Брутфорс-grid (argmax по CV из N конфигов) систематически выдаёт ложный эдж:
+ * максимум N шумных оценок смещён вверх на ≈ σ·√(2·ln N) даже при истинном эдже 0.
+ * Эти функции дают СТАТИСТИЧЕСКИЙ СЕРТИФИКАТ, а не «score повыше».
+ *
+ * Ссылки: López de Prado (Deflated Sharpe 2014, PBO 2015, minTRL),
+ * White (Reality Check 2000), Hansen (SPA 2005), Politis-Romano (stationary
+ * bootstrap 1994), Breiman (1-SE 1984).
+ *
+ * Все функции — чистые над массивами ретёрнов сделок. Без внешних зависимостей.
+ */
+declare function mean(a: number[]): number;
+declare function variance(a: number[]): number;
+declare function stdev(a: number[]): number;
+/** Выборочный коэффициент асимметрии (Fisher-Pearson). */
+declare function skewness(a: number[]): number;
+/** Выборочный куртозис (НЕ excess: нормаль = 3). */
+declare function kurtosis(a: number[]): number;
+/** Sharpe ratio по ряду ретёрнов (без аннуализации; per-trade). */
+declare function sharpe(returns: number[]): number;
+/** CDF стандартной нормали через erf-приближение Abramowitz-Stegun 7.1.26. */
+declare function normalCdf(z: number): number;
+/** Обратная нормаль (quantile) — Acklam 2003. Точность ~1e-9 в [1e-15, 1-1e-15]. */
+declare function normalInv(p: number): number;
+/**
+ * Ожидаемый МАКСИМАЛЬНЫЙ Sharpe при истинном эдже 0, если перебрано N независимых
+ * конфигураций с дисперсией SR-оценок varSR. Это «планка случайности»: насколько
+ * высокий Sharpe выскочит из чистого шума просто потому, что мы выбрали лучший из N.
+ *
+ * E[max] ≈ √varSR · [(1−γ)·Z(1−1/N) + γ·Z(1−1/(N·e))]   (López de Prado 2014)
+ */
+declare function expectedMaxSharpe(varSR: number, nTrials: number): number;
+/**
+ * Deflated Sharpe Ratio: вероятность, что ИСТИННЫЙ Sharpe > порога случайности,
+ * с поправкой на (а) число испытаний N, (б) асимметрию/куртозис ряда, (в) длину T.
+ *
+ * DSR = Φ( (SR − SR0)·√(T−1) / √(1 − skew·SR + (kurt−1)/4·SR²) )
+ *
+ * SR — наблюдаемый Sharpe лучшей стратегии; SR0 — expectedMaxSharpe(varSR, N).
+ * Возвращает p ∈ [0,1]. p ≥ 0.95 → эдж РЕАЛЕН с учётом перебора. На малой выборке
+ * или огромном N → p ≈ 0 (честный отказ вместо ложного «reliable»).
+ */
+declare function deflatedSharpe(returns: number[], nTrials: number, varSRAcrossTrials: number): number;
+/**
+ * Минимальная длина ряда (число сделок), при которой наблюдаемый Sharpe значим на
+ * уровне α (по умолчанию 0.05). Если фактическое N < minTRL — выборки физически НЕ
+ * хватает, любой вывод преждевременен. Это «сколько сделок до доверия».
+ *
+ * minTRL = 1 + [1 − skew·SR + (kurt−1)/4·SR²]·(Z_α / SR)²   (López de Prado)
+ */
+declare function minTrackRecordLength(returns: number[], alpha?: number): number;
+/**
+ * Probability of Backtest Overfitting через Combinatorially-Symmetric CV (CSCV).
+ *
+ * Матрица M[config][fold] (perf каждого конфига на каждом фолде). Делим S фолдов
+ * на все C(S, S/2) комбинаций IS/OOS. На каждой: выбираем лучший конфиг по IS,
+ * смотрим его РАНГ на OOS. Если IS-лучший систематически плох на OOS — это оверфит.
+ *
+ * PBO = доля разбиений, где IS-лучший попал в нижнюю половину OOS (logit < 0).
+ * PBO → 0.5 = чистый оверфит; PBO → 0 = эдж переносится OOS.
+ *
+ * @param perf perf[c][f] — метрика конфига c на фолде f (больше = лучше)
+ */
+declare function probabilityOfBacktestOverfitting(perf: number[][]): number;
+/**
+ * Stationary bootstrap (Politis-Romano 1994): ресэмпл ряда блоками случайной
+ * геометрической длины (средняя 1/p), сохраняя автокорреляцию. Для зависимых рядов
+ * сделок обычный i.i.d. бутстрэп даёт оптимистичный результат — блочность чинит это.
+ */
+declare function stationaryBootstrapResample(returns: number[], pBlock: number, rng: () => number): number[];
+/** Детерминированный ГПСЧ (mulberry32) — воспроизводимые бутстрэп-прогоны в тестах. */
+declare function mulberry32(seed: number): () => number;
+/**
+ * White's Reality Check / Hansen SPA через stationary bootstrap.
+ * H0: лучшая из N стратегий НЕ лучше бенчмарка 0 (весь эдж — data-snooping).
+ *
+ * Статистика V = max_k √T · mean(returns_k). Бутстрэпим центрированные ряды,
+ * считаем распределение макс-статистики при H0, p-value = доля бутстрэп-V,
+ * превысивших наблюдаемый V. p ≤ 0.05 → отвергаем H0 (эдж не объясним перебором).
+ *
+ * @param strategiesReturns массив рядов (по одному на конфиг-кандидат)
+ */
+declare function realityCheckPValue(strategiesReturns: number[][], opts?: {
+    bootstraps?: number;
+    pBlock?: number;
+    seed?: number;
+}): number;
+/**
+ * Итоговый сертификат: пять барьеров López de Prado / White / Hansen.
+ * certified=true ТОЛЬКО если эдж переживает поправку на N испытаний, не оверфит
+ * по CSCV, не объясним data-snooping, и выборки достаточно.
+ */
+interface CertificationInput {
+    /** ретёрны ВЫБРАННОЙ стратегии (по сделкам) */
+    selectedReturns: number[];
+    /** число перебранных конфигураций (N испытаний) */
+    nTrials: number;
+    /** дисперсия Sharpe-оценок ПО испытаниям (для DSR planка) */
+    varSRAcrossTrials: number;
+    /** perf[config][fold] для PBO (CSCV) */
+    perfMatrix: number[][];
+    /** ретёрны всех конфигов-кандидатов для SPA */
+    candidateReturns: number[][];
+    /** несмещённый nested-CV OOS score (null если не считался) */
+    nestedScore: number | null;
+}
+interface Certification {
+    certified: boolean;
+    dsr: number;
+    pbo: number;
+    spaPValue: number;
+    minTRL: number;
+    actualN: number;
+    nestedScore: number | null;
+    reasons: string[];
+}
+declare function certifyStrategy(inp: CertificationInput, thresholds?: {
+    dsr?: number;
+    pbo?: number;
+    spa?: number;
+}): Certification;
+
+/**
  * Параметры выбора конфигурации и валидации. Вынесены в одно место, чтобы в логике
  * train не было магических литералов — каждое число здесь именовано и объяснено.
  */
@@ -912,6 +1036,8 @@ interface TrainedParams {
         stability: number;
         significance: number;
         totalSamples: number;
+        /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
+        certification?: Certification;
     };
 }
 interface TrainResult {
@@ -982,6 +1108,12 @@ declare class PumpMatrix {
     get reliable(): boolean;
     /** Доверие к модели 0..1. */
     get confidence(): number;
+    /**
+     * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
+     * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
+     * не доказан — тогда модель торговать НЕ должна. undefined у моделей до этой версии.
+     */
+    get certification(): Certification | undefined;
     /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */
     get impactHorizonMinutes(): number;
     /**
@@ -1109,5 +1241,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, clusterAuthors, computeReliability, conservatismKey, earlyWarning, entryStartTs, enumerateBursts, enumeratePosts, exitKey, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, labelBurst, lagXCorr, loadPredict, oneStandardErrorSelect, percentile, pnlStats, predict, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, shrinkageExpectancy, silentProgress, singleChannelSignals, squeezePressure, standardError, stdoutProgress, train, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, CandleInterval, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
+export type { AuthorMap, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

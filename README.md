@@ -243,6 +243,57 @@ On a small sample, `reliable: false` — the library still works, but honestly w
 
 ---
 
+## Statistical certificate — edge vs. brute-force artifact
+
+`reliable` answers "did training have enough stable, significant data?". It does **not** answer the harder question: a grid search is `argmax` over thousands of CV scores, and **the max of N noisy estimates is biased upward by ≈ σ·√(2·ln N) even when the true edge is zero.** The 1-SE rule (winner selection) softens this, but it does not *prove* the surviving edge is real. The certificate does — it is an independent **judge applied to the already-selected configuration**, never an input to selection (using it to pick configs would make it overfittable, defeating the point).
+
+Five barriers from the literature (López de Prado, White, Hansen, Politis-Romano). `certified: true` only if the edge survives **all** of them:
+
+| barrier | function | catches | threshold |
+|---|---|---|---|
+| **DSR** (Deflated Sharpe) | `deflatedSharpe` | edge doesn't survive the correction for N trials + skew/kurtosis/length | ≥ 0.95 |
+| **PBO** (CSCV overfit) | `probabilityOfBacktestOverfitting` | the IS-best config is systematically poor OOS | ≤ 0.10 |
+| **SPA / Reality Check** | `realityCheckPValue` | the whole edge is explainable by data-snooping (stationary bootstrap) | p ≤ 0.05 |
+| **minTRL** | `minTrackRecordLength` | the sample is physically too small for significance | N ≥ minTRL |
+| **nested OOS** | (from `train`) | the unbiased out-of-sample forecast isn't positive | > 0 |
+
+```ts
+model.certification;
+// {
+//   certified: boolean;        // false → the model should NOT trade
+//   dsr: number;               // ≥ 0.95
+//   pbo: number;               // ≤ 0.10
+//   spaPValue: number;         // ≤ 0.05
+//   minTRL: number; actualN: number;   // actualN ≥ minTRL
+//   nestedScore: number | null;        // > 0
+//   reasons: string[];         // WHY it was not certified (empty when certified)
+// }
+```
+
+`certified: false` is the **honest refusal**: training still ran and `argmax` still picked a winner, but the certificate says the winner is a brute-force artifact, not a real edge. The e2e test `fit-noise-rejection` proves it — a full `fit` on a pure random walk *does* learn a "best" config, yet `certified: false`. This is the layer `reliable` cannot provide, because `reliable` never sees the winner's curse of the search itself.
+
+All functions are pure over arrays of per-trade returns, no external dependencies, and exported from the package: `sharpe`, `deflatedSharpe`, `expectedMaxSharpe`, `minTrackRecordLength`, `probabilityOfBacktestOverfitting`, `realityCheckPValue`, `stationaryBootstrapResample`, `mulberry32`, plus moment stats (`mean`/`variance` via Welford/`skewness`/`kurtosis`) and `normalCdf`/`normalInv`. `certifyStrategy(input, thresholds?)` composes them; thresholds (`dsr`/`pbo`/`spa`) are overridable.
+
+---
+
+## Toward a self-learning loop
+
+The engine is a **stateless learner + judge**, not a running system — which is exactly what makes it safe to wrap in an automation loop (e.g. a scheduled agent + MCP data/broker adapters). The pieces line up:
+
+- **`fit` → `save()` → `load()`** — training is separated from inference; the model is a JSON blob.
+- **`signals`/`plan`/`backtest`** — pure, no hidden state; `plan` is look-ahead-free by construction.
+- **`dump()`** — full signal history (including non-entered) for the loop's own analytics.
+- **`certification`** — the automatable gate: re-fit on a rolling window, and **only promote to live when `certified: true`**; otherwise hold and surface `reasons[]`.
+
+A loop then closes itself: a scheduler ticks → fresh `ParserItem[]` + `getCandles` arrive (e.g. via MCP) → `fit` retrains on the recent window → `certification` decides whether the model may trade → if so, `plan()` emits ready signals → execution → `dump()` feeds the next tick. The system **retrains itself and refuses to trade when the edge has decayed** (a previously-certified model going `certified: false` is a regime-shift alarm).
+
+Two invariants keep this honest rather than dangerous:
+
+1. **The certificate stays out of the optimization loop.** An orchestrator (or LLM operator) may decide *whether* to retrain or escalate, but must never tune the grid/thresholds to *pass* the certificate — that would turn the independent judge back into an overfitter.
+2. **Re-fitting multiplies trials at the meta level.** DSR penalizes N *within* one `fit`, but not the fact that you run `fit` hundreds of times and trade only when one comes back certified. Retrain on a slow cadence (days/weeks, not minutes) and log *every* tick, not only the certified ones.
+
+---
+
 ## Exit tensor `[mode][channel][symbol][direction][volRegime]`
 
 The model does NOT duplicate the stoploss/targets from the post, and does NOT mix exit math across sources. trailing/hardStop/impact-horizon are trained **separately per cell** of the tensor — every channel moves every symbol differently, a long-trap and a short-trap have different dynamics, and anomalous volume requires a tighter trailing.
@@ -373,6 +424,7 @@ model.signals(items, { allow: ["enter"] });  // direct entries only
 ```ts
 model.reliable;              // did training have enough data
 model.confidence;            // 0..1 trust in the model
+model.certification;         // five-barrier edge certificate (DSR/PBO/SPA/minTRL/nested)
 model.impactHorizonMinutes;  // empirical post impact horizon (global level)
 model.mode;                  // "matrix" | "single" — how the model was trained
 model.modeReason;            // honest diagnostics: WHY this mode was chosen
@@ -501,7 +553,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ## Tests
 
-**442 tests** across **42 test files**. All passing.
+**496 tests** across **47 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|
@@ -547,6 +599,11 @@ All five are computed over the stationarity window. In single mode the matrix is
 | `coverage-gaps.test.ts` | 17 | `resolveExitNoRegime` fallback, `volumeFeatures` combined helper, facade getters/methods, `planFor` live path, facade tighten path, `??` default branches, RR-filter branches |
 | `progress.test.ts` | 5 | Training progress: both phases with monotonic `done`, score phase reaches 100%, default stdout writer, `silentProgress` no-op, `stdoutProgress` ignores `total ≤ 0` |
 | `attack-round3.test.ts` | 11 | Regression: significance not maximized on zero variance, `intersectPolicy` minRiskReward only tightens |
+| `statistics-attack.test.ts` | 31 | Adversarial stats: `normalCdf`/`normalInv` vs tables, float-dust on a constant series → Sharpe 0 (not astronomical), `minTRL`=∞ for a losing strategy, PBO NaN on odd folds / empty matrix (no false 0.5), Welford catastrophic-cancellation, NaN/Inf fail-closed across DSR/skew/kurt, out-of-bounds `entryIdx` doesn't crash volume |
+| `statistics-robustness.test.ts` | 5 | Not seed-tuned: real +0.4σ edge certifies on ≥22/30 independent seeds, pure noise 0/30 false positives, monotone edge→certification rate, brute-force N=280k penalized stricter than N=50, `minTRL` grows as edge weakens |
+| `e2e/certification.test.ts` | 14 | 500-signal scenarios with known truth: DSR certifies a real edge, rejects noise / single-outlier edge / regime-shift; `minTRL`, PBO, SPA, full `certifyStrategy` five-barrier gate |
+| `e2e/fit-certification.test.ts` | 3 | `fit` attaches the certificate: small sample (17 trades) → `certified:false` with reasons, survives `save`/`load`, present on the model facade |
+| `e2e/fit-noise-rejection.test.ts` | 1 | Full `fit` on a pure random walk → `certified:false` even though grid argmax picks a "best" config (the certificate catches the brute-force artifact `reliable` alone would miss) |
 
 ```bash
 npm test

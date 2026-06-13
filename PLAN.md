@@ -15,7 +15,7 @@
 ```bash
 npm i
 npm run build   # tsc -p tsconfig.json
-npm test        # vitest run — 442 теста
+npm test        # vitest run — 496 тестов
 ```
 
 Стек: TypeScript + vitest, без CLI и монорепо. Единственная публичная точка входа высокого уровня — класс `PumpMatrix`.

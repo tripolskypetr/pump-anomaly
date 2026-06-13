@@ -105,6 +105,15 @@ export class PumpMatrix {
     return this.params.meta.confidence;
   }
 
+  /**
+   * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
+   * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
+   * не доказан — тогда модель торговать НЕ должна. undefined у моделей до этой версии.
+   */
+  get certification() {
+    return this.params.meta.certification;
+  }
+
   /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */
   get impactHorizonMinutes(): number {
     return this.params.meta.impactHorizonMinutes;

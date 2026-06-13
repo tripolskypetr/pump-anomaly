@@ -36,12 +36,15 @@ export function volumeZScore(
   const lo = Math.max(0, entryIdx - baselineWindow);
   const base = candles.slice(lo, entryIdx);
   if (base.length < 2) return 0;
+  // битый/короткий массив: entryIdx может быть >= длины → candles[entryIdx] undefined.
+  const entry = candles[entryIdx];
+  if (!entry) return 0;
   const vols = base.map((c) => c.volume);
   const mean = vols.reduce((s, v) => s + v, 0) / vols.length;
   const variance = vols.reduce((s, v) => s + (v - mean) ** 2, 0) / (vols.length - 1);
   const std = Math.sqrt(variance);
   if (std === 0) return 0;
-  return (candles[entryIdx].volume - mean) / std;
+  return (entry.volume - mean) / std;
 }
 
 /**
@@ -89,9 +92,12 @@ export function squeezePressureBefore(
   horizon: number,
 ): number {
   const start = Math.max(0, entryIdx - horizon);
+  // КЛАМП верхней границы: при битом/коротком массиве свечей (флэки-адаптер биржи)
+  // entryIdx может оказаться > длины — без клампа цикл прочитает undefined и упадёт.
+  const end = Math.min(entryIdx, candles.length);
   let againstVol = 0;
   let totalVol = 0;
-  for (let i = start; i < entryIdx; i++) {
+  for (let i = start; i < end; i++) {
     const c = candles[i];
     const delta = c.close - c.open;
     const against = dir === "long" ? delta < 0 : delta > 0;

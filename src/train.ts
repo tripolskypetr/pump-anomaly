@@ -19,6 +19,7 @@ import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
 import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, pnlStats, PnlStats } from "./objective";
+import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
 import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
@@ -198,6 +199,8 @@ export interface TrainedParams {
     stability: number;
     significance: number;
     totalSamples: number;
+    /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
+    certification?: Certification;
   };
 }
 
@@ -540,6 +543,35 @@ export async function train(
     { ...DEFAULT_RELIABILITY, ...opts.reliability },
   );
 
+  // ── СЕРТИФИКАТ: математически доказуемый эдж, а не argmax по шуму ──
+  // DSR (поправка на N испытаний) + PBO (CSCV-оверфит) + SPA (data-snooping) +
+  // minTRL (достаточность выборки) + nested OOS. certified=true только если эдж
+  // переживает ВСЕ барьеры. Это и отличает реальный эдж от выброса.
+  const candPool = board
+    .filter((e) => e._returns.length > 0)
+    .slice(0, 50)
+    .map((e) => e._returns);
+  // perf-матрица для PBO: топ-конфиги × их fold-scores (нужно чётное число фолдов)
+  const perfRows = board
+    .filter((e) => e._foldScores.length >= 2)
+    .slice(0, 30)
+    .map((e) => e._foldScores.slice(0, e._foldScores.length - (e._foldScores.length % 2)));
+  const evenFolds = perfRows.length && perfRows.every((r) => r.length === perfRows[0].length && r.length >= 2);
+  // дисперсия Sharpe ПО испытаниям (планка случайности для DSR)
+  const trialSharpes = board
+    .filter((e) => e._returns.length >= 2)
+    .map((e) => sharpe(e._returns));
+  const varSR = variance(trialSharpes);
+
+  const certification = certifyStrategy({
+    selectedReturns: top._returns,
+    nTrials: Math.max(board.length, 1),
+    varSRAcrossTrials: varSR,
+    perfMatrix: evenFolds ? perfRows : [],
+    candidateReturns: candPool.length ? candPool : [top._returns],
+    nestedScore,
+  });
+
   // ── exit tensor: лучший exit на каждую ячейку [channel][symbol][direction][volRegime] ──
   // detector-конфиг выбран глобально; exit считаем per-cell, НЕ смешивая математику
   // источников. Каскад ликвидаций симметричен: long-trap и short-trap — РАЗНЫЕ ячейки.
@@ -699,6 +731,7 @@ export async function train(
       confidence: reliability.confidence, reliable: reliability.reliable,
       support: reliability.support, stability: reliability.stability,
       significance: reliability.significance, totalSamples: reliability.totalN,
+      certification,
     },
   };
 

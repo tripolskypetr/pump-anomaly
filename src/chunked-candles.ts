@@ -43,8 +43,15 @@ export async function fetchCandlesChunked(
     if (!chunk || chunk.length === 0) break; // край истории / дыра — отдаём собранное
     for (const c of chunk) all.push(c); // НЕ спред: при большом limit чанк переполнит стек
 
-    remaining -= chunkLimit;
-    if (remaining > 0) currentSince = currentSince + chunkLimit * step;
+    // ЧАСТИЧНЫЙ чанк (биржа недодала: вернула < chunkLimit, но не пусто) — двигаем
+    // since от ФАКТИЧЕСКИ последней свечи (+step), а remaining уменьшаем на реально
+    // полученное (chunk.length). Иначе since прыгает на полный chunkLimit·step, минуя
+    // недополученный хвост → дыра в склеенном ряду + недосчёт. Свечи могут прийти
+    // неотсортированными — берём max(ts), а не последний элемент.
+    let maxTs = currentSince;
+    for (const c of chunk) if (c.timestamp > maxTs) maxTs = c.timestamp;
+    remaining -= chunk.length;
+    currentSince = maxTs + step;
   }
 
   // дедуп по timestamp (на стыках чанков адаптер может вернуть пограничную свечу

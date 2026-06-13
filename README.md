@@ -715,7 +715,7 @@ async function runBacktest() {
 
 ## Tests
 
-**531 tests** across **52 test files**. All passing.
+**538 tests** across **52 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|

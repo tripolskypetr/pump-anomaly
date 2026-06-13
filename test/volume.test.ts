@@ -123,6 +123,29 @@ describe("replayExit — каскад veto/tighten СИММЕТРИЧНО", () =
   });
 });
 
+describe("squeezePressure — устойчивость к битому entryIdx (симметрично Before)", () => {
+  const cs = candles([
+    [100, 101, 99, 100.5, 1000],
+    [100.5, 102, 100, 101, 1000],
+  ]);
+  it("отрицательный entryIdx → 0, НЕ краш (start клампится к 0)", () => {
+    // РЕГРЕССИЯ: раньше старт = entryIdx+1 < 0 читал candles[-1] = undefined → краш на c.close
+    expect(squeezePressure(cs, -5, "long", 5)).toBe(0);
+    expect(squeezePressure(cs, -1, "short", 5)).toBeGreaterThanOrEqual(0); // -1 → start=0, валидно
+  });
+  it("entryIdx >> length → 0, не краш (end клампится)", () => {
+    expect(squeezePressure(cs, 99, "long", 5)).toBe(0);
+  });
+  it("отрицательный entryIdx с реальными свечами впереди считает от начала, не падает", () => {
+    const rows: Array<[number, number, number, number, number]> = [
+      [100, 100.1, 99.9, 98, 3000],  // против long
+      [98, 98.1, 96, 96, 3000],      // против long
+    ];
+    // entryIdx=-1 → start=0 → считает обе свечи; обе против long → pressure=1
+    expect(squeezePressure(candles(rows), -1, "long", 5)).toBeCloseTo(1.0, 9);
+  });
+});
+
 describe("volRegimeOf", () => {
   it("порог разделяет calm/anomalous", () => {
     expect(volRegimeOf(1.0, 2.0)).toBe("calm");

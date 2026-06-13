@@ -84,6 +84,43 @@ describe("fetchCandlesChunked", () => {
   it("MAX_CANDLES_PER_CHUNK = 500", () => {
     expect(MAX_CANDLES_PER_CHUNK).toBe(500);
   });
+
+  // РЕГРЕССИЯ: частичный чанк (биржа недодала, но не пусто — типичная дыра/лимит в
+  // середине истории). Раньше since прыгал на полный chunkLimit·step, минуя
+  // недополученный хвост → ДЫРА в склеенном ряду + недосчёт. Теперь since двигается
+  // от фактически последней свечи, ряд непрерывен.
+  it("частичный чанк (300 из 500) → ряд непрерывен, без дыры", async () => {
+    let call = 0;
+    const partial: GetCandles = async (_s, _i, limit, sDate) => {
+      call++;
+      const give = call === 2 ? 300 : (limit ?? 0); // 2-й чанк недодаёт 200
+      const out: ICandleData[] = [];
+      for (let i = 0; i < give; i++) out.push({ timestamp: sDate! + i * STEP, open: 100, high: 101, low: 99, close: 100, volume: 1000 });
+      return out;
+    };
+    const res = await fetchCandlesChunked(partial, "X", "1m", 1200, t0, 500);
+    // НЕПРЕРЫВНОСТЬ: ни одного разрыва между соседними свечами
+    for (let i = 1; i < res.length; i++) {
+      expect(res[i].timestamp).toBe(res[i - 1].timestamp + STEP);
+    }
+    // и продолжили докачивать после частичного чанка (а не прыгнули за дыру)
+    expect(call).toBeGreaterThanOrEqual(3);
+  });
+
+  it("частичный чанк: следующий since = последняя свеча + step (не chunkLimit·step)", async () => {
+    let call = 0;
+    const spy = vi.fn<GetCandles>(async (_s, _i, limit, sDate) => {
+      call++;
+      const give = call === 1 ? 200 : (limit ?? 0); // 1-й чанк отдал только 200 из 500
+      const out: ICandleData[] = [];
+      for (let i = 0; i < give; i++) out.push({ timestamp: sDate! + i * STEP, open: 100, high: 101, low: 99, close: 100, volume: 1000 });
+      return out;
+    });
+    await fetchCandlesChunked(spy, "X", "1m", 1000, t0, 500);
+    const sinces = spy.mock.calls.map((c) => c[3]);
+    expect(sinces[0]).toBe(t0);
+    expect(sinces[1]).toBe(t0 + 200 * STEP); // от фактических 200, НЕ от 500
+  });
 });
 
 describe("chunked — дедуп оставляет ПЕРВОЕ вхождение (авторитетное)", () => {

@@ -61,10 +61,14 @@ export function squeezePressure(
   dir: Direction,
   horizon: number,
 ): number {
+  // КЛАМП нижней границы (симметрично squeezePressureBefore): при отрицательном
+  // entryIdx (findIndex вернул -1, битый вызов) старт стал бы < 0 и цикл прочитал
+  // candles[-1] = undefined → краш на c.close. max(0, ...) этого не допускает.
+  const start = Math.max(0, entryIdx + 1);
   const end = Math.min(candles.length, entryIdx + horizon + 1);
   let againstVol = 0;
   let totalVol = 0;
-  for (let i = entryIdx + 1; i < end; i++) {
+  for (let i = start; i < end; i++) {
     const c = candles[i];
     const delta = c.close - c.open; // знак внутрисвечного движения
     // «против позиции»: long не любит падение (delta<0), short не любит рост (delta>0)

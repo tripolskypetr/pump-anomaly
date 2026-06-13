@@ -1,5 +1,5 @@
 import { Direction } from "./types";
-import { GetCandles, alignTs, ICandleData } from "./candle";
+import { GetCandles, entryStartTs, ICandleData } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { ExitParams, replayExit, ReplayResult } from "./replay";
 
@@ -36,7 +36,9 @@ export async function labelBurst(
   entryToPrice?: number,
 ): Promise<LabeledBurst | null> {
   const maxLife = Math.max(...exitSets.map((e) => e.staleMinutes));
-  const since = alignTs(ts, "1m");
+  // старт = первая полностью сформированная свеча ПОСЛЕ сигнала (без look-ahead):
+  // свеча, содержащая сигнал, ещё формируется — её OHLC известны только в конце минуты.
+  const since = entryStartTs(ts, "1m");
   const limit = maxLife * 2 + 5; // запас на поиск входа в зону
 
   // getCandles может бросить (look-ahead guard на хвосте истории, дыры в данных

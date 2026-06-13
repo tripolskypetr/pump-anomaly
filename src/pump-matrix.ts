@@ -1,9 +1,10 @@
 import { ParserItem, PumpVerdict, Direction } from "./types";
-import { GetCandles, ICandleData, alignTs } from "./candle";
+import { GetCandles, ICandleData, entryStartTs, STEP_MS } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
-import { volumeZScore, squeezePressure, volRegimeOf, VolRegime } from "./volume";
+import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, VolRegime } from "./volume";
 import { RiskRewardStats, PnlStats } from "./objective";
+import { DEFAULT_VIABILITY } from "./viability";
 import {
   TradeSignal, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
   intersectPolicy, DEFAULT_POLICY,
@@ -109,6 +110,37 @@ export class PumpMatrix {
     return this.params.meta.impactHorizonMinutes;
   }
 
+  /**
+   * Сколько минут истории СВЕЧЕЙ ДО сигнала нужно live-вызову plan() для каждого
+   * сигнала: max(volBaselineWindow, cascadeWindowMinutes) + запас 5 свечей. Столько
+   * 1m-свечей plan() запрашивает у getCandles (строго в прошлое, без look-ahead).
+   * В проде держи доступной историю минимум на это окно для каждого свежего сигнала.
+   */
+  get lookbackMinutes(): number {
+    const baseWin = this.params.exit.global.volBaselineWindow ?? 20;
+    const casWin = this.params.exit.global.cascadeWindowMinutes ?? 30;
+    return Math.max(baseWin, casWin) + 5;
+  }
+
+  /**
+   * Минимальное число НЕЗАВИСИМЫХ кластеров авторства, которые должны сойтись на
+   * тикере, чтобы matrix-всплеск считался сигналом. Из config (по умолчанию 2).
+   * В single-режиме не применяется (там всегда 1 кластер).
+   */
+  get minClusters(): number {
+    return this.params.config.minClusters;
+  }
+
+  /**
+   * Минимальное число ОБЩИХ событий между каналами, при котором author-матрица
+   * считается жизнеспособной (не шумовое совпадение) — порог перекрытия для
+   * auto-режима. Из config.viability (по умолчанию DEFAULT_VIABILITY.minSharedEvents).
+   * Грубо: сколько раз кластеры должны совпасть, чтобы их связь была не случайной.
+   */
+  get minSharedEvents(): number {
+    return this.params.config.viability?.minSharedEvents ?? DEFAULT_VIABILITY.minSharedEvents;
+  }
+
   /** Режим, которым обучена модель: matrix (корреляция) | single (fallback). */
   get mode(): "matrix" | "single" {
     return this.params.meta.mode;
@@ -147,18 +179,19 @@ export class PumpMatrix {
   }
 
   /**
-   * Prod-вызов СО свечами: volRegime, cell-exit, детекция каскада. Возвращает
-   * только исполняемые сигналы (veto отфильтрован). Нет свечей для символа → как
-   * signals() для него.
+   * LIVE-решение об открытии позиции — БЕЗ look-ahead. Возвращает только
+   * исполняемые сигналы (veto/инверс-запрет отфильтрованы). Использует свечи
+   * СТРОГО ДО сигнала: volZ-режим по базлайну до входа и каскад-давление по
+   * прошлым свечам (squeezePressureBefore). НИКОГДА не тянет свечи из будущего —
+   * в live их не существует. Это решение «входить ли сейчас и с какими exit».
    *
-   * Источник свечей задаётся ОДНИМ из двух способов (перегрузка):
-   *  1) getCandles — ТА ЖЕ функция, что и в fit(): свечи подгружаются лениво по
-   *     каждому символу (вокруг его ts). Async → Promise. Канонический live-путь:
-   *     один источник свечей и в обучении, и в исполнении, без ручного словаря.
-   *     Если getCandles бросает по символу (дыра в данных) — сигнал отдаётся без
-   *     свечей (как signals()), а не роняет весь вызов.
-   *  2) candlesBySymbol — словарь {symbol: candles[]}, когда свечи УЖЕ в памяти
-   *     (бэктест, переиспользование набора). Sync → массив.
+   * Источник свечей:
+   *  1) getCandles — та же, что в fit(): подгружает историю ДО сигнала. Async.
+   *     Бросок по символу (дыра в данных) → сигнал без свечей (как signals()),
+   *     не роняя весь вызов.
+   *  2) candlesBySymbol — словарь предзагруженной истории ДО сигнала. Sync.
+   *
+   * Для бэктеста (replay вперёд + реализованный pnl) используй backtest().
    */
   plan(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
   plan(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
@@ -168,29 +201,84 @@ export class PumpMatrix {
     policy?: Partial<SignalPolicy>,
   ): TradeSignal[] | Promise<TradeSignal[]> {
     if (typeof source === "function") {
-      return this.planViaGetCandles(items, source, policy);
+      return this.planLiveViaGetCandles(items, source, policy);
     }
-    return this.collect(items, (v) => source[v.symbol] ?? null, policy);
+    const eff = intersectPolicy(this.params.policy, policy);
+    const out: TradeSignal[] = [];
+    for (const v of this._predict(items).signals) {
+      const s = this.buildSignalLive(v, source[v.symbol] ?? null, eff);
+      if (s) out.push(s);
+    }
+    return out;
   }
 
-  private async planViaGetCandles(
+  private async planLiveViaGetCandles(
     items: ParserItem[],
     getCandles: GetCandles,
     policy?: Partial<SignalPolicy>,
   ): Promise<TradeSignal[]> {
     const eff = intersectPolicy(this.params.policy, policy);
-    // горизонт свечей: запас на life-cap (как в разметке при обучении)
+    // окно ДО сигнала (единый источник — геттер lookbackMinutes): базлайн объёма +
+    // горизонт каскада, всё в прошлом, без forward.
+    const lookback = this.lookbackMinutes;
+    const out: TradeSignal[] = [];
+    for (const v of this._predict(items).signals) {
+      let candles: ICandleData[] | null = null;
+      try {
+        // тянем lookback свечей, заканчивающихся НА сигнальной минуте (не позже).
+        // since = entryStartTs - lookback·step: окно строго ДО входа.
+        const step = STEP_MS["1m"];
+        const start = entryStartTs(v.ts, "1m");
+        const since = start - lookback * step;
+        candles = await fetchCandlesChunked(getCandles, v.symbol, "1m", lookback, since);
+        if (!candles.length) candles = null;
+      } catch {
+        candles = null; // битый символ → сигнал без свечей, не рушим весь вызов
+      }
+      const s = this.buildSignalLive(v, candles, eff);
+      if (s) out.push(s);
+    }
+    return out;
+  }
+
+  /**
+   * БЭКТЕСТ — replay вперёд по истории + реализованный pnl/каскад. Тянет свечи
+   * ПОСЛЕ сигнала (life-cap горизонт), прогоняет полный replay. ТОЛЬКО для анализа
+   * завершённого прошлого: в live свечей вперёд нет. Look-ahead отсутствует, т.к.
+   * мы в настоящем смотрим на уже закрытые свечи прошлого.
+   *
+   * Источник свечей — getCandles (async) или словарь {symbol: candles} (sync).
+   */
+  backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
+  backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
+  backtest(
+    items: ParserItem[],
+    source: GetCandles | Record<string, ICandleData[]>,
+    policy?: Partial<SignalPolicy>,
+  ): TradeSignal[] | Promise<TradeSignal[]> {
+    if (typeof source === "function") {
+      return this.backtestViaGetCandles(items, source, policy);
+    }
+    return this.collect(items, (v) => source[v.symbol] ?? null, policy);
+  }
+
+  private async backtestViaGetCandles(
+    items: ParserItem[],
+    getCandles: GetCandles,
+    policy?: Partial<SignalPolicy>,
+  ): Promise<TradeSignal[]> {
+    const eff = intersectPolicy(this.params.policy, policy);
     const maxLife = this.params.exit.global.staleMinutes;
     const limit = maxLife * 2 + 5;
     const out: TradeSignal[] = [];
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
       try {
-        const since = alignTs(v.ts, "1m");
+        const since = entryStartTs(v.ts, "1m");
         candles = await fetchCandlesChunked(getCandles, v.symbol, "1m", limit, since);
         if (!candles.length) candles = null;
       } catch {
-        candles = null; // битый символ → сигнал без свечей, не рушим весь вызов
+        candles = null;
       }
       const s = this.buildSignal(v, candles, eff);
       if (s) out.push(s);
@@ -198,7 +286,7 @@ export class PumpMatrix {
     return out;
   }
 
-  /** Точечно под ОДНУ позицию (live: вход = последняя свеча). null при veto. */
+  /** Точечно под ОДНУ позицию в LIVE (вход = последняя свеча, каскад по прошлому). */
   planFor(
     symbol: string,
     direction: Direction,
@@ -207,10 +295,16 @@ export class PumpMatrix {
     policy?: Partial<SignalPolicy>,
   ): TradeSignal | null {
     const entryTs = candles[candles.length - 1]?.timestamp ?? 0;
-    return this.planForAt(symbol, direction, channel, candles, entryTs, policy);
+    const v: PumpVerdict = {
+      symbol, direction, action: "open", ts: entryTs,
+      independentClusters: 1, totalChannels: 1, confidence: 0.5,
+      reason: "planFor", source: this.params.meta.mode, channel,
+    };
+    const eff = intersectPolicy(this.params.policy, policy);
+    return this.buildSignalLive(v, candles, eff);
   }
 
-  /** Как planFor, но с явным entryTs (бэктест). null при veto. */
+  /** Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему). */
   planForAt(
     symbol: string,
     direction: Direction,
@@ -262,15 +356,45 @@ export class PumpMatrix {
   }
 
   /**
-   * Строит ЕДИНЫЙ TradeSignal из вердикта. Возвращает null, если исполнять нечего:
-   * каскад дал veto ИЛИ получившийся action не в allow-списке. Инверсия здесь же
-   * разворачивает direction и тянет exit из инверс-ячейки — наружу уходит готовое
-   * направление, без флагов.
+   * BACKTEST-сборка сигнала: каскад по свечам ПОСЛЕ входа (forward squeezePressure),
+   * допустимо только на истории. Делегирует в общее ядро с mode="backtest".
    */
   private buildSignal(
     v: PumpVerdict,
     candles: ICandleData[] | null,
     policy: SignalPolicy,
+  ): TradeSignal | null {
+    return this.buildSignalCore(v, candles, policy, "backtest");
+  }
+
+  /**
+   * LIVE-сборка сигнала: каскад по свечам ДО входа (backward squeezePressureBefore),
+   * БЕЗ look-ahead. Делегирует в общее ядро с mode="live".
+   */
+  private buildSignalLive(
+    v: PumpVerdict,
+    candles: ICandleData[] | null,
+    policy: SignalPolicy,
+  ): TradeSignal | null {
+    return this.buildSignalCore(v, candles, policy, "live");
+  }
+
+  /**
+   * Строит ЕДИНЫЙ TradeSignal из вердикта. Возвращает null, если исполнять нечего:
+   * каскад дал veto ИЛИ получившийся action не в allow-списке. Инверсия здесь же
+   * разворачивает direction и тянет exit из инверс-ячейки — наружу уходит готовое
+   * направление, без флагов.
+   *
+   * mode="live": каскад меряется по свечам ДО входа (squeezePressureBefore) — в live
+   *   свечей после входа нет, look-ahead запрещён.
+   * mode="backtest": каскад по свечам ПОСЛЕ входа (squeezePressure) — допустимо на
+   *   завершённой истории.
+   */
+  private buildSignalCore(
+    v: PumpVerdict,
+    candles: ICandleData[] | null,
+    policy: SignalPolicy,
+    mode: "live" | "backtest",
   ): TradeSignal | null {
     const ch = v.channel ?? "_matrix";
     const dir = v.direction!;
@@ -294,10 +418,16 @@ export class PumpMatrix {
 
     let sqPressure: number | null = null;
     if (candles && candles.length > 0) {
-      let entryIdx = candles.findIndex((c) => c.timestamp >= v.ts);
+      // первая свеча, ОТКРЫВШАЯСЯ не раньше сигнальной минуты (без look-ahead в
+      // формирующуюся свечу сигнала). entryStartTs гарантирует полностью сформированную.
+      const startTs = entryStartTs(v.ts, "1m");
+      let entryIdx = candles.findIndex((c) => c.timestamp >= startTs);
       if (entryIdx < 0) entryIdx = candles.length - 1;
       const volZ = volumeZScore(candles, entryIdx, baseWin);
-      sqPressure = squeezePressure(candles, entryIdx, dir, horizon);
+      // КАСКАД: live — по прошлым свечам (без look-ahead), backtest — по будущим.
+      sqPressure = mode === "live"
+        ? squeezePressureBefore(candles, entryIdx, dir, horizon)
+        : squeezePressure(candles, entryIdx, dir, horizon);
       volRegime = volRegimeOf(volZ, volZThr);
     }
 

@@ -73,6 +73,35 @@ export function squeezePressure(
   return againstVol / totalVol;
 }
 
+/**
+ * LIVE-вариант squeezePressure: считает давление каскада по свечам СТРОГО ДО входа
+ * (никакого look-ahead). В live свечей ПОСЛЕ сигнала ещё нет — поэтому ловушку
+ * оцениваем по уже произошедшим свечам перед сигналом: высокая доля объёма на
+ * движениях против позиции в недавнем прошлом = рынок уже под давлением каскада.
+ *
+ * entryIdx — индекс входной свечи; окно [entryIdx-horizon, entryIdx) (НЕ включая
+ * саму входную, чтобы не зависеть от её формирования). Симметрия по dir та же.
+ */
+export function squeezePressureBefore(
+  candles: ICandleData[],
+  entryIdx: number,
+  dir: Direction,
+  horizon: number,
+): number {
+  const start = Math.max(0, entryIdx - horizon);
+  let againstVol = 0;
+  let totalVol = 0;
+  for (let i = start; i < entryIdx; i++) {
+    const c = candles[i];
+    const delta = c.close - c.open;
+    const against = dir === "long" ? delta < 0 : delta > 0;
+    totalVol += c.volume;
+    if (against) againstVol += c.volume;
+  }
+  if (totalVol === 0) return 0;
+  return againstVol / totalVol;
+}
+
 /** Считает оба признака разом для входа на entryIdx. */
 export function volumeFeatures(
   candles: ICandleData[],

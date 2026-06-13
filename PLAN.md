@@ -15,7 +15,7 @@
 ```bash
 npm i
 npm run build   # tsc -p tsconfig.json
-npm test        # vitest run — 387 тестов
+npm test        # vitest run — 442 теста
 ```
 
 Стек: TypeScript + vitest, без CLI и монорепо. Единственная публичная точка входа высокого уровня — класс `PumpMatrix`.
@@ -35,12 +35,19 @@ const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
 
 // signals() возвращает ТОЛЬКО исполняемое — veto уже отфильтрован
 const trades = model.signals(liveItems);
-// со свечами добавляется volRegime + детекция каскада:
-const trades = model.plan(liveItems, { SOLUSDT: solCandles, TRXUSDT: trxCandles });
+
+// LIVE-решение СО свечами — БЕЗ look-ahead. plan() тянет свечи СТРОГО ДО сигнала
+// (volZ-режим + каскад по прошлому), НИКОГДА не смотрит в будущее. Та же getCandles,
+// что и в fit(); словарь предзагруженной истории тоже принимается:
+const trades = await model.plan(liveItems, getCandles);
 
 for (const s of trades) {
   openPosition(s.symbol, s.direction, s.exit); // direction развёрнут при инверсии; exit готов
 }
+
+// БЭКТЕСТ (анализ прошлого): replay вперёд + реализованный pnl. Тянет свечи ПОСЛЕ
+// сигнала — допустимо только на истории, в live будущего нет:
+const replayed = await model.backtest(histItems, getCandles);
 ```
 
 `signals`/`plan` думают сами: выбирают режим, считают volRegime, оценивают каскад, фильтруют veto, разворачивают инверсию. Приложение исполняет `s.direction` с `s.exit` — никаких `if` про veto, инверсию или режим.
@@ -287,9 +294,18 @@ interface TradeSignal {
 
 ```ts
 model.signals(items, policy?)                       // без свечей: action всегда enter
-model.plan(items, candlesBySymbol, policy?)          // со свечами: volRegime, каскад
-model.planFor(symbol, dir, channel, candles, policy?)        // live, null при veto
-model.planForAt(symbol, dir, channel, candles, ts, policy?)  // бэктест, null при veto
+model.plan(items, getCandles, policy?)               // LIVE: свечи ДО сигнала, no look-ahead → Promise
+model.plan(items, candlesBySymbol, policy?)          // LIVE: предзагруженная история ДО сигнала → массив
+model.backtest(items, getCandles, policy?)           // БЭКТЕСТ: replay вперёд + pnl → Promise
+model.backtest(items, candlesBySymbol, policy?)      // БЭКТЕСТ: свечи в памяти → массив
+model.planFor(symbol, dir, channel, candles, policy?)        // LIVE точечно, каскад по прошлому
+model.planForAt(symbol, dir, channel, candles, ts, policy?)  // БЭКТЕСТ точечно, replay вперёд
+
+model.lookbackMinutes               // сколько минут истории свечей ДО сигнала нужно plan() на каждый сигнал
+model.minClusters                   // мин. число независимых кластеров для matrix-сигнала
+model.minSharedEvents               // мин. число общих событий для жизнеспособности матрицы
+model.impactHorizonMinutes          // эмпирический импакт-горизонт поста
+model.mode / model.modeReason       // matrix|single + почему
 ```
 
 ### Разрешения — allow-список, сериализован на обучении, readonly в исполнении

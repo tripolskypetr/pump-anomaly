@@ -79,9 +79,9 @@ export const DEFAULT_GRID: TrainGrid = {
   squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
   squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
   volBaselineWindow: [20],
-  cascadeWindowMinutes: [15, 30, 60, 120, 240], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
-  // вся история + конечные окна (1 / 2 / 4 / 8 недель); train выберет по CV
-  stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
+  cascadeWindowMinutes: [15, 30, 60], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
+  // вся история + конечные окна (4 / 8 недель); train выберет по CV
+  stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
 };
 
 export interface TrainOptions {

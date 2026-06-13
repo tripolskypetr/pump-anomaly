@@ -40,6 +40,20 @@ export const alignTs = (t: number, interval: CandleInterval): number => {
 };
 
 /**
+ * Первая ПОЛНОСТЬЮ сформированная свеча, торгуемая БЕЗ look-ahead: если сигнал
+ * пришёл внутри минуты (ts > границы), свеча, СОДЕРЖАЩАЯ сигнал, ещё формируется —
+ * её close/high/low станут известны только в КОНЦЕ минуты, ПОСЛЕ сигнала. Входить
+ * в неё = заглядывать вперёд. Поэтому старт входа = следующая граница. Если сигнал
+ * ровно на границе (ts === aligned) — эта свеча открывается одновременно с сигналом
+ * и торгуема честно, не пропускаем.
+ */
+export const entryStartTs = (t: number, interval: CandleInterval): number => {
+  const step = STEP_MS[interval];
+  const aligned = Math.floor(t / step) * step;
+  return aligned === t ? aligned : aligned + step;
+};
+
+/**
  * Источник свечей. Семантика диапазонов (sDate inclusive, eDate exclusive):
  *   (limit)                 → [alignedWhen − limit·step, alignedWhen)
  *   (limit, sDate)          → [align(sDate), align(sDate) + limit·step)

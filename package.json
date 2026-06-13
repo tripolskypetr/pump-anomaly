@@ -2,7 +2,7 @@
   "name": "pump-anomaly",
   "version": "1.0.0",
   "description": "Detector of synchronized trading pump signals via author-cluster deduplication, with path-aware exit replay and liquidation-cascade detection.",
-    "author": {
+  "author": {
     "name": "Petr Tripolsky",
     "email": "tripolskypetr@gmail.com",
     "url": "https://github.com/tripolskypetr"

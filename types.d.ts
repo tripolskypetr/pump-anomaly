@@ -1198,6 +1198,8 @@ declare class PumpMatrix {
      * undefined у моделей до этой версии.
      */
     get effectiveTrials(): number | undefined;
+    /** Число конфигов в гриде текущего fit (внутренние испытания). undefined у моделей до этой версии. */
+    get innerTrials(): number | undefined;
     /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
     get fitAttempts(): number | undefined;
     /**

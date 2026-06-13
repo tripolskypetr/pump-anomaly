@@ -1,7 +1,18 @@
 {
   "name": "pump-anomaly",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Detector of synchronized trading pump signals via author-cluster deduplication, with path-aware exit replay and liquidation-cascade detection.",
+    "author": {
+    "name": "Petr Tripolsky",
+    "email": "tripolskypetr@gmail.com",
+    "url": "https://github.com/tripolskypetr"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "http://paypal.me/tripolskypetr"
+  },
+  "license": "MIT",
+  "homepage": "https://backtest-kit.github.io/documents/article_07_ai_news_trading_signals.html",
   "keywords": [
     "trading",
     "pump",
@@ -19,7 +30,6 @@
     "typescript"
   ],
   "type": "module",
-  "license": "MIT",
   "main": "./build/index.cjs",
   "module": "./build/index.mjs",
   "types": "./types.d.ts",

@@ -74,6 +74,39 @@ export interface TradeSignal {
 }
 
 /**
+ * Реализованный результат сделки — РЕПЛЕЙ exit-плана по свечам ПОСЛЕ входа.
+ * Существует только в backtest (forward-replay по закрытой истории); plan/signals
+ * его НЕ дают (там позиция ещё не закрыта). pnl/peak в долях (0.05 = +5%).
+ */
+export interface BacktestResult {
+  /** вошли ли в позицию (false → зона входа не задета на окне свечей) */
+  entered: boolean;
+  /** реализованный pnl, доля (при hard-stop = честный -hardStop%) */
+  pnl: number;
+  /** пиковый pnl за жизнь позиции, доля */
+  peak: number;
+  /** причина выхода (hard-stop / trailing-take / peak-staleness / life-cap / …) */
+  reason: string;
+  /** минут от входа до выхода */
+  heldMinutes: number;
+  /** цена входа (0 если не вошли) */
+  entryPrice: number;
+  /** цена выхода (0 если не вошли) */
+  exitPrice: number;
+  /** замер неполный: после входа не хватило свечей на полный life-cap */
+  truncated: boolean;
+}
+
+/**
+ * Сигнал backtest = TradeSignal + реализованный result. Тип-потомок: главное
+ * отличие backtest от plan — он РЕПЛЕИТ позицию вперёд и возвращает realized pnl.
+ * Сигнатура backtest() возвращает именно его, поэтому pnl виден без джойна с dump().
+ */
+export interface BacktestSignal extends TradeSignal {
+  result: BacktestResult;
+}
+
+/**
  * Политика разрешённых исходов (allow-список).
  *
  * Сериализуема: фиксируется в момент fit, попадает в params (model.json).

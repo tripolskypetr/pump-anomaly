@@ -736,6 +736,37 @@ interface TradeSignal {
     origin: SignalOrigin;
 }
 /**
+ * Реализованный результат сделки — РЕПЛЕЙ exit-плана по свечам ПОСЛЕ входа.
+ * Существует только в backtest (forward-replay по закрытой истории); plan/signals
+ * его НЕ дают (там позиция ещё не закрыта). pnl/peak в долях (0.05 = +5%).
+ */
+interface BacktestResult {
+    /** вошли ли в позицию (false → зона входа не задета на окне свечей) */
+    entered: boolean;
+    /** реализованный pnl, доля (при hard-stop = честный -hardStop%) */
+    pnl: number;
+    /** пиковый pnl за жизнь позиции, доля */
+    peak: number;
+    /** причина выхода (hard-stop / trailing-take / peak-staleness / life-cap / …) */
+    reason: string;
+    /** минут от входа до выхода */
+    heldMinutes: number;
+    /** цена входа (0 если не вошли) */
+    entryPrice: number;
+    /** цена выхода (0 если не вошли) */
+    exitPrice: number;
+    /** замер неполный: после входа не хватило свечей на полный life-cap */
+    truncated: boolean;
+}
+/**
+ * Сигнал backtest = TradeSignal + реализованный result. Тип-потомок: главное
+ * отличие backtest от plan — он РЕПЛЕИТ позицию вперёд и возвращает realized pnl.
+ * Сигнатура backtest() возвращает именно его, поэтому pnl виден без джойна с dump().
+ */
+interface BacktestSignal extends TradeSignal {
+    result: BacktestResult;
+}
+/**
  * Политика разрешённых исходов (allow-список).
  *
  * Сериализуема: фиксируется в момент fit, попадает в params (model.json).
@@ -1335,20 +1366,30 @@ declare class PumpMatrix {
      *
      * Источник свечей — getCandles (async) или словарь {symbol: candles} (sync).
      */
-    backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
-    backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
+    backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<BacktestSignal[]>;
+    backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): BacktestSignal[];
+    /** Индекс зон входа (symbol|dir|ts → {from,to}) из parser-items — для replay в backtest. */
+    private entryZoneIndex;
+    /** Ключ зоны по вердикту: исходное (до инверсии) направление поста. */
+    private zoneKey;
     private backtestViaGetCandles;
     /** Точечно под ОДНУ позицию в LIVE (вход = последняя свеча, каскад по прошлому). */
     planFor(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], policy?: Partial<SignalPolicy>): TradeSignal | null;
-    /** Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему). */
-    planForAt(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], entryTs: number, policy?: Partial<SignalPolicy>): TradeSignal | null;
+    /**
+     * Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему).
+     * Возвращает BacktestSignal с реализованным result. Зона входа не задаётся —
+     * replay берёт точку = open первой свечи (как при отсутствии зоны в обучении).
+     */
+    planForAt(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], entryTs: number, policy?: Partial<SignalPolicy>): BacktestSignal | null;
     /** Полный отчёт (все вердикты + карта авторства) — для разбора. */
     explain(items: ParserItem[]): PredictionResult;
     private collect;
     private flatExit;
     /**
      * BACKTEST-сборка сигнала: каскад по свечам ПОСЛЕ входа (forward squeezePressure),
-     * допустимо только на истории. Делегирует в общее ядро с mode="backtest".
+     * допустимо только на истории. Возвращает BacktestSignal с реализованным result
+     * (replay exit-плана вперёд) — главное отличие backtest от plan. entryFrom/entryTo
+     * — зона входа для replay (из parser-item); без свечей result.entered=false.
      */
     private buildSignal;
     /**
@@ -1356,6 +1397,12 @@ declare class PumpMatrix {
      * БЕЗ look-ahead. Делегирует в общее ядро с mode="live".
      */
     private buildSignalLive;
+    /**
+     * Реализованный результат для backtest: replay ИТОГОВОГО (с учётом инверсии)
+     * направления и exit-плана сигнала по свечам после входа. Зона входа из parser-item;
+     * если не задана — точка = open первой свечи (как в обучении). Нет свечей → не вошли.
+     */
+    private replayResult;
     /**
      * Строит ЕДИНЫЙ TradeSignal из вердикта. Возвращает null, если исполнять нечего:
      * каскад дал veto ИЛИ получившийся action не в allow-списке. Инверсия здесь же
@@ -1387,4 +1434,4 @@ declare class PumpMatrix {
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
 export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export type { AuthorMap, BacktestResult, BacktestSignal, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

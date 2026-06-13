@@ -3,10 +3,11 @@ import { GetCandles, ICandleData, entryStartTs, STEP_MS } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
 import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, VolRegime } from "./volume";
+import { replayExit } from "./replay";
 import { RiskRewardStats, PnlStats } from "./objective";
 import { DEFAULT_VIABILITY } from "./viability";
 import {
-  TradeSignal, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
+  TradeSignal, BacktestSignal, BacktestResult, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
   intersectPolicy, DEFAULT_POLICY,
 } from "./signal";
 import {
@@ -288,28 +289,55 @@ export class PumpMatrix {
    *
    * Источник свечей — getCandles (async) или словарь {symbol: candles} (sync).
    */
-  backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<TradeSignal[]>;
-  backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): TradeSignal[];
+  backtest(items: ParserItem[], getCandles: GetCandles, policy?: Partial<SignalPolicy>): Promise<BacktestSignal[]>;
+  backtest(items: ParserItem[], candlesBySymbol: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): BacktestSignal[];
   backtest(
     items: ParserItem[],
     source: GetCandles | Record<string, ICandleData[]>,
     policy?: Partial<SignalPolicy>,
-  ): TradeSignal[] | Promise<TradeSignal[]> {
+  ): BacktestSignal[] | Promise<BacktestSignal[]> {
+    const zones = this.entryZoneIndex(items);
     if (typeof source === "function") {
-      return this.backtestViaGetCandles(items, source, policy);
+      return this.backtestViaGetCandles(items, source, zones, policy);
     }
-    return this.collect(items, (v) => source[v.symbol] ?? null, policy);
+    const eff = intersectPolicy(this.params.policy, policy);
+    const out: BacktestSignal[] = [];
+    for (const v of this._predict(items).signals) {
+      const z = zones.get(this.zoneKey(v));
+      const s = this.buildSignal(v, source[v.symbol] ?? null, eff, z?.from, z?.to);
+      if (s) out.push(s);
+    }
+    return out;
+  }
+
+  /** Индекс зон входа (symbol|dir|ts → {from,to}) из parser-items — для replay в backtest. */
+  private entryZoneIndex(items: ParserItem[]): Map<string, { from?: number; to?: number }> {
+    const m = new Map<string, { from?: number; to?: number }>();
+    for (const it of items) {
+      const from = typeof it.entryFromPrice === "number" ? it.entryFromPrice : undefined;
+      const to = typeof it.entryToPrice === "number" ? it.entryToPrice : undefined;
+      m.set(`${it.symbol}|${it.direction}|${it.ts}`, { from, to });
+    }
+    return m;
+  }
+
+  /** Ключ зоны по вердикту: исходное (до инверсии) направление поста. */
+  private zoneKey(v: PumpVerdict): string {
+    // invertedFrom применяется позже в buildSignal; зона привязана к ИСХОДНОМУ посту,
+    // поэтому ключ по direction вердикта (что говорил канал), не по итоговому.
+    return `${v.symbol}|${v.direction}|${v.ts}`;
   }
 
   private async backtestViaGetCandles(
     items: ParserItem[],
     getCandles: GetCandles,
+    zones: Map<string, { from?: number; to?: number }>,
     policy?: Partial<SignalPolicy>,
-  ): Promise<TradeSignal[]> {
+  ): Promise<BacktestSignal[]> {
     const eff = intersectPolicy(this.params.policy, policy);
     const maxLife = this.params.exit.global.staleMinutes;
     const limit = maxLife * 2 + 5;
-    const out: TradeSignal[] = [];
+    const out: BacktestSignal[] = [];
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
       try {
@@ -319,7 +347,8 @@ export class PumpMatrix {
       } catch {
         candles = null;
       }
-      const s = this.buildSignal(v, candles, eff);
+      const z = zones.get(this.zoneKey(v));
+      const s = this.buildSignal(v, candles, eff, z?.from, z?.to);
       if (s) out.push(s);
     }
     return out;
@@ -343,7 +372,11 @@ export class PumpMatrix {
     return this.buildSignalLive(v, candles, eff);
   }
 
-  /** Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему). */
+  /**
+   * Бэктест под ОДНУ позицию с явным entryTs (replay вперёд, каскад по будущему).
+   * Возвращает BacktestSignal с реализованным result. Зона входа не задаётся —
+   * replay берёт точку = open первой свечи (как при отсутствии зоны в обучении).
+   */
   planForAt(
     symbol: string,
     direction: Direction,
@@ -351,7 +384,7 @@ export class PumpMatrix {
     candles: ICandleData[],
     entryTs: number,
     policy?: Partial<SignalPolicy>,
-  ): TradeSignal | null {
+  ): BacktestSignal | null {
     const v: PumpVerdict = {
       symbol, direction, action: "open", ts: entryTs,
       independentClusters: 1, totalChannels: 1, confidence: 0.5,
@@ -367,6 +400,8 @@ export class PumpMatrix {
   }
 
   // ── общий сборщик: predict → buildSignal → отсев null (veto/не разрешено) ──
+  // signals() — без свечей. Используем LIVE-сборку: каскад не оценивается (нет свечей),
+  // и result не доклеивается — signals() отдаёт чистый TradeSignal, не BacktestSignal.
   private collect(
     items: ParserItem[],
     candlesOf: (v: PumpVerdict) => ICandleData[] | null,
@@ -375,7 +410,7 @@ export class PumpMatrix {
     const eff = intersectPolicy(this.params.policy, policy);
     const out: TradeSignal[] = [];
     for (const v of this._predict(items).signals) {
-      const s = this.buildSignal(v, candlesOf(v), eff);
+      const s = this.buildSignalLive(v, candlesOf(v), eff);
       if (s) out.push(s); // null = veto или исход не в allow → не отдаём
     }
     return out;
@@ -396,14 +431,20 @@ export class PumpMatrix {
 
   /**
    * BACKTEST-сборка сигнала: каскад по свечам ПОСЛЕ входа (forward squeezePressure),
-   * допустимо только на истории. Делегирует в общее ядро с mode="backtest".
+   * допустимо только на истории. Возвращает BacktestSignal с реализованным result
+   * (replay exit-плана вперёд) — главное отличие backtest от plan. entryFrom/entryTo
+   * — зона входа для replay (из parser-item); без свечей result.entered=false.
    */
   private buildSignal(
     v: PumpVerdict,
     candles: ICandleData[] | null,
     policy: SignalPolicy,
-  ): TradeSignal | null {
-    return this.buildSignalCore(v, candles, policy, "backtest");
+    entryFrom?: number,
+    entryTo?: number,
+  ): BacktestSignal | null {
+    const sig = this.buildSignalCore(v, candles, policy, "backtest");
+    if (!sig) return null;
+    return { ...sig, result: this.replayResult(sig, candles, entryFrom, entryTo) };
   }
 
   /**
@@ -416,6 +457,36 @@ export class PumpMatrix {
     policy: SignalPolicy,
   ): TradeSignal | null {
     return this.buildSignalCore(v, candles, policy, "live");
+  }
+
+  /**
+   * Реализованный результат для backtest: replay ИТОГОВОГО (с учётом инверсии)
+   * направления и exit-плана сигнала по свечам после входа. Зона входа из parser-item;
+   * если не задана — точка = open первой свечи (как в обучении). Нет свечей → не вошли.
+   */
+  private replayResult(
+    sig: TradeSignal,
+    candles: ICandleData[] | null,
+    entryFrom?: number,
+    entryTo?: number,
+  ): BacktestResult {
+    if (!candles || candles.length === 0) {
+      return { entered: false, pnl: 0, peak: 0, reason: "no-candles", heldMinutes: 0, entryPrice: 0, exitPrice: 0, truncated: false };
+    }
+    const from = entryFrom ?? candles[0].open;
+    const to = entryTo ?? candles[0].open;
+    const r = replayExit(candles, sig.direction, from, to, {
+      trailingTake: sig.exit.trailingTake,
+      hardStop: sig.exit.hardStop,
+      stalenessSinceProfit: sig.exit.stalenessSinceProfit,
+      stalenessSinceMinutes: sig.exit.stalenessSinceMinutes,
+      staleMinutes: sig.exit.impactHorizonMinutes,
+    });
+    return {
+      entered: r.entered, pnl: r.pnl, peak: r.peak, reason: r.reason,
+      heldMinutes: r.heldMinutes, entryPrice: r.entryPrice, exitPrice: r.exitPrice,
+      truncated: r.truncated,
+    };
   }
 
   /**
@@ -531,4 +602,4 @@ export class PumpMatrix {
   }
 }
 
-export type { TradeSignal, SignalAction, SignalOrigin, ExitPlan, SignalPolicy } from "./signal";
+export type { TradeSignal, BacktestSignal, BacktestResult, SignalAction, SignalOrigin, ExitPlan, SignalPolicy } from "./signal";

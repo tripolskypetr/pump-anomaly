@@ -46,6 +46,8 @@ interface SignalEvent {
     ts: number;
     entryFromPrice?: number;
     entryToPrice?: number;
+    /** идентификатор исходного parser-item — для сопоставления результата теста с парсингом */
+    id?: string;
 }
 /** Вердикт по одному (symbol, direction). */
 interface PumpVerdict {
@@ -436,6 +438,10 @@ interface CandidateBurst {
     independentClusters: number;
     totalChannels: number;
     confidence: number;
+    /** id якорного (последнего в окне) события — для сопоставления с парсингом */
+    id?: string;
+    /** id ВСЕХ событий, вошедших во всплеск (в matrix может быть несколько) */
+    ids?: string[];
 }
 /**
  * Перечисляет ВСЕ всплески при заданных (windowK, jaccardThreshold, lagPeakThreshold),
@@ -1027,6 +1033,10 @@ interface TrainOptions {
  * Все цены абсолютные; pnl/peak в долях (0.05 = +5%); ts в мс.
  */
 interface SignalRecord {
+    /** id якорного parser-item — для сопоставления результата теста с парсингом */
+    id?: string;
+    /** id всех parser-item, вошедших в сигнал (в matrix может быть несколько) */
+    ids?: string[];
     symbol: string;
     direction: "long" | "short";
     channel: string;

@@ -85,11 +85,12 @@ interface ParserItem {
   ts: number;               // unix time of publication, ms
   entryFromPrice?: number;   // lower bound of the entry zone (entry.from)
   entryToPrice?: number;     // upper bound of the entry zone (entry.to)
+  id?: string | number;      // optional source id — threaded through to dump() for traceback
   [extra: string]: unknown;  // targets/stoploss/… are allowed and ignored
 }
 ```
 
-`channel` is required — it is the key into the exit tensor. The entry zone (`entryFromPrice`/`entryToPrice`) maps from `entry: {from, to}` of your parser-items; if absent, entry is at the open of the first candle.
+`channel` is required — it is the key into the exit tensor. The entry zone (`entryFromPrice`/`entryToPrice`) maps from `entry: {from, to}` of your parser-items; if absent, entry is at the open of the first candle. An optional `id` (string or number → normalized to string) is carried untouched all the way to each `dump()` record, so a realized trade can be traced back to the exact post it came from.
 
 ### `getCandles` (candle source)
 
@@ -176,17 +177,17 @@ const DEFAULT_GRID = {
   // prod exit (label set by replay)
   trailingTake:         [0.5, 1.0, 2.0],
   hardStop:             [1.0, 2.0, 3.0],
-  stalenessSinceProfit: [1.0],
-  stalenessSinceMinutes:[240],
+  stalenessSinceProfit: [0.5, 1.0, 2.0],        // profit threshold that pins the peak — searched, not fixed
+  stalenessSinceMinutes:[60, 120, 240],         // minutes without a new high before a staleness exit
   staleMinutes:         [60, 240, 720, 1440],   // impact horizon: 1h / 4h / 12h / 24h
   // liquidation-cascade detector
   volZThreshold:    [1.5, 2.5],                 // when volume is anomalous
   squeezePolicy:    ["none", "tighten", "veto", "invert"],
   squeezeThreshold: [0.55, 0.7],
   volBaselineWindow:[20],
-  cascadeWindowMinutes: [15, 30, 60, 120, 240],           // cascade-detection window — NOT the holding horizon
+  cascadeWindowMinutes: [15, 30, 60],           // cascade-detection window — NOT the holding horizon
   // stationarity window (long horizon)
-  stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
+  stationarityWindowMs: [Infinity, 28*24*3600_000, 56*24*3600_000],
 };
 ```
 
@@ -479,6 +480,8 @@ model.historySize;   // number of records (0 if loaded without history)
 
 ```ts
 interface SignalRecord {
+  id?: string;           // anchor parser-item id (traceback to the source post)
+  ids?: string[];        // all parser-item ids in the burst (matrix may have several)
   symbol: string;
   direction: "long" | "short";
   channel: string;
@@ -581,7 +584,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ## Tests
 
-**505 tests** across **48 test files**. All passing.
+**512 tests** across **49 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|
@@ -633,6 +636,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 | `e2e/fit-certification.test.ts` | 3 | `fit` attaches the certificate: small sample (17 trades) → `certified:false` with reasons, survives `save`/`load`, present on the model facade |
 | `e2e/fit-noise-rejection.test.ts` | 1 | Full `fit` on a pure random walk → `certified:false` even though grid argmax picks a "best" config (the certificate catches the brute-force artifact `reliable` alone would miss) |
 | `meta-ledger.test.ts` | 9 | Meta-overfitting guard: cadence guard blocks too-frequent refits, `effectiveTrials` sums ALL fit attempts (not only certified ones), family-wise DSR drops false certificates from 720 noise refits to 0 while a strong edge survives the correction |
+| `staleness-and-id.test.ts` | 7 | `stalenessSinceProfit`/`stalenessSinceMinutes` are searched in `DEFAULT_GRID` (not pinned); a parser-item `id` threads through to every `dump()` record (numeric→string, matches the source post by `ts`, survives save/load, `undefined` without an id) |
 
 ```bash
 npm test

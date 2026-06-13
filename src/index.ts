@@ -29,6 +29,7 @@ function normalize(items: ParserItem[]): SignalEvent[] {
       ts: it.ts,
       entryFromPrice: typeof it.entryFromPrice === "number" ? it.entryFromPrice : undefined,
       entryToPrice: typeof it.entryToPrice === "number" ? it.entryToPrice : undefined,
+      id: typeof it.id === "string" ? it.id : (typeof it.id === "number" ? String(it.id) : undefined),
     });
   }
   return out;

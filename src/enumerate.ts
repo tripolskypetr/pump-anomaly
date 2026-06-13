@@ -13,6 +13,10 @@ export interface CandidateBurst {
   independentClusters: number;
   totalChannels: number;
   confidence: number;
+  /** id якорного (последнего в окне) события — для сопоставления с парсингом */
+  id?: string;
+  /** id ВСЕХ событий, вошедших во всплеск (в matrix может быть несколько) */
+  ids?: string[];
 }
 
 /**
@@ -71,11 +75,18 @@ export function enumerateBursts(
       const channels = new Set(slice.map((e) => e.channel));
       const dedup = clusters.size / channels.size;
       const fill = Math.min(slice.length / 4, 1);
+      const rawAnchorId = (evs[hi] as SignalEvent & { id?: unknown }).id;
+      const anchorId = typeof rawAnchorId === "string" ? rawAnchorId : (typeof rawAnchorId === "number" ? String(rawAnchorId) : undefined);
       const cand: CandidateBurst = {
         symbol, direction, ts: evs[hi].ts,
         independentClusters: clusters.size,
         totalChannels: channels.size,
         confidence: +(dedup * fill).toFixed(6),
+        id: anchorId,
+        ids: slice.map((e) => {
+          const r = (e as SignalEvent & { id?: unknown }).id;
+          return typeof r === "string" ? r : (typeof r === "number" ? String(r) : undefined);
+        }).filter((x): x is string => x != null),
       };
       if (!best || cand.independentClusters > best.independentClusters ||
         (cand.independentClusters === best.independentClusters && cand.confidence > best.confidence))
@@ -107,9 +118,13 @@ export function enumeratePosts(
     for (const e of evs) {
       if (e.ts - lastTs <= window) continue;
       lastTs = e.ts;
+      const rawId = (e as SignalEvent & { id?: unknown }).id;
+      const id = typeof rawId === "string" ? rawId : (typeof rawId === "number" ? String(rawId) : undefined);
       out.push({
         symbol, direction, ts: e.ts,
         independentClusters: 1, totalChannels: 1, confidence: 0.5,
+        id,
+        ids: id != null ? [id] : [],
       });
     }
   }

@@ -74,8 +74,8 @@ export const DEFAULT_GRID: TrainGrid = {
   lagPeakThreshold: [0.4, 0.5, 0.6],
   trailingTake: [0.5, 1.0, 2.0],
   hardStop: [1.0, 2.0, 3.0],
-  stalenessSinceProfit: [1.0],
-  stalenessSinceMinutes: [240],
+  stalenessSinceProfit: [0.5, 1.0, 2.0],   // порог профита для фиксации пика — перебирается, не зафиксирован
+  stalenessSinceMinutes: [60, 120, 240],    // сколько минут без нового пика = выход по staleness
   staleMinutes: [60, 240, 720, 1440], // 1ч / 4ч / 12ч / 24ч — какой импакт-горизонт лучше
   volZThreshold: [1.5, 2.5],          // когда считать объём аномальным (накопление топлива)
   squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
@@ -125,6 +125,10 @@ export interface TrainOptions {
  * Все цены абсолютные; pnl/peak в долях (0.05 = +5%); ts в мс.
  */
 export interface SignalRecord {
+  /** id якорного parser-item — для сопоставления результата теста с парсингом */
+  id?: string;
+  /** id всех parser-item, вошедших в сигнал (в matrix может быть несколько) */
+  ids?: string[];
   symbol: string;
   direction: "long" | "short";
   channel: string;
@@ -319,6 +323,7 @@ export async function train(
   type Labeled = {
     channel: string; symbol: string; direction: "long" | "short"; ts: number;
     independentClusters: number;
+    id?: string; ids?: string[];
     byExit: Map<string, ExitRec>;
   };
   const labeledCache = new Map<string, Labeled[]>();
@@ -352,7 +357,9 @@ export async function train(
       labeled.push({
         channel: src?.channel ?? "_unknown",
         symbol: b.symbol, direction: b.direction, ts: b.ts,
-        independentClusters: b.independentClusters, byExit,
+        independentClusters: b.independentClusters,
+        id: b.id, ids: b.ids,
+        byExit,
       });
     }
     return labeled;
@@ -703,6 +710,7 @@ export async function train(
       // запись истории — для ВСЕХ сигналов (вошли/не вошли), чтобы аналитика
       // могла считать и пропуски (veto/no-entry), и реализованные сделки
       history.push({
+        id: b.id, ids: b.ids,
         symbol, direction, channel: b.channel, ts: b.ts,
         entered: r.entered, entryPrice: r.entryPrice, exitPrice: r.exitPrice,
         pnl: r.pnl, peak: r.peak, reason: r.reason, heldMinutes: r.heldMinutes,

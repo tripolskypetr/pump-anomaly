@@ -53,6 +53,8 @@ export interface SignalEvent {
   ts: number;
   entryFromPrice?: number;
   entryToPrice?: number;
+  /** идентификатор исходного parser-item — для сопоставления результата теста с парсингом */
+  id?: string;
 }
 
 /** Вердикт по одному (symbol, direction). */

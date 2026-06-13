@@ -324,7 +324,7 @@ const model = await PumpMatrix.fit(history, getCandles, {
 });
 
 if (!model.certification.certified) {
-  console.warn("not certified — do NOT trade this model:", model.certification?.reasons);
+  console.warn("not certified — do NOT trade this model:", model.certification.reasons);
 }
 ```
 

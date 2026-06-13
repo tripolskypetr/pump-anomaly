@@ -73,6 +73,32 @@ Three execution methods, by what candles they're allowed to see:
 
 ---
 
+## Per-asset grids
+
+Tuned `TrainGrid`s per asset live in [`config/`](config/) — one `*-grid.mjs` each, set from how that coin actually pumps. See [config/README.md](config/README.md) for the full rationale. Summary (fastest → slowest):
+
+| Asset | Pump speed | `staleMinutes` | `hardStop` % | `trailingTake` % | `stalenessSinceProfit` % | Noise | Matrix strictness |
+|---|---|---|---|---|---|---|---|
+| [Fartcoin](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/fartcoin-grid.mjs) | Very fast | 25m – 4h | 0.65–2.0 | 0.5–2.4 | 0.3–1.0 | Very high | Low |
+| [HYPE](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/hype-grid.mjs) | Very fast | 30m – 4h | 0.7–2.0 | 0.5–2.5 | 0.3–1.0 | High | Low |
+| [Solana](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/solana-grid.mjs) | Fast | 45m – 8h | 0.8–2.5 | 0.6–2.2 | 0.4–1.3 | High | Low–Med |
+| [TRX](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/tron-grid.mjs) | Medium | 1.5h – 15h | 1.0–3.0 | 0.7–3.5 | 0.5–1.4 | Medium | Medium |
+| [TON](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/gram-grid.mjs) | Medium-fast | 1h – 12h | 1.0–3.0 | 0.7–3.5 | 0.5–1.4 | Medium | Medium |
+| [DOGE](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/doge-grid.mjs) | Medium | 1.5h – 16h | 1.1–3.2 | 0.8–4.0 | 0.5–1.5 | Medium+ | Medium+ |
+| [BNB](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/bnb-grid.mjs) | Medium | 3h – 24h | 1.2–3.5 | 0.9–4.5 | 0.6–1.6 | Medium | Medium+ |
+| [Ethereum](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/ethereum-grid.mjs) | Slow | 2h – 24h | 1.2–3.5 | 0.5–2.5 | 0.3–1.0 | Low | High |
+| [Ripple (XRP)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/ripple-grid.mjs) | Medium-slow | 3h – 24h | 1.3–4.0 | 0.9–5.0 | 0.6–1.7 | Low–Med | High |
+| [Litecoin (LTC)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/litecoin-grid.mjs) | Medium-slow | 4h – 30h | 1.3–3.8 | 0.9–5.0 | 0.7–1.8 | Low–Med | High |
+| [Zcash (ZEC)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/zec-grid.mjs) | Medium-slow | 4h – 28h | 1.4–4.2 | 0.9–5.5 | 0.6–1.7 | Low–Med | High |
+| [Stellar (XLM)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/stellar-grid.mjs) | Medium-slow | 4h – 30h | 1.4–4.0 | 1.0–5.0 | 0.7–1.8 | Low | High |
+| [Chainlink (LINK)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/link-grid.mjs) | Medium-slow | 5h – 32h | 1.4–4.0 | 1.0–5.5 | 0.7–1.8 | Low–Med | High |
+| [Polkadot (DOT)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/dot-grid.mjs) | Medium-slow | 5h – 36h | 1.5–4.2 | 1.0–5.5 | 0.7–1.9 | Low–Med | High |
+| [Bitcoin (BTC)](https://github.com/tripolskypetr/pump-anomaly/blob/master/config/btc-grid.mjs) | Slow | 6h – 48h+ | 1.8–5.0 | 1.2–7.0 | 0.8–2.2 | Low | Very high |
+
+`staleMinutes` / `hardStop` / `trailingTake` / `stalenessSinceProfit` show the **range spanned by the grid** for that asset — `fit` picks within it.
+
+---
+
 ## Input contract
 
 ### `ParserItem` (channel signal)

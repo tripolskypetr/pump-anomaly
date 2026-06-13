@@ -1122,14 +1122,14 @@ interface TrainedParams {
         stability: number;
         significance: number;
         totalSamples: number;
-        /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
-        certification?: Certification;
+        /** статистический сертификат (DSR/PBO/SPA/minTRL) */
+        certification: Certification;
         /** эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse) */
-        effectiveTrials?: number;
+        effectiveTrials: number;
         /** число конфигов в гриде текущего fit */
-        innerTrials?: number;
+        innerTrials: number;
         /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
-        fitAttempts?: number;
+        fitAttempts: number;
     };
 }
 interface TrainResult {
@@ -1203,17 +1203,18 @@ declare class PumpMatrix {
     /**
      * Эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse).
      * Если fit гнали многократно — это Σ конфигов по всем попыткам, а не текущий грид.
-     * undefined у моделей до этой версии.
      */
-    get effectiveTrials(): number | undefined;
+    get effectiveTrials(): number;
+    /** Число конфигов в гриде текущего fit (внутренние испытания). */
+    get innerTrials(): number;
     /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
-    get fitAttempts(): number | undefined;
+    get fitAttempts(): number;
     /**
      * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
      * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
-     * не доказан — тогда модель торговать НЕ должна. undefined у моделей до этой версии.
+     * не доказан — тогда модель торговать НЕ должна.
      */
-    get certification(): Certification | undefined;
+    get certification(): Certification;
     /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */
     get impactHorizonMinutes(): number;
     /**

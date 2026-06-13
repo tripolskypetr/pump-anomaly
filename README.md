@@ -310,7 +310,7 @@ if (gate.allowed) {
   ledger = recordAttempt(ledger, {                // log EVERY attempt, certified or not
     ts: Date.now(),
     innerTrials: model.innerTrials,          // grid size of this fit
-    certifiedNaive: !!model.certification?.certified,
+    certifiedNaive: model.certification.certified,
   });
   // model.effectiveTrials / model.fitAttempts expose the meta-trial count for audit
 }

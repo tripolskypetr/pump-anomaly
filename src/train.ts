@@ -208,14 +208,14 @@ export interface TrainedParams {
     stability: number;
     significance: number;
     totalSamples: number;
-    /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
-    certification?: Certification;
+    /** статистический сертификат (DSR/PBO/SPA/minTRL) */
+    certification: Certification;
     /** эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse) */
-    effectiveTrials?: number;
+    effectiveTrials: number;
     /** число конфигов в гриде текущего fit */
-    innerTrials?: number;
+    innerTrials: number;
     /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
-    fitAttempts?: number;
+    fitAttempts: number;
   };
 }
 

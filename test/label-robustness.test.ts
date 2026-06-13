@@ -20,23 +20,25 @@ function flat(n: number, startTs = t0): ICandleData[] {
 }
 
 describe("labelBurst — устойчивость к ошибкам адаптера", () => {
-  it("getCandles бросает (look-ahead guard / дыра в символе) → кандидат пропущен, не краш", async () => {
+  it("getCandles бросает (look-ahead guard / дыра в символе) → adapter-error, не краш", async () => {
     const throwing: GetCandles = async () => { throw new Error("look-ahead bias protection"); };
     const res = await labelBurst(throwing, "FARTCOINUSDT", "long", t0, [EXIT()], 99, 101);
-    expect(res).toBe(null); // пропущен, исключение проглочено
+    expect(res.outcome).toBe("adapter-error"); // пропущен, исключение проглочено
+    expect(res.burst).toBe(null);
   });
 
-  it("getCandles вернул пусто → null, не краш", async () => {
+  it("getCandles вернул пусто → no-candles, не краш", async () => {
     const empty: GetCandles = async () => [];
     const res = await labelBurst(empty, "SOLUSDT", "long", t0, [EXIT()], 99, 101);
-    expect(res).toBe(null);
+    expect(res.outcome).toBe("no-candles");
+    expect(res.burst).toBe(null);
   });
 
-  it("нормальные данные → метка ставится", async () => {
+  it("нормальные данные → метка ставится (outcome=ok)", async () => {
     const ok: GetCandles = async (_s, _i, limit) => flat(limit ?? 100);
     const res = await labelBurst(ok, "SOLUSDT", "long", t0, [EXIT({ staleMinutes: 60 })], 99, 101);
-    expect(res).not.toBe(null);
-    expect(res!.byExit.size).toBe(1);
+    expect(res.outcome).toBe("ok");
+    expect(res.burst!.byExit.size).toBe(1);
   });
 });
 
@@ -71,8 +73,8 @@ describe("replayExit — усечённый горизонт (боковик)", 
       99.9, 100.1,
     );
     // вход на свече 0, forward=199: life=60 ок (truncated=false), life=720 усечён (отброшен)
-    expect(res).not.toBe(null);
-    const keys = [...res!.byExit.keys()];
+    expect(res.outcome).toBe("ok");
+    const keys = [...res.burst!.byExit.keys()];
     expect(keys.some((k) => k.includes("life60"))).toBe(true);
     expect(keys.some((k) => k.includes("life720"))).toBe(false);
   });

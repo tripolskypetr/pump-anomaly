@@ -16,6 +16,23 @@ export interface LabeledBurst {
   byExit: Map<string, ReplayResult>;
 }
 
+/**
+ * Исход разметки одного кандидата. Диагностика «немых» пустых fit: пустой результат
+ * выглядит одинаково для «нет данных» и «нет входов», а это РАЗНЫЕ проблемы (битый
+ * getCandles vs реально не было входов в зону).
+ *  - ok           — размечен, есть вход (burst != null);
+ *  - adapter-error — getCandles бросил (look-ahead guard / дыра / count-mismatch);
+ *  - no-candles    — getCandles вернул пусто (символ/диапазон не дали свечей);
+ *  - no-entry      — свечи есть, но ни один exit-набор не вошёл в зону (или все truncated).
+ */
+export type LabelOutcome = "ok" | "adapter-error" | "no-candles" | "no-entry";
+
+/** Результат labelBurst: типизированный исход + сам размеченный всплеск (null кроме ok). */
+export interface LabelResult {
+  outcome: LabelOutcome;
+  burst: LabeledBurst | null;
+}
+
 /** Стабильный строковый ключ exit-набора для кэша/grid. */
 export const exitKey = (p: ExitParams): string =>
   `tt${p.trailingTake}|hs${p.hardStop}|sp${p.stalenessSinceProfit}|sm${p.stalenessSinceMinutes}|life${p.staleMinutes}` +
@@ -34,7 +51,7 @@ export async function labelBurst(
   exitSets: ExitParams[],
   entryFromPrice?: number,
   entryToPrice?: number,
-): Promise<LabeledBurst | null> {
+): Promise<LabelResult> {
   // НЕ Math.max(...arr.map()): spread-в-аргументы переполняет стек на большом наборе.
   let maxLife = 0;
   for (const e of exitSets) if (e.staleMinutes > maxLife) maxLife = e.staleMinutes;
@@ -51,9 +68,11 @@ export async function labelBurst(
   try {
     candles = await fetchCandlesChunked(getCandles, symbol, "1m", limit, since);
   } catch {
-    return null;
+    return { outcome: "adapter-error", burst: null };
   }
-  if (!candles || candles.length === 0) return null;
+  if (!candles || candles.length === 0) {
+    return { outcome: "no-candles", burst: null };
+  }
 
   const from = entryFromPrice ?? candles[0].open;
   const to = entryToPrice ?? candles[0].open;
@@ -71,7 +90,9 @@ export async function labelBurst(
   }
 
   const anyEntered = [...byExit.values()].some((r) => r.entered);
-  if (byExit.size === 0 || !anyEntered) return null;
+  if (byExit.size === 0 || !anyEntered) {
+    return { outcome: "no-entry", burst: null };
+  }
 
-  return { symbol, direction, ts, byExit };
+  return { outcome: "ok", burst: { symbol, direction, ts, byExit } };
 }

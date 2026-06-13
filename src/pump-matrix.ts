@@ -125,6 +125,16 @@ export class PumpMatrix {
   }
 
   /**
+   * Диагностика фазы разметки: { candidates, outcomes }. Если модель пустая
+   * (totalSamples=0), причина в outcomes по LabelOutcome: "adapter-error" (getCandles
+   * бросает), "no-candles" (вернул пусто — символ/диапазон), "no-entry" (свечи есть,
+   * входов в зону нет), "ok" (размечено). Присутствуют только ненулевые исходы.
+   */
+  get labeling() {
+    return this.params.meta.labeling;
+  }
+
+  /**
    * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
    * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
    * не доказан — тогда модель торговать НЕ должна.

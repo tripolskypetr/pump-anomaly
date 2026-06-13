@@ -475,6 +475,21 @@ interface LabeledBurst {
     /** ключ exit-набора → результат replay */
     byExit: Map<string, ReplayResult>;
 }
+/**
+ * Исход разметки одного кандидата. Диагностика «немых» пустых fit: пустой результат
+ * выглядит одинаково для «нет данных» и «нет входов», а это РАЗНЫЕ проблемы (битый
+ * getCandles vs реально не было входов в зону).
+ *  - ok           — размечен, есть вход (burst != null);
+ *  - adapter-error — getCandles бросил (look-ahead guard / дыра / count-mismatch);
+ *  - no-candles    — getCandles вернул пусто (символ/диапазон не дали свечей);
+ *  - no-entry      — свечи есть, но ни один exit-набор не вошёл в зону (или все truncated).
+ */
+type LabelOutcome = "ok" | "adapter-error" | "no-candles" | "no-entry";
+/** Результат labelBurst: типизированный исход + сам размеченный всплеск (null кроме ok). */
+interface LabelResult {
+    outcome: LabelOutcome;
+    burst: LabeledBurst | null;
+}
 /** Стабильный строковый ключ exit-набора для кэша/grid. */
 declare const exitKey: (p: ExitParams) => string;
 /**
@@ -482,7 +497,7 @@ declare const exitKey: (p: ExitParams) => string;
  * прогоняет каждый exit-набор через replay. Зона входа берётся из события;
  * если не задана — точка entryFrom=entryTo=open первой свечи.
  */
-declare function labelBurst(getCandles: GetCandles, symbol: string, direction: Direction, ts: number, exitSets: ExitParams[], entryFromPrice?: number, entryToPrice?: number): Promise<LabeledBurst | null>;
+declare function labelBurst(getCandles: GetCandles, symbol: string, direction: Direction, ts: number, exitSets: ExitParams[], entryFromPrice?: number, entryToPrice?: number): Promise<LabelResult>;
 
 /** Максимум свечей в одном чанке (как CC_MAX_CANDLES_PER_REQUEST в проде). */
 declare const MAX_CANDLES_PER_CHUNK = 500;
@@ -1132,6 +1147,17 @@ interface TrainedParams {
         innerTrials: number;
         /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
         fitAttempts: number;
+        /**
+         * Диагностика фазы разметки: сколько УНИКАЛЬНЫХ кандидатов-всплесков и во что они
+         * вылились (outcomes по LabelOutcome — присутствуют только ненулевые исходы).
+         * totalSamples=0 при candidates>0 указывает причину: "adapter-error" — getCandles
+         * бросает (look-ahead/дыра/символ); "no-candles" — пусто (символ/диапазон);
+         * "no-entry" — свечи есть, но входов в зону нет. Без этого пустой fit немой.
+         */
+        labeling: {
+            candidates: number;
+            outcomes: Partial<Record<LabelOutcome, number>>;
+        };
     };
 }
 interface TrainResult {
@@ -1211,6 +1237,16 @@ declare class PumpMatrix {
     get innerTrials(): number;
     /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
     get fitAttempts(): number;
+    /**
+     * Диагностика фазы разметки: { candidates, outcomes }. Если модель пустая
+     * (totalSamples=0), причина в outcomes по LabelOutcome: "adapter-error" (getCandles
+     * бросает), "no-candles" (вернул пусто — символ/диапазон), "no-entry" (свечи есть,
+     * входов в зону нет), "ok" (размечено). Присутствуют только ненулевые исходы.
+     */
+    get labeling(): {
+        candidates: number;
+        outcomes: Partial<Record<LabelOutcome, number>>;
+    };
     /**
      * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
      * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж

@@ -14,7 +14,7 @@ import { clusterAuthors } from "./layers/cluster-authors";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
 import { ViabilityConfig } from "./types";
 import { ProgressFn, stdoutProgress } from "./progress";
-import { labelBurst, exitKey } from "./label";
+import { labelBurst, exitKey, LabelOutcome } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
@@ -216,6 +216,17 @@ export interface TrainedParams {
     innerTrials: number;
     /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
     fitAttempts: number;
+    /**
+     * Диагностика фазы разметки: сколько УНИКАЛЬНЫХ кандидатов-всплесков и во что они
+     * вылились (outcomes по LabelOutcome — присутствуют только ненулевые исходы).
+     * totalSamples=0 при candidates>0 указывает причину: "adapter-error" — getCandles
+     * бросает (look-ahead/дыра/символ); "no-candles" — пусто (символ/диапазон);
+     * "no-entry" — свечи есть, но входов в зону нет. Без этого пустой fit немой.
+     */
+    labeling: {
+      candidates: number;
+      outcomes: Partial<Record<LabelOutcome, number>>;
+    };
   };
 }
 
@@ -328,6 +339,12 @@ export async function train(
   };
   const labeledCache = new Map<string, Labeled[]>();
   const seenCluster = new Set<string>();
+  // диагностика разметки: исход каждого УНИКАЛЬНОГО всплеска. dedup по (symbol|dir|ts):
+  // один всплеск перечисляется в нескольких проходах грида — считаем исход раз, иначе
+  // счётчики раздуты числом конфигов. Пустой fit перестаёт быть немым: тэлли скажет,
+  // adapter-error / no-candles / no-entry это или реально ok.
+  const outcomeTally = new Map<LabelOutcome, number>();
+  const diagSeen = new Set<string>();
 
   const labelCandidates = async (
     cands: ReturnType<typeof enumerateBursts>,
@@ -336,17 +353,22 @@ export async function train(
     const labeled: Labeled[] = [];
     for (const b of cands) {
       const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
-      const lb = await labelBurst(
+      const { outcome, burst } = await labelBurst(
         getCandles, b.symbol, b.direction, b.ts, exitSets,
         src?.entryFromPrice, src?.entryToPrice,
       );
       onTick?.(b.symbol);
-      if (!lb) continue;
+      const diagKey = `${b.symbol}|${b.direction}|${b.ts}`;
+      if (!diagSeen.has(diagKey)) {
+        diagSeen.add(diagKey);
+        outcomeTally.set(outcome, (outcomeTally.get(outcome) ?? 0) + 1);
+      }
+      if (!burst) continue;
       const byExit = new Map<string, ExitRec>();
       // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
       // и он ДОЛЖЕН учитываться как «не вошли и не потеряли», иначе policy=veto нечестно
       // сравнивать с policy=none. Поэтому храним и не-entered, помечая флагом.
-      for (const [k, r] of lb.byExit) {
+      for (const [k, r] of burst.byExit) {
         byExit.set(k, {
           pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
           entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
@@ -764,6 +786,10 @@ export async function train(
       effectiveTrials: nTrialsEff,
       innerTrials,
       fitAttempts: opts.metaLedger ? fitAttemptCount(opts.metaLedger) + 1 : 1,
+      labeling: {
+        candidates: diagSeen.size,
+        outcomes: Object.fromEntries(outcomeTally) as Partial<Record<LabelOutcome, number>>,
+      },
     },
   };
 

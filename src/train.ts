@@ -226,6 +226,8 @@ export interface TrainedParams {
     labeling: {
       candidates: number;
       outcomes: Partial<Record<LabelOutcome, number>>;
+      /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
+      errors: Record<string, number>;
     };
   };
 }
@@ -344,6 +346,8 @@ export async function train(
   // счётчики раздуты числом конфигов. Пустой fit перестаёт быть немым: тэлли скажет,
   // adapter-error / no-candles / no-entry это или реально ok.
   const outcomeTally = new Map<LabelOutcome, number>();
+  // уникальные тексты adapter-error → сколько раз встретились (32 одинаковых схлопнутся).
+  const errorTally = new Map<string, number>();
   const diagSeen = new Set<string>();
 
   const labelCandidates = async (
@@ -353,7 +357,7 @@ export async function train(
     const labeled: Labeled[] = [];
     for (const b of cands) {
       const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
-      const { outcome, burst } = await labelBurst(
+      const { outcome, burst, error } = await labelBurst(
         getCandles, b.symbol, b.direction, b.ts, exitSets,
         src?.entryFromPrice, src?.entryToPrice,
       );
@@ -362,6 +366,7 @@ export async function train(
       if (!diagSeen.has(diagKey)) {
         diagSeen.add(diagKey);
         outcomeTally.set(outcome, (outcomeTally.get(outcome) ?? 0) + 1);
+        if (error) errorTally.set(error, (errorTally.get(error) ?? 0) + 1);
       }
       if (!burst) continue;
       const byExit = new Map<string, ExitRec>();
@@ -789,6 +794,7 @@ export async function train(
       labeling: {
         candidates: diagSeen.size,
         outcomes: Object.fromEntries(outcomeTally) as Partial<Record<LabelOutcome, number>>,
+        errors: Object.fromEntries(errorTally),
       },
     },
   };

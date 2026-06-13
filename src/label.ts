@@ -31,6 +31,8 @@ export type LabelOutcome = "ok" | "adapter-error" | "no-candles" | "no-entry";
 export interface LabelResult {
   outcome: LabelOutcome;
   burst: LabeledBurst | null;
+  /** текст брошенного getCandles исключения (только при outcome="adapter-error"). */
+  error?: string;
 }
 
 /** Стабильный строковый ключ exit-набора для кэша/grid. */
@@ -67,8 +69,11 @@ export async function labelBurst(
   let candles: ICandleData[];
   try {
     candles = await fetchCandlesChunked(getCandles, symbol, "1m", limit, since);
-  } catch {
-    return { outcome: "adapter-error", burst: null };
+  } catch (e) {
+    // НЕ глотаем текст: 32 одинаковых adapter-error немы без него. Сообщение
+    // (или String(e) для не-Error) уходит в meta.labeling для диагностики.
+    const error = e instanceof Error ? e.message : String(e);
+    return { outcome: "adapter-error", burst: null, error };
   }
   if (!candles || candles.length === 0) {
     return { outcome: "no-candles", burst: null };

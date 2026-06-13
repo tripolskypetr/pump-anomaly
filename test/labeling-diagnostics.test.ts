@@ -54,6 +54,24 @@ describe("meta.labeling — почему fit пустой", () => {
     expect(m.reliable).toBe(false);
   });
 
+  it("текст исключения getCandles попадает в labeling.errors со счётчиком (не немой)", async () => {
+    const thrower: GetCandles = async () => { throw new Error("ccxt: symbol not found"); };
+    const m = await fit(thrower);
+    // 8 одинаковых ошибок схлопываются в одну запись со счётчиком 8
+    expect(m.labeling.errors["ccxt: symbol not found"]).toBe(8);
+  });
+
+  it("не-Error throw тоже захватывается (String(e))", async () => {
+    const thrower: GetCandles = async () => { throw "raw string failure"; };
+    const m = await fit(thrower);
+    expect(m.labeling.errors["raw string failure"]).toBe(8);
+  });
+
+  it("успешный fit → errors пустой", async () => {
+    const m = await fit(goodCandles);
+    expect(Object.keys(m.labeling.errors).length).toBe(0);
+  });
+
   it("счётчик не раздут размером грида (dedup по всплеску)", async () => {
     const wideGrid = { ...grid, hardStop: [1.0, 2.0, 3.0], staleMinutes: [60, 240, 720] };
     const m = await PumpMatrix.fit(items(), async () => [], {

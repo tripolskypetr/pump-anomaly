@@ -489,6 +489,8 @@ type LabelOutcome = "ok" | "adapter-error" | "no-candles" | "no-entry";
 interface LabelResult {
     outcome: LabelOutcome;
     burst: LabeledBurst | null;
+    /** текст брошенного getCandles исключения (только при outcome="adapter-error"). */
+    error?: string;
 }
 /** Стабильный строковый ключ exit-набора для кэша/grid. */
 declare const exitKey: (p: ExitParams) => string;
@@ -1157,6 +1159,8 @@ interface TrainedParams {
         labeling: {
             candidates: number;
             outcomes: Partial<Record<LabelOutcome, number>>;
+            /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
+            errors: Record<string, number>;
         };
     };
 }
@@ -1238,14 +1242,16 @@ declare class PumpMatrix {
     /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
     get fitAttempts(): number;
     /**
-     * Диагностика фазы разметки: { candidates, outcomes }. Если модель пустая
+     * Диагностика фазы разметки: { candidates, outcomes, errors }. Если модель пустая
      * (totalSamples=0), причина в outcomes по LabelOutcome: "adapter-error" (getCandles
      * бросает), "no-candles" (вернул пусто — символ/диапазон), "no-entry" (свечи есть,
-     * входов в зону нет), "ok" (размечено). Присутствуют только ненулевые исходы.
+     * входов в зону нет), "ok" (размечено). errors — уникальные тексты исключений
+     * getCandles со счётчиком (чтобы adapter-error не был немым).
      */
     get labeling(): {
         candidates: number;
         outcomes: Partial<Record<LabelOutcome, number>>;
+        errors: Record<string, number>;
     };
     /**
      * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,

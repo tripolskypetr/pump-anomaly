@@ -125,10 +125,11 @@ export class PumpMatrix {
   }
 
   /**
-   * Диагностика фазы разметки: { candidates, outcomes }. Если модель пустая
+   * Диагностика фазы разметки: { candidates, outcomes, errors }. Если модель пустая
    * (totalSamples=0), причина в outcomes по LabelOutcome: "adapter-error" (getCandles
    * бросает), "no-candles" (вернул пусто — символ/диапазон), "no-entry" (свечи есть,
-   * входов в зону нет), "ok" (размечено). Присутствуют только ненулевые исходы.
+   * входов в зону нет), "ok" (размечено). errors — уникальные тексты исключений
+   * getCandles со счётчиком (чтобы adapter-error не был немым).
    */
   get labeling() {
     return this.params.meta.labeling;

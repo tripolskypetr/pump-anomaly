@@ -859,6 +859,67 @@ declare function certifyStrategy(inp: CertificationInput, thresholds?: {
 }): Certification;
 
 /**
+ * Мета-учёт переобучений — против МЕТА-winner's-curse.
+ *
+ * Проблема (Tripolsky): DSR штрафует N конфигов ВНУТРИ одного fit, но если гонять
+ * fit 720 раз за месяц (ежечасно) и торговать только когда выпал certified=true —
+ * это повторный перебор УЖЕ ПО ВРЕМЕНИ. Каждый «сертифицированный» прогон может быть
+ * тем самым выбросом среди 720 попыток. Сертификат на отдельном fit слеп к цепочке.
+ *
+ * Лечение (двухчастное):
+ *  1) CADENCE GUARD: запрет частого переобучения. fit разрешён не чаще minRefitMs
+ *     (дни/недели, не часы). Частые refit = размножение испытаний.
+ *  2) FAMILY-WISE коррекция: эффективное число испытаний = N_внутри × число_fit_попыток.
+ *     ВСЕ попытки логируются (не только certified), иначе знаменатель занижен и
+ *     поправка лжёт. DSR на эффективном N нейтрализует мета-curse (доказано тестом:
+ *     720 fit на шуме → наивно 2 ложных, мета 0).
+ */
+interface FitAttempt {
+    /** когда запущен fit (ms epoch) */
+    ts: number;
+    /** число конфигов в гриде этого fit (внутренние испытания) */
+    innerTrials: number;
+    /** сертифицирован ли ЭТОТ fit по собственному (наивному) критерию */
+    certifiedNaive: boolean;
+}
+interface MetaLedgerState {
+    /** ВСЕ попытки fit, не только успешные — иначе знаменатель занижен */
+    attempts: FitAttempt[];
+}
+interface MetaPolicy {
+    /** минимальный интервал между fit (ms). По умолчанию 7 дней. */
+    minRefitMs: number;
+}
+declare const DEFAULT_META_POLICY: MetaPolicy;
+/** Пустой реестр. */
+declare function emptyLedger(): MetaLedgerState;
+/**
+ * Разрешён ли новый fit сейчас по cadence-политике. Возвращает {allowed, reason,
+ * nextAllowedTs}. Частое переобучение размножает испытания → запрещаем.
+ */
+declare function canRefit(ledger: MetaLedgerState, now: number, policy?: MetaPolicy): {
+    allowed: boolean;
+    reason: string;
+    nextAllowedTs: number;
+};
+/** Регистрирует попытку fit (ЛЮБУЮ — и certified, и нет). Возвращает новый реестр. */
+declare function recordAttempt(ledger: MetaLedgerState, attempt: FitAttempt): MetaLedgerState;
+/**
+ * Эффективное число испытаний для family-wise коррекции DSR: суммарно по ВСЕМ
+ * fit-попыткам, не только текущей. Если за месяц было M fit-ов с N конфигов каждый —
+ * эффективно перебрано до Σ Nᵢ гипотез. Это и есть честный знаменатель для DSR.
+ *
+ * Используется как nTrials в deflatedSharpe вместо одного board.length. Так
+ * сертификат учитывает, что ты гонял fit многократно и выбираешь успешные.
+ */
+declare function effectiveTrials(ledger: MetaLedgerState, currentInnerTrials: number): number;
+/**
+ * Сколько РАЗ был запущен fit (длина цепочки попыток + текущая). Для отчёта и для
+ * грубой Bonferroni-поправки порога значимости при желании.
+ */
+declare function fitAttemptCount(ledger: MetaLedgerState): number;
+
+/**
  * Параметры выбора конфигурации и валидации. Вынесены в одно место, чтобы в логике
  * train не было магических литералов — каждое число здесь именовано и объяснено.
  */
@@ -953,6 +1014,13 @@ interface TrainOptions {
     policy?: SignalPolicy;
     /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
     selection?: Partial<SelectionConfig>;
+    /**
+     * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан,
+     * DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам, а не
+     * только текущему. Так сертификат учитывает, что fit гоняли многократно.
+     * Без него (undefined) — поправки нет (одиночный fit, наивный N).
+     */
+    metaLedger?: MetaLedgerState;
 }
 /**
  * Запись истории одного сигнала для внешней аналитики (dump()).
@@ -1038,6 +1106,12 @@ interface TrainedParams {
         totalSamples: number;
         /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
         certification?: Certification;
+        /** эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse) */
+        effectiveTrials?: number;
+        /** число конфигов в гриде текущего fit */
+        innerTrials?: number;
+        /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
+        fitAttempts?: number;
     };
 }
 interface TrainResult {
@@ -1108,6 +1182,14 @@ declare class PumpMatrix {
     get reliable(): boolean;
     /** Доверие к модели 0..1. */
     get confidence(): number;
+    /**
+     * Эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse).
+     * Если fit гнали многократно — это Σ конфигов по всем попыткам, а не текущий грид.
+     * undefined у моделей до этой версии.
+     */
+    get effectiveTrials(): number | undefined;
+    /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
+    get fitAttempts(): number | undefined;
     /**
      * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
      * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
@@ -1241,5 +1323,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, GetCandles, ICandleData, LabeledBurst, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
+export type { AuthorMap, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

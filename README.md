@@ -290,7 +290,32 @@ A loop then closes itself: a scheduler ticks → fresh `ParserItem[]` + `getCand
 Two invariants keep this honest rather than dangerous:
 
 1. **The certificate stays out of the optimization loop.** An orchestrator (or LLM operator) may decide *whether* to retrain or escalate, but must never tune the grid/thresholds to *pass* the certificate — that would turn the independent judge back into an overfitter.
-2. **Re-fitting multiplies trials at the meta level.** DSR penalizes N *within* one `fit`, but not the fact that you run `fit` hundreds of times and trade only when one comes back certified. Retrain on a slow cadence (days/weeks, not minutes) and log *every* tick, not only the certified ones.
+2. **Re-fitting multiplies trials at the meta level.** DSR penalizes N *within* one `fit`, but not the fact that a loop runs `fit` hundreds of times and trades only when one comes back certified — each "certified" run can itself be the outlier among, say, 720 monthly attempts. A single-`fit` certificate is blind to this chain.
+
+### Meta-overfitting guard (`meta-ledger.ts`)
+
+Invariant 2 is **enforced in code**, not left to operator discipline. A serializable `MetaLedgerState` records *every* `fit` attempt (the loop's state between ticks), and two mechanisms close the meta-curse:
+
+- **Cadence guard** — `canRefit(ledger, now, policy?)` refuses a `fit` that comes too soon after the last one (`minRefitMs`, default **1 week**). Frequent re-fitting *is* trial multiplication, so it is simply disallowed, with a human-readable `reason` and `nextAllowedTs`.
+- **Family-wise correction** — pass `metaLedger` to `fit` and DSR's N becomes `effectiveTrials` = Σ configs across **all** past attempts, not just the current grid. The denominator is honest only because **every** attempt is logged (`recordAttempt` stores `certifiedNaive: false` runs too) — logging only the successes would understate N and make the correction lie.
+
+```ts
+import { emptyLedger, recordAttempt, canRefit, effectiveTrials } from "pump-anomaly";
+
+let ledger = emptyLedger();                       // persist between ticks (loop state)
+const gate = canRefit(ledger, Date.now());        // too-frequent refit? → { allowed, reason, nextAllowedTs }
+if (gate.allowed) {
+  const model = await PumpMatrix.fit(history, getCandles, { metaLedger: ledger });
+  ledger = recordAttempt(ledger, {                // log EVERY attempt, certified or not
+    ts: Date.now(),
+    innerTrials: model.innerTrials ?? 0,          // grid size of this fit
+    certifiedNaive: !!model.certification?.certified,
+  });
+  // model.effectiveTrials / model.fitAttempts expose the meta-trial count for audit
+}
+```
+
+The guarantee is verified: 720 `fit` runs on pure noise produce false naive certificates, and the family-wise correction drops them to **0** — while a genuine 0.75σ edge survives the same correction (`meta-ledger.test.ts`). So the loop *cannot* "click" its way to a certificate by re-running, and the engine becomes safe-by-construction rather than safe-by-discipline.
 
 ---
 
@@ -425,6 +450,9 @@ model.signals(items, { allow: ["enter"] });  // direct entries only
 model.reliable;              // did training have enough data
 model.confidence;            // 0..1 trust in the model
 model.certification;         // five-barrier edge certificate (DSR/PBO/SPA/minTRL/nested)
+model.effectiveTrials;       // family-wise meta-trial count (Σ configs over all fit attempts)
+model.innerTrials;           // grid size of this fit
+model.fitAttempts;           // how many times fit has run in the chain
 model.impactHorizonMinutes;  // empirical post impact horizon (global level)
 model.mode;                  // "matrix" | "single" — how the model was trained
 model.modeReason;            // honest diagnostics: WHY this mode was chosen
@@ -553,7 +581,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 
 ## Tests
 
-**496 tests** across **47 test files**. All passing.
+**505 tests** across **48 test files**. All passing.
 
 | File | Tests | What is covered |
 |------|-------|-----------------|
@@ -604,6 +632,7 @@ All five are computed over the stationarity window. In single mode the matrix is
 | `e2e/certification.test.ts` | 14 | 500-signal scenarios with known truth: DSR certifies a real edge, rejects noise / single-outlier edge / regime-shift; `minTRL`, PBO, SPA, full `certifyStrategy` five-barrier gate |
 | `e2e/fit-certification.test.ts` | 3 | `fit` attaches the certificate: small sample (17 trades) → `certified:false` with reasons, survives `save`/`load`, present on the model facade |
 | `e2e/fit-noise-rejection.test.ts` | 1 | Full `fit` on a pure random walk → `certified:false` even though grid argmax picks a "best" config (the certificate catches the brute-force artifact `reliable` alone would miss) |
+| `meta-ledger.test.ts` | 9 | Meta-overfitting guard: cadence guard blocks too-frequent refits, `effectiveTrials` sums ALL fit attempts (not only certified ones), family-wise DSR drops false certificates from 720 noise refits to 0 while a strong edge survives the correction |
 
 ```bash
 npm test

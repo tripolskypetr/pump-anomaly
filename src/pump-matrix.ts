@@ -106,6 +106,25 @@ export class PumpMatrix {
   }
 
   /**
+   * Эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse).
+   * Если fit гнали многократно — это Σ конфигов по всем попыткам, а не текущий грид.
+   * undefined у моделей до этой версии.
+   */
+  get effectiveTrials(): number | undefined {
+    return this.params.meta.effectiveTrials;
+  }
+
+  /** Число конфигов в гриде текущего fit (внутренние испытания). undefined у моделей до этой версии. */
+  get innerTrials(): number | undefined {
+    return this.params.meta.innerTrials;
+  }
+
+  /** Сколько раз всего запускался fit (прозрачность мета-перебора). */
+  get fitAttempts(): number | undefined {
+    return this.params.meta.fitAttempts;
+  }
+
+  /**
    * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
    * SPA p ≤ 0.05, N ≥ minTRL, nested OOS > 0). certified=false с reasons, если эдж
    * не доказан — тогда модель торговать НЕ должна. undefined у моделей до этой версии.

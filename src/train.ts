@@ -20,6 +20,7 @@ import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
 import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, pnlStats, PnlStats } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
+import { MetaLedgerState, effectiveTrials, fitAttemptCount } from "./meta-ledger";
 import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
@@ -67,25 +68,22 @@ export interface TrainGrid {
 }
 
 export const DEFAULT_GRID: TrainGrid = {
-  // detector (authorship matrix)
-  windowK:          [2, 3, 5],
-  minClusters:      [2, 3],
+  windowK: [2, 3, 5],
+  minClusters: [2, 3],
   jaccardThreshold: [0.2, 0.3, 0.4],
   lagPeakThreshold: [0.4, 0.5, 0.6],
-  // prod exit (label set by replay)
-  trailingTake:         [0.5, 1.0, 2.0],
-  hardStop:             [1.0, 2.0, 3.0],
+  trailingTake: [0.5, 1.0, 2.0],
+  hardStop: [1.0, 2.0, 3.0],
   stalenessSinceProfit: [1.0],
-  stalenessSinceMinutes:[240],
-  staleMinutes:         [60, 240, 720, 1440],   // impact horizon: 1h / 4h / 12h / 24h
-  // liquidation-cascade detector
-  volZThreshold:    [1.5, 2.5],                 // when volume is anomalous
-  squeezePolicy:    ["none", "tighten", "veto", "invert"],
-  squeezeThreshold: [0.55, 0.7],
-  volBaselineWindow:[20],
-  cascadeWindowMinutes: [15, 30, 60, 120, 240],           // cascade-detection window — NOT the holding horizon
-  // stationarity window (long horizon)
-  stationarityWindowMs: [7*24*3600_000, 14*24*3600_000, 28*24*3600_000, 56*24*3600_000],
+  stalenessSinceMinutes: [240],
+  staleMinutes: [60, 240, 720, 1440], // 1ч / 4ч / 12ч / 24ч — какой импакт-горизонт лучше
+  volZThreshold: [1.5, 2.5],          // когда считать объём аномальным (накопление топлива)
+  squeezePolicy: ["none", "tighten", "veto", "invert"], // train выберет реакцию по CV
+  squeezeThreshold: [0.55, 0.7],      // доля объёма против позиции для срабатывания
+  volBaselineWindow: [20],
+  cascadeWindowMinutes: [15, 30, 60], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
+  // вся история + конечные окна (4 / 8 недель); train выберет по CV
+  stationarityWindowMs: [Infinity, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
 };
 
 export interface TrainOptions {
@@ -111,6 +109,13 @@ export interface TrainOptions {
   policy?: SignalPolicy;
   /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
   selection?: Partial<SelectionConfig>;
+  /**
+   * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан,
+   * DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам, а не
+   * только текущему. Так сертификат учитывает, что fit гоняли многократно.
+   * Без него (undefined) — поправки нет (одиночный fit, наивный N).
+   */
+  metaLedger?: MetaLedgerState;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -201,6 +206,12 @@ export interface TrainedParams {
     totalSamples: number;
     /** статистический сертификат (DSR/PBO/SPA/minTRL); optional для обратной совместимости */
     certification?: Certification;
+    /** эффективное число испытаний с family-wise поправкой на цепочку fit (мета-curse) */
+    effectiveTrials?: number;
+    /** число конфигов в гриде текущего fit */
+    innerTrials?: number;
+    /** сколько раз всего запускался fit (для прозрачности мета-перебора) */
+    fitAttempts?: number;
   };
 }
 
@@ -563,9 +574,16 @@ export async function train(
     .map((e) => sharpe(e._returns));
   const varSR = variance(trialSharpes);
 
+  // эффективное число испытаний: family-wise по ВСЕМ fit-попыткам (мета-curse),
+  // а не только текущему гриду. Без metaLedger — наивный board.length (одиночный fit).
+  const innerTrials = Math.max(board.length, 1);
+  const nTrialsEff = opts.metaLedger
+    ? effectiveTrials(opts.metaLedger, innerTrials)
+    : innerTrials;
+
   const certification = certifyStrategy({
     selectedReturns: top._returns,
-    nTrials: Math.max(board.length, 1),
+    nTrials: nTrialsEff,
     varSRAcrossTrials: varSR,
     perfMatrix: evenFolds ? perfRows : [],
     candidateReturns: candPool.length ? candPool : [top._returns],
@@ -732,6 +750,9 @@ export async function train(
       support: reliability.support, stability: reliability.stability,
       significance: reliability.significance, totalSamples: reliability.totalN,
       certification,
+      effectiveTrials: nTrialsEff,
+      innerTrials,
+      fitAttempts: opts.metaLedger ? fitAttemptCount(opts.metaLedger) + 1 : 1,
     },
   };
 

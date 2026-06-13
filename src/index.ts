@@ -165,3 +165,4 @@ export type { SelectionConfig } from "./selection";
 export { stdoutProgress, silentProgress } from "./progress";
 export type { ProgressFn, ProgressEvent } from "./progress";
 export * from "./statistics";
+export * from "./meta-ledger";

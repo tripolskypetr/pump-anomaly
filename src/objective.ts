@@ -91,6 +91,41 @@ export function percentile(xs: number[], p: number): number {
   return sorted[lo] * (1 - frac) + sorted[hi] * frac;
 }
 
+/**
+ * КВАНТИЛЬНЫЕ ПРЕДЛОЖЕНИЯ EXIT из статистики пути (MAE/MFE-анализ, Sweeney).
+ *
+ * Перебор сетки судит конфиги по финальному pnl, выбрасывая информацию о пути.
+ * Путь же говорит напрямую: у ПОБЕДИТЕЛЕЙ адверс-экскурсия (|MAE|) компактна, у
+ * лузеров — тяжёлый хвост → стоп сразу за p90 |MAE| победителей режет лузеров,
+ * почти не задевая винеров. Аналогично trailing: quantиль отката от пика,
+ * который победители реально отдавали (peak − pnl). Это оценка ДВУХ квантилей
+ * по всем сделкам сразу — на порядок эффективнее по данным, чем независимый
+ * скоринг тысяч конфигов.
+ *
+ * Возвращает КАНДИДАТОВ (в %), а не решение: refinement подаёт их в CV наравне
+ * с сеточными вариантами — принимаются только при значимом улучшении (SE-гвард).
+ * Мало победителей (< minWinners) → пустые списки: по 5 сделкам квантили — шум.
+ */
+export interface PathExitProposals {
+  hardStop: number[];
+  trailingTake: number[];
+}
+export function exitProposalsFromPath(
+  rows: Array<{ pnl: number; peak: number; trough: number; entered: boolean }>,
+  minWinners = 10,
+): PathExitProposals {
+  const winners = rows.filter((r) => r.entered && r.pnl > 0);
+  if (winners.length < minWinners) return { hardStop: [], trailingTake: [] };
+  const mae = winners.map((r) => Math.abs(Math.min(r.trough, 0)) * 100).filter((v) => v > 0);
+  const giveback = winners.map((r) => Math.max(r.peak - r.pnl, 0) * 100).filter((v) => v > 0);
+  const q = (xs: number[], ps: number[]) =>
+    xs.length >= minWinners ? ps.map((p) => +percentile(xs, p).toFixed(4)) : [];
+  return {
+    hardStop: q(mae, [0.9, 0.95]),
+    trailingTake: q(giveback, [0.75, 0.9]),
+  };
+}
+
 /** Статистика risk-reward по набору сделок. */
 export interface RiskRewardStats {
   /** среднее RR */

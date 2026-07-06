@@ -42,7 +42,21 @@ export function earlyWarning(
       const channels = new Set(slice.map((e) => e.channel));
 
       if (clusters.size >= cfg.minClusters) {
-        const dedup = clusters.size / channels.size;
+        // ЭФФЕКТИВНОЕ число независимых авторов (participation ratio, число Хилла):
+        // N_eff = 1/Σp², p_c — доля событий кластера c в срезе. Целочисленный
+        // clusters.size слеп к дисбалансу: {5 постов автора A, 1 пост B} — это не
+        // «2 независимых источника», а 1.4. Гейт остаётся на clusters.size
+        // (консервативная совместимость), но confidence взвешивается N_eff —
+        // ошибки кластеризации деградируют плавно, а не ступенькой.
+        const perCluster = new Map<number | undefined, number>();
+        for (const e of slice) {
+          const c = clusterOf.get(e.channel);
+          perCluster.set(c, (perCluster.get(c) ?? 0) + 1);
+        }
+        let sumP2 = 0;
+        for (const cnt of perCluster.values()) sumP2 += (cnt / slice.length) ** 2;
+        const nEff = 1 / sumP2;
+        const dedup = nEff / channels.size;
         const fill = Math.min(slice.length / (cfg.minClusters * 2), 1);
         const burst = hawkesBurst(groupTs, hi, tau);
         const lw = influence
@@ -55,6 +69,7 @@ export function earlyWarning(
           action: "open",
           ts: evs[hi].ts,
           independentClusters: clusters.size,
+          nEffClusters: +nEff.toFixed(3),
           totalChannels: channels.size,
           confidence,
           burstScore: +burst.score.toFixed(6),

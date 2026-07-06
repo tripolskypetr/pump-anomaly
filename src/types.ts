@@ -91,6 +91,10 @@ export interface PumpVerdict {
   /** зона входа из parser-item — нужна для открытия live-позиции */
   entryFromPrice?: number;
   entryToPrice?: number;
+  /** ЭФФЕКТИВНОЕ число независимых авторов всплеска (participation ratio, дробное):
+   *  {5 постов A, 1 пост B} → 1.4, а не «2 кластера». Гейт minClusters остаётся
+   *  на целочисленном independentClusters; N_eff взвешивает confidence. */
+  nEffClusters?: number;
   /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
   burstScore?: number;
   /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */

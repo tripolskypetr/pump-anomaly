@@ -79,6 +79,12 @@ export interface TradeSignal {
   entryToPrice?: number;
   /** готовый exit-план */
   exit: ExitPlan;
+  /**
+   * ПРОГНОЗ модели исхода: калиброванная P(win) и ожидаемый pnl (доли, нетто).
+   * informative=false = модель не побила prior по OOF-Brier — pWin равен prior,
+   * не притворяясь точнее данных. null = модель не обучалась (мало сделок).
+   */
+  probability?: { pWin: number; expectedPnl: number; informative: boolean } | null;
   /** происхождение (аудит), не для ветвления */
   origin: SignalOrigin;
 }
@@ -185,6 +191,18 @@ export interface SignalPolicy {
    * 10% минутного оборота — уже двигаешь цену). Тighten-only: min(trained, requested).
    */
   maxLiquidityShare?: number;
+  /**
+   * Порог калиброванной вероятности выигрыша (модель исхода): сигнал с
+   * probability.pWin ниже порога режется. Работает и при informative=false
+   * (тогда сравнивается prior). Тighten-only: max(trained, requested).
+   */
+  minPWin?: number;
+  /**
+   * Порог ожидаемой ценности, % на сделку: режем сигналы с E[pnl|x] ниже.
+   * Решение о входе как решение об ожидаемой ценности, а не о ступеньках.
+   * Тighten-only: max(trained, requested).
+   */
+  minExpectedPnlPct?: number;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -230,5 +248,7 @@ export function intersectPolicy(
     // ёмкость: больший размер / меньшая доля оборота = строже отбор
     notionalQuote: tightenMax(trained.notionalQuote, requested?.notionalQuote),
     maxLiquidityShare: tightenMin(trained.maxLiquidityShare, requested?.maxLiquidityShare),
+    minPWin: tightenMax(trained.minPWin, requested?.minPWin),
+    minExpectedPnlPct: tightenMax(trained.minExpectedPnlPct, requested?.minExpectedPnlPct),
   };
 }

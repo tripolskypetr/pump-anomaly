@@ -21,6 +21,7 @@ import {
 import { Certification } from "./statistics";
 import { MetaLedgerState } from "./meta-ledger";
 import { Calibration } from "./calibrate";
+import { predictOutcome } from "./outcome-model";
 
 /**
  * Casual-фасад с ЕДИНЫМ стабильным контрактом ввода-вывода.
@@ -114,12 +115,12 @@ export class PumpMatrix {
     const {
       allow, minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
-      notionalQuote, maxLiquidityShare,
+      notionalQuote, maxLiquidityShare, minPWin, minExpectedPnlPct,
     } = this.params.policy;
     return {
       allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
-      notionalQuote, maxLiquidityShare,
+      notionalQuote, maxLiquidityShare, minPWin, minExpectedPnlPct,
     };
   }
 
@@ -643,19 +644,40 @@ export class PumpMatrix {
     // режем консервативно (signals() без свечей с этим флагом всегда пуст — см. policy).
     if (policy.requireVolumeConfirm && volRegime !== "anomalous") return null;
 
+    // momentum до сигнала — нужен и гейту, и модели исхода; считается один раз
+    let momentumVal: number | null = null;
+    if (candles && candles.length > 0) {
+      const startTs = entryStartTs(v.ts, "1m");
+      let preEnd = candles.findIndex((c) => c.timestamp >= startTs);
+      if (preEnd < 0) preEnd = candles.length; // вся серия до сигнала
+      momentumVal = momentumPct(candles, preEnd, policy.momentumWindowMinutes ?? 1440);
+    }
+
     // ── MOMENTUM-ФИЛЬТР (эдж из habr 1041898): цена уже двигалась не против ──
     // сигнала ДО публикации (приток реального капитала). Momentum считается по
     // свечам СТРОГО до сигнальной минуты — без look-ahead. Нет свечей/окна →
     // подтвердить нечем → режем консервативно.
     if (policy.minMomentum24hPct !== undefined) {
-      if (!candles || candles.length === 0) return null;
-      const startTs = entryStartTs(v.ts, "1m");
-      let preEnd = candles.findIndex((c) => c.timestamp >= startTs);
-      if (preEnd < 0) preEnd = candles.length; // вся серия до сигнала
-      const m = momentumPct(candles, preEnd, policy.momentumWindowMinutes ?? 1440);
-      if (m === null) return null;
-      const directional = dir === "long" ? m : -m;
+      if (momentumVal === null) return null;
+      const directional = dir === "long" ? momentumVal : -momentumVal;
       if (directional < policy.minMomentum24hPct) return null;
+    }
+
+    // ── МОДЕЛЬ ИСХОДА: калиброванная P(win|признаки) и ожидаемая ценность ──
+    // Мягкая замена ступенчатых гейтов: каждый признак — вклад в правдоподобие,
+    // отсутствующий признак честно даёт 0. Гейты minPWin / minExpectedPnlPct
+    // превращают вход в решение об ожидаемой ценности.
+    let probability: { pWin: number; expectedPnl: number; informative: boolean } | null = null;
+    if (this.params.outcome) {
+      const pred = predictOutcome(this.params.outcome, {
+        clusters: v.independentClusters ?? null,
+        momentum: momentumVal,
+        algo: v.channel !== null ? this.params.channelScore?.[v.channel]?.algoScore ?? null : null,
+        burst: v.burstScore ?? null,
+      });
+      probability = pred;
+      if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) return null;
+      if (policy.minExpectedPnlPct !== undefined && pred.expectedPnl * 100 < policy.minExpectedPnlPct) return null;
     }
 
     let resolved = volRegime
@@ -727,7 +749,7 @@ export class PumpMatrix {
     return {
       symbol: v.symbol, direction: finalDir, action, ts: v.ts,
       entryFromPrice: v.entryFromPrice, entryToPrice: v.entryToPrice,
-      exit: plan, origin,
+      exit: plan, probability, origin,
     };
   }
 }

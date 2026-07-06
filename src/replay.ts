@@ -78,8 +78,11 @@ export interface ReplayResult {
    */
   pnl: number;
   reason: ExitReason;
-  /** пиковый PnL% за жизнь позиции */
+  /** пиковый PnL% за жизнь позиции (MFE) */
   peak: number;
+  /** наихудший PnL% за жизнь позиции (MAE, ≤0; при стопе = −hardStop%) — сырьё для
+   *  квантильного подбора стопа: p90 |MAE| победителей режет лузеров, не задевая винеров */
+  trough: number;
   /** минут от входа до выхода */
   heldMinutes: number;
   entered: boolean;
@@ -145,7 +148,7 @@ export function replayExit(
   }
   if (entryIdx < 0 || !(entryPrice > 0)) {
     return {
-      pnl: 0, reason: "no-entry", peak: 0, heldMinutes: 0, entered: false,
+      pnl: 0, reason: "no-entry", peak: 0, trough: 0, heldMinutes: 0, entered: false,
       entryPrice: 0, exitPrice: 0,
       volZ: 0, squeezePressure: 0, volRegime: "calm", inverted: false, truncated: false,
     };
@@ -166,7 +169,7 @@ export function replayExit(
   const sqThr = p.squeezeThreshold ?? 0.6;
   if (p.squeezePolicy === "veto" && sqPressure >= sqThr) {
     return {
-      pnl: 0, reason: "cascade-veto", peak: 0, heldMinutes: 0, entered: false,
+      pnl: 0, reason: "cascade-veto", peak: 0, trough: 0, heldMinutes: 0, entered: false,
       entryPrice, exitPrice: 0,
       volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated: false,
     };
@@ -211,6 +214,7 @@ export function replayExit(
 
   let peak = 0;                 // пиковый PnL за жизнь (доли)
   let peakMinute = 0;          // минута достижения пика
+  let trough = 0;              // наихудший PnL за жизнь (MAE, доли, ≤0)
 
   const forwardAvail = candles.length - entryIdx - 1;
   const lifeCap = Math.min(p.staleMinutes, forwardAvail);
@@ -233,6 +237,7 @@ export function replayExit(
     // 1) HARD STOP — внутрисвечной прокол против позиции на hardStop% от входа.
     //    Приоритет стопа над тейком в той же свече (консервативно, как в проде стоп жёсткий).
     if (worst <= -hardStopFrac) {
+      trough = -hardStopFrac; // реализованная адверс-экскурсия ограничена стопом
       // ЧЕСТНЫЙ реализованный PnL: стоп исполняется на уровне -hardStop%, это и есть
       // результат сделки. Раньше возвращался lastPositivePeak (≥0), из-за чего стоп
       // НИКОГДА не показывал убыток — это завышало pnl и отравляло RR/CV-объектив
@@ -240,13 +245,15 @@ export function replayExit(
       return {
         pnl: -hardStopFrac - costFrac - entrySlip - slipOf(c),
         reason: "hard-stop",
-        peak,
+        peak, trough,
         heldMinutes: minute,
         entered: true,
         entryPrice, exitPrice: exitPriceOf(entryPrice, -hardStopFrac, dir),
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
+
+    if (worst < trough) trough = worst; // MAE по внутрисвечному худшему
 
     // обновляем пик по лучшему внутрисвечному PnL
     if (best > peak) {
@@ -267,7 +274,7 @@ export function replayExit(
       return {
         pnl: closePnl - costFrac - entrySlip - slipOf(c),
         reason: "trailing-take",
-        peak,
+        peak, trough,
         heldMinutes: minute,
         entered: true,
         entryPrice, exitPrice: c.close,
@@ -283,7 +290,7 @@ export function replayExit(
       return {
         pnl: closePnl - costFrac - entrySlip - slipOf(c),
         reason: "peak-staleness",
-        peak,
+        peak, trough,
         heldMinutes: minute,
         entered: true,
         entryPrice, exitPrice: c.close,
@@ -299,7 +306,7 @@ export function replayExit(
   return {
     pnl: finalPnl - costFrac - entrySlip - slipOf(candles[lastIdx]),
     reason: "life-cap",
-    peak,
+    peak, trough,
     heldMinutes: lifeCap,
     entered: true,
     entryPrice, exitPrice: exitPriceOf(entryPrice, finalPnl, dir),

@@ -8,6 +8,9 @@ import { GetCandles, entryStartTs } from "./candle";
 import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
 import { momentumPct } from "./volume";
 import { algoSignatureOf } from "./layers/algo-signature";
+import { hawkesBurst } from "./layers/hawkes-burst";
+import { OutcomeModel, OutcomeRow, fitOutcomeModel } from "./outcome-model";
+import { SignalEvent } from "./types";
 import { enumerateBursts, enumeratePosts } from "./enumerate";
 import { buildTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
@@ -21,7 +24,7 @@ import { labelBurst, exitKey, LabelOutcome } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats, percentile } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats, percentile, exitProposalsFromPath } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
 import {
   MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
@@ -164,6 +167,17 @@ export interface TrainOptions {
    */
   channelTriage?: boolean;
   /**
+   * Модель исхода (P(win|признаки)): по умолчанию строится, если сделок достаточно.
+   * false — не строить (params.outcome = null).
+   */
+  outcomeModel?: boolean;
+  /**
+   * Принудительно считать momentum-фичу для модели исхода, даже если ось
+   * momentumGatePct не перебирается (стоит пре-фетча свечей на кандидата).
+   * По умолчанию фича есть только когда её уже считает гейт-ось.
+   */
+  momentumFeature?: boolean;
+  /**
    * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
    * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
    * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
@@ -285,6 +299,15 @@ export interface TrainedParams {
    * Отключается opts.channelTriage: false. Сериализуется.
    */
   channelPlan?: Record<string, "invert" | "drop">;
+  /**
+   * МОДЕЛЬ ИСХОДА: калиброванная P(win|признаки) поверх torгуемого потока
+   * (наивный Байес с изотонными маржиналами + OOF-калибровка, см. outcome-model.ts).
+   * Признаки: independentClusters, momentum до поста (если считался), algoScore
+   * канала, hawkes-burstScore. Рантайм отдаёт probability в каждом TradeSignal
+   * и применяет гейты policy.minPWin / minExpectedPnlPct. null = данных мало
+   * или модель не лучше prior (informative-гвард честно отключает её).
+   */
+  outcome?: OutcomeModel | null;
   /**
    * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
    * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -541,7 +564,7 @@ export async function train(
   type ExitRec = {
     pnl: number; volRegime: import("./volume").VolRegime; entered: boolean;
     entryPrice: number; exitPrice: number; reason: string; heldMinutes: number;
-    peak: number; inverted: boolean;
+    peak: number; trough: number; inverted: boolean;
   };
   type Labeled = {
     channel: string; symbol: string; direction: "long" | "short"; ts: number;
@@ -560,7 +583,7 @@ export async function train(
   const momentumWindow = opts.momentumWindowMinutes ?? 1440;
   const momentumAxis: Array<number | null> =
     grid.momentumGatePct.length ? grid.momentumGatePct : [null];
-  const needMomentum = momentumAxis.some((g) => g !== null);
+  const needMomentum = momentumAxis.some((g) => g !== null) || opts.momentumFeature === true;
   // promise-кэш: конкурентный пул разметки не должен считать фичу дважды
   const preMomCache = new Map<string, Promise<number | null>>();
   const preMomentumOf = (symbol: string, ts: number): Promise<number | null> => {
@@ -634,7 +657,7 @@ export async function train(
           byExit.set(k, {
             pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
             entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
-            heldMinutes: r.heldMinutes, peak: r.peak, inverted: r.inverted,
+            heldMinutes: r.heldMinutes, peak: r.peak, trough: r.trough, inverted: r.inverted,
           });
         }
         if (byExit.size === 0) continue;
@@ -948,6 +971,23 @@ export async function train(
           if (mid !== curGate) variants.push({ exit: curExit, gate: mid });
         }
       }
+      // ── КВАНТИЛЬНЫЕ ПРЕДЛОЖЕНИЯ ИЗ ПУТИ (MAE/MFE-анализ, первый раунд) ──
+      // Стоп из p90|MAE| победителей и trailing из квантилей отдачи пика: путь
+      // сделок предлагает значения НАПРЯМУЮ (сеточные узлы могли их не содержать),
+      // а CV с SE-гвардом судит их наравне с геосерединами — предложение ≠ решение.
+      if (r === 0) {
+        const topKey = exitKey(curExit);
+        const pathRows = labeledWin
+          .filter((b) => b.independentClusters >= minC && passGate(b, curGate) && b.byExit.has(topKey))
+          .map((b) => b.byExit.get(topKey)!);
+        const proposals = exitProposalsFromPath(pathRows);
+        for (const hs of proposals.hardStop) {
+          if (hs > 0 && hs !== curExit.hardStop) variants.push({ exit: { ...curExit, hardStop: hs }, gate: curGate });
+        }
+        for (const tt of proposals.trailingTake) {
+          if (tt > 0 && tt !== curExit.trailingTake) variants.push({ exit: { ...curExit, trailingTake: tt }, gate: curGate });
+        }
+      }
       if (!variants.length) break;
 
       // доразметка НЕДОСТАЮЩИХ exit-наборов по кандидатам победившей кластеризации
@@ -973,7 +1013,7 @@ export async function train(
                 b.byExit.set(k, {
                   pnl: rr.pnl, volRegime: rr.volRegime, entered: rr.entered,
                   entryPrice: rr.entryPrice, exitPrice: rr.exitPrice, reason: rr.reason,
-                  heldMinutes: rr.heldMinutes, peak: rr.peak, inverted: rr.inverted,
+                  heldMinutes: rr.heldMinutes, peak: rr.peak, trough: rr.trough, inverted: rr.inverted,
                 });
               }
             }
@@ -1343,6 +1383,50 @@ export async function train(
     }
   }
 
+  // ── МОДЕЛЬ ИСХОДА: P(win|признаки) на торгуемом потоке (см. outcome-model.ts) ──
+  // Признаки на сделку: кластеры всплеска, momentum до поста (если считался),
+  // algoScore канала, hawkes-burstScore относительно фона тикера. Признак без
+  // данных честно null (вклад 0). Модель, не побившая prior по OOF-Brier,
+  // помечается informative=false — рантайм отдаст prior, а не псевдоточность.
+  let outcome: OutcomeModel | null = null;
+  if (opts.outcomeModel ?? true) {
+    // hawkes-фича: глобальная таблица (symbol|dir → ts[]) + бинарный поиск якоря
+    const globalTbl = buildTable(items as unknown as SignalEvent[]);
+    const globalTau = selfTuneLag(globalTbl);
+    const burstOf = (symbol: string, direction: string, ts: number): number | null => {
+      const group = globalTbl.byKey.get(`${symbol}|${direction}`);
+      if (!group || group.length < 2) return null;
+      let lo = 0, hi = group.length - 1, idx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (group[mid].ts === ts) { idx = mid; break; }
+        if (group[mid].ts < ts) lo = mid + 1; else hi = mid - 1;
+      }
+      if (idx < 0) return null;
+      return hawkesBurst(group.map((e) => e.ts), idx, globalTau).score;
+    };
+    // momentum-фича: значения из promise-кэша (к этому моменту все резолвлены)
+    const momentumOf = new Map<string, number | null>();
+    for (const [k, p] of preMomCache) momentumOf.set(k, await p);
+
+    const rows: OutcomeRow[] = [];
+    for (const h of history) {
+      if (!h.entered) continue;
+      rows.push({
+        y: h.pnl > 0 ? 1 : 0,
+        pnl: h.pnl,
+        ts: h.ts,
+        features: {
+          clusters: h.independentClusters,
+          momentum: momentumOf.get(`${h.symbol}|${h.ts}`) ?? null,
+          algo: channelScore[h.channel]?.algoScore ?? null,
+          burst: burstOf(h.symbol, h.direction, h.ts),
+        },
+      });
+    }
+    outcome = fitOutcomeModel(rows, folds);
+  }
+
   // ── ОБУЧЕННЫЙ momentum-гейт → policy ──
   // Выбранный CV порог вшивается в сериализуемую политику: runtime (signals/plan/
   // backtest) применит его сам, без ручной передачи. Пользовательский порог из
@@ -1364,6 +1448,7 @@ export async function train(
     pnl: { bySymbol: pnlBySymbol, global: pnlGlobal },
     channelScore,
     channelPlan,
+    outcome,
     history,
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,

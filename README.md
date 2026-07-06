@@ -661,6 +661,18 @@ Matrix signals (`channel: null`, cross-channel confirmation) always pass; a chan
 
 Every signal built with candles carries the **median per-minute quote turnover before the signal** (`median(volume)·close`). An order comparable to this number *is* the pump — there is no edge at that size. The library can't filter for you (it doesn't know your order), so it's advisory: compare `origin.liquidityQuote` with your intended notional and skip or downsize when they're within an order of magnitude.
 
+### Outcome model — calibrated P(win) instead of step gates
+
+Gates are binary (momentum −0.99% passes, −1.01% is cut to zero) and `confidence` is a heuristic product. The outcome model replaces this with a **calibrated probability**, built for small samples (no ML zoo):
+
+- **Naive Bayes with isotonic marginals** — for each feature (`independentClusters`, pre-signal momentum, channel `algoScore`, hawkes `burstScore`) the monotone P(win|xᵢ) is fitted by PAVA isotonic regression; each hard gate becomes a soft log-likelihood contribution, a missing feature honestly contributes 0.
+- **Out-of-fold calibration** — the naive LLR sum double-counts correlated features, so the raw score is re-calibrated isotonic-ally on chronological OOF predictions: a predicted 0.7 must win ~70%.
+- **Informative guard** — if OOF-Brier is not better than the constant prior, `informative: false` and the runtime returns the prior instead of pseudo-precision. The model is never allowed to sound more confident than the data.
+
+Every signal carries `probability: { pWin, expectedPnl, informative }` (expectedPnl net, доли), and entry becomes an **expected-value decision**: `policy.minPWin` / `policy.minExpectedPnlPct` (tighten-only). Serialized in `params.outcome`; `outcomeModel: false` to skip, `momentumFeature: true` to force the momentum feature when the gate axis is off.
+
+Related math upgrades: `verdict.nEffClusters` — the **effective number of independent authors** (participation ratio: {5 posts by A, 1 by B} is 1.4, not "2 clusters"; the `minClusters` gate stays integer, confidence uses N_eff); τ is now estimated by an **EM mixture** (lognormal sibling peak + uniform coincidence background — `selfTuneLagDetail()` exposes σ and the peak weight) instead of a noisy modal bin; and `replayExit` records `trough` (MAE), which feeds **quantile exit proposals** (stop = p90 |MAE| of winners, trailing = winners' give-back quantiles — Sweeney's MAE analysis) into the refinement round, judged by CV with the same SE guard as every other candidate.
+
 ### Autopilot — the non-obvious logic is inside
 
 Three decisions that used to live in the operator's head are now automated:

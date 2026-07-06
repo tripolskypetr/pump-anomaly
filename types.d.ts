@@ -83,6 +83,10 @@ interface PumpVerdict {
     /** зона входа из parser-item — нужна для открытия live-позиции */
     entryFromPrice?: number;
     entryToPrice?: number;
+    /** ЭФФЕКТИВНОЕ число независимых авторов всплеска (participation ratio, дробное):
+     *  {5 постов A, 1 пост B} → 1.4, а не «2 кластера». Гейт minClusters остаётся
+     *  на целочисленном independentClusters; N_eff взвешивает confidence. */
+    nEffClusters?: number;
     /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
     burstScore?: number;
     /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */
@@ -205,6 +209,210 @@ declare function buildWindowedTable(events: SignalEvent[], anchorTs: number, win
  * Возвращает τ в мс, зажатый в [30с, 60мин]. Если данных мало — дефолт 15 мин.
  */
 declare function selfTuneLag(tbl: EventTable): number;
+/** Детальная оценка τ: параметры смеси «пик братских задержек + фон совпадений». */
+interface LagDetail {
+    /** τ = мода логнормальной компоненты, зажат в [30с, 60мин] */
+    tauMs: number;
+    /** ширина пика в лог-пространстве (σ) — «насколько братья пунктуальны» */
+    sigmaLog: number;
+    /** вес пиковой компоненты (доля задержек, объяснимых братством, 0..1) */
+    peakWeight: number;
+    /** число задержек в оценке */
+    n: number;
+}
+/** Публичная детальная версия selfTuneLag (τ + ширина пика + вес братской компоненты). */
+declare function selfTuneLagDetail(tbl: EventTable): LagDetail;
+
+/**
+ * МОДЕЛЬ ИСХОДА — калиброванная вероятность P(win|признаки) вместо ступенчатых
+ * гейтов и эвристического confidence.
+ *
+ * Проблема: гейты бинарны (momentum −0.99% проходит, −1.01% режется в ноль), а
+ * confidence — произведение ad-hoc весов без вероятностного смысла. Прогноз
+ * становится точным, когда сигналу приписывается откалиброванная вероятность.
+ *
+ * Аппарат подобран под МАЛЫЕ выборки (n ~ 100–300 сделок), где ML-зоопарк —
+ * гарантированный оверфит:
+ *
+ *  1. НАИВНЫЙ БАЙЕС С ИЗОТОННЫМИ МАРЖИНАЛАМИ. Для каждого признака x_i оцениваем
+ *     P(win|x_i) изотонной регрессией (PAVA): монотонная, непараметрическая,
+ *     не переобучается. Направление монотонности — по знаку корреляции.
+ *     Вклад признака = log-likelihood ratio: LLR_i(x) = logit(P(win|x_i)) − logit(prior).
+ *     Каждый жёсткий гейт превращается в мягкий вклад в правдоподобие;
+ *     отсутствующий признак честно даёт 0.
+ *  2. КАЛИБРОВКА НА OUT-OF-FOLD. Сумма LLR наивна (признаки коррелированы,
+ *     вклады двоятся) — поэтому сырой скор пере-калибруется изотонной регрессией
+ *     на out-of-fold предсказаниях (хронологические фолды): предсказанные 0.7
+ *     обязаны выигрывать ~70%. Это одновременно лечит наивность и даёт честную
+ *     вероятностную шкалу.
+ *  3. INFORMATIVE-ГВАРД. Если OOF-Brier модели НЕ лучше Brier константного prior —
+ *     модель ничего не выучила: informative=false, рантайм отдаёт prior, а не
+ *     псевдоточные проценты. Модель не имеет права быть увереннее данных.
+ *
+ * E[pnl|x] = pWin·meanWin + (1−pWin)·meanLoss — решение о входе становится
+ * решением об ожидаемой ценности (policy.minExpectedPnlPct), а не о ступеньках.
+ */
+interface StepFn {
+    /** правые границы ступеней по x (возрастание) */
+    breaks: number[];
+    /** значение ступени */
+    values: number[];
+}
+interface IsotonicLLR {
+    /** −1 = признак инвертируется перед применением (убывающая зависимость) */
+    direction: 1 | -1;
+    fn: StepFn;
+}
+interface OutcomeModel {
+    version: 1;
+    /** базовая P(win) по всем сделкам */
+    prior: number;
+    /** маржиналы по именам признаков */
+    features: Record<string, IsotonicLLR>;
+    /** калибровка сырого скора (Σ LLR) → вероятность, изотонная по OOF */
+    calibration: StepFn;
+    /** средний pnl выигрышных / проигрышных сделок (для E[pnl]) */
+    meanWin: number;
+    meanLoss: number;
+    n: number;
+    /** OOF-Brier модели и константного prior — качество ЧЕСТНО хуже/лучше базы */
+    brier: number;
+    brierPrior: number;
+    /** false = модель не лучше prior → рантайм отдаёт prior, не псевдоточность */
+    informative: boolean;
+}
+interface OutcomeRow {
+    /** 1 = pnl > 0 */
+    y: 0 | 1;
+    pnl: number;
+    ts: number;
+    /** null = признак недоступен для этой сделки (вклад 0) */
+    features: Record<string, number | null>;
+}
+/**
+ * Обучение модели исхода. null, если данных мало или исход одноклассовый —
+ * честное «модели нет», а не мусорная модель.
+ */
+declare function fitOutcomeModel(rowsIn: OutcomeRow[], folds?: number): OutcomeModel | null;
+interface OutcomePrediction {
+    /** калиброванная P(win); при informative=false = prior */
+    pWin: number;
+    /** E[pnl|x] = pWin·meanWin + (1−pWin)·meanLoss, доли */
+    expectedPnl: number;
+    informative: boolean;
+}
+declare function predictOutcome(model: OutcomeModel, features: Record<string, number | null | undefined>): OutcomePrediction;
+
+/**
+ * Objective для подбора порогов: shrinkage-expectancy.
+ *
+ *   score = mean(returns) · N/(N+k)
+ *
+ * Средний forward-return отобранных всплесков, усаженный к нулю при малой выборке.
+ * Без усадки grid выбрал бы вырожденный порог, ловящий 1 жирный всплеск и
+ * рапортующий «идеальный эдж» — ровно ловушка winrate-68%-с-чёрным-лебедем.
+ * k — сила усадки (по умолчанию 5): при N=k вклад режется вдвое.
+ */
+declare function shrinkageExpectancy(returns: number[], k?: number): number;
+/** Доля положительных (winrate) — для отчёта, не для оптимизации. */
+declare function winrate(returns: number[]): number;
+/**
+ * Стандартная ошибка среднего по фолдам: SE = std(foldScores) / sqrt(n).
+ * std — выборочное (делитель n-1). При n<2 SE=0 (разброс не оценить).
+ */
+declare function standardError(foldScores: number[]): number;
+/**
+ * One-standard-error rule (Breiman 1984) — против winner's curse при grid-search.
+ *
+ * Проблема: argmax по CV-score из N конфигураций систематически завышен — максимум
+ * шумных оценок смещён вверх на ~sigma·sqrt(2·ln N) даже при истинном edge=0. Чем
+ * больше grid, тем сильнее переобучение на шум выборки.
+ *
+ * Правило: берём НЕ максимум, а самую КОНСЕРВАТИВНУЮ конфигурацию среди тех, чей
+ * score в пределах 1 SE от максимума. Разница внутри 1 SE статистически незначима
+ * (внутри шума), поэтому вместо счастливого выброса выбираем робастную конфигурацию.
+ *
+ * @param entries    кандидаты
+ * @param scoreOf    извлечь CV-score кандидата
+ * @param foldsOf    извлечь fold-scores кандидата (для SE максимума)
+ * @param isSimpler  компаратор «a консервативнее b» (true → предпочесть a)
+ */
+declare function oneStandardErrorSelect<T>(entries: T[], scoreOf: (e: T) => number, foldsOf: (e: T) => number[], isSimpler: (a: T, b: T) => boolean, seMultiplier?: number): T | null;
+/**
+ * Перцентиль p (0..1) по выборке методом линейной интерполяции (type-7, как в numpy).
+ * percentile([...], 0.95) = P95. Пустая выборка → 0.
+ */
+declare function percentile(xs: number[], p: number): number;
+/**
+ * КВАНТИЛЬНЫЕ ПРЕДЛОЖЕНИЯ EXIT из статистики пути (MAE/MFE-анализ, Sweeney).
+ *
+ * Перебор сетки судит конфиги по финальному pnl, выбрасывая информацию о пути.
+ * Путь же говорит напрямую: у ПОБЕДИТЕЛЕЙ адверс-экскурсия (|MAE|) компактна, у
+ * лузеров — тяжёлый хвост → стоп сразу за p90 |MAE| победителей режет лузеров,
+ * почти не задевая винеров. Аналогично trailing: quantиль отката от пика,
+ * который победители реально отдавали (peak − pnl). Это оценка ДВУХ квантилей
+ * по всем сделкам сразу — на порядок эффективнее по данным, чем независимый
+ * скоринг тысяч конфигов.
+ *
+ * Возвращает КАНДИДАТОВ (в %), а не решение: refinement подаёт их в CV наравне
+ * с сеточными вариантами — принимаются только при значимом улучшении (SE-гвард).
+ * Мало победителей (< minWinners) → пустые списки: по 5 сделкам квантили — шум.
+ */
+interface PathExitProposals {
+    hardStop: number[];
+    trailingTake: number[];
+}
+declare function exitProposalsFromPath(rows: Array<{
+    pnl: number;
+    peak: number;
+    trough: number;
+    entered: boolean;
+}>, minWinners?: number): PathExitProposals;
+/** Статистика risk-reward по набору сделок. */
+interface RiskRewardStats {
+    /** среднее RR */
+    mean: number;
+    /** P95 RR (хвост в плюс) */
+    p95: number;
+    /** P99 RR */
+    p99: number;
+    /** число сделок в выборке */
+    n: number;
+}
+/**
+ * RR на сделку = pnl / hardStop (реализованный в единицах риска — сколько R сняли).
+ * Считает mean / P95 / P99 по парам (pnl, hardStop). Сделки с hardStop ≤ 0
+ * пропускаются (деление на ноль). Главный исследовательский выход бэктеста.
+ */
+declare function riskRewardStats(trades: Array<{
+    pnl: number;
+    hardStop: number;
+}>): RiskRewardStats;
+/**
+ * Устойчивая к выбросам статистика реализованного PnL системы (в долях).
+ * Дополняет mean процентилями и медианой, чтобы ОДНА плохая (или одна жирная)
+ * сделка не определяла оценку выигрыша:
+ *   - median — робастный центр, полностью иммунный к выбросам (50-й перцентиль);
+ *   - p5     — нижний хвост (насколько плохи худшие 5% сделок);
+ *   - p95/p99— верхний хвост (вклад редких крупных выигрышей).
+ * mean остаётся для сравнения, но median/перцентили показывают систему без
+ * искажения единичными экстремумами. NaN/Infinity отбрасываются.
+ */
+interface PnlStats {
+    /** среднее PnL (чувствительно к выбросам — для сравнения) */
+    mean: number;
+    /** медиана PnL (робастный центр, иммунный к выбросам) */
+    median: number;
+    /** P5 — нижний хвост (худшие сделки) */
+    p5: number;
+    /** P95 — верхний хвост */
+    p95: number;
+    /** P99 — крайний верхний хвост */
+    p99: number;
+    /** число сделок в выборке */
+    n: number;
+}
+declare function pnlStats(pnls: number[]): PnlStats;
 
 interface Edge {
     a: string;
@@ -499,8 +707,11 @@ interface ReplayResult {
      */
     pnl: number;
     reason: ExitReason;
-    /** пиковый PnL% за жизнь позиции */
+    /** пиковый PnL% за жизнь позиции (MFE) */
     peak: number;
+    /** наихудший PnL% за жизнь позиции (MAE, ≤0; при стопе = −hardStop%) — сырьё для
+     *  квантильного подбора стопа: p90 |MAE| победителей режет лузеров, не задевая винеров */
+    trough: number;
     /** минут от входа до выхода */
     heldMinutes: number;
     entered: boolean;
@@ -680,92 +891,6 @@ declare const MAX_CANDLES_PER_CHUNK = 500;
 declare function fetchCandlesChunked(getCandles: GetCandles, symbol: string, interval: CandleInterval, limit: number, since: number, chunkSize?: number): Promise<ICandleData[]>;
 
 /**
- * Objective для подбора порогов: shrinkage-expectancy.
- *
- *   score = mean(returns) · N/(N+k)
- *
- * Средний forward-return отобранных всплесков, усаженный к нулю при малой выборке.
- * Без усадки grid выбрал бы вырожденный порог, ловящий 1 жирный всплеск и
- * рапортующий «идеальный эдж» — ровно ловушка winrate-68%-с-чёрным-лебедем.
- * k — сила усадки (по умолчанию 5): при N=k вклад режется вдвое.
- */
-declare function shrinkageExpectancy(returns: number[], k?: number): number;
-/** Доля положительных (winrate) — для отчёта, не для оптимизации. */
-declare function winrate(returns: number[]): number;
-/**
- * Стандартная ошибка среднего по фолдам: SE = std(foldScores) / sqrt(n).
- * std — выборочное (делитель n-1). При n<2 SE=0 (разброс не оценить).
- */
-declare function standardError(foldScores: number[]): number;
-/**
- * One-standard-error rule (Breiman 1984) — против winner's curse при grid-search.
- *
- * Проблема: argmax по CV-score из N конфигураций систематически завышен — максимум
- * шумных оценок смещён вверх на ~sigma·sqrt(2·ln N) даже при истинном edge=0. Чем
- * больше grid, тем сильнее переобучение на шум выборки.
- *
- * Правило: берём НЕ максимум, а самую КОНСЕРВАТИВНУЮ конфигурацию среди тех, чей
- * score в пределах 1 SE от максимума. Разница внутри 1 SE статистически незначима
- * (внутри шума), поэтому вместо счастливого выброса выбираем робастную конфигурацию.
- *
- * @param entries    кандидаты
- * @param scoreOf    извлечь CV-score кандидата
- * @param foldsOf    извлечь fold-scores кандидата (для SE максимума)
- * @param isSimpler  компаратор «a консервативнее b» (true → предпочесть a)
- */
-declare function oneStandardErrorSelect<T>(entries: T[], scoreOf: (e: T) => number, foldsOf: (e: T) => number[], isSimpler: (a: T, b: T) => boolean, seMultiplier?: number): T | null;
-/**
- * Перцентиль p (0..1) по выборке методом линейной интерполяции (type-7, как в numpy).
- * percentile([...], 0.95) = P95. Пустая выборка → 0.
- */
-declare function percentile(xs: number[], p: number): number;
-/** Статистика risk-reward по набору сделок. */
-interface RiskRewardStats {
-    /** среднее RR */
-    mean: number;
-    /** P95 RR (хвост в плюс) */
-    p95: number;
-    /** P99 RR */
-    p99: number;
-    /** число сделок в выборке */
-    n: number;
-}
-/**
- * RR на сделку = pnl / hardStop (реализованный в единицах риска — сколько R сняли).
- * Считает mean / P95 / P99 по парам (pnl, hardStop). Сделки с hardStop ≤ 0
- * пропускаются (деление на ноль). Главный исследовательский выход бэктеста.
- */
-declare function riskRewardStats(trades: Array<{
-    pnl: number;
-    hardStop: number;
-}>): RiskRewardStats;
-/**
- * Устойчивая к выбросам статистика реализованного PnL системы (в долях).
- * Дополняет mean процентилями и медианой, чтобы ОДНА плохая (или одна жирная)
- * сделка не определяла оценку выигрыша:
- *   - median — робастный центр, полностью иммунный к выбросам (50-й перцентиль);
- *   - p5     — нижний хвост (насколько плохи худшие 5% сделок);
- *   - p95/p99— верхний хвост (вклад редких крупных выигрышей).
- * mean остаётся для сравнения, но median/перцентили показывают систему без
- * искажения единичными экстремумами. NaN/Infinity отбрасываются.
- */
-interface PnlStats {
-    /** среднее PnL (чувствительно к выбросам — для сравнения) */
-    mean: number;
-    /** медиана PnL (робастный центр, иммунный к выбросам) */
-    median: number;
-    /** P5 — нижний хвост (худшие сделки) */
-    p5: number;
-    /** P95 — верхний хвост */
-    p95: number;
-    /** P99 — крайний верхний хвост */
-    p99: number;
-    /** число сделок в выборке */
-    n: number;
-}
-declare function pnlStats(pnls: number[]): PnlStats;
-
-/**
  * Достоверность обучения. Отвечает на вопрос «можно ли доверять подобранным
  * порогам», а НЕ «велик ли эдж». На малой выборке confidence низкий и
  * reliable=false (либа работает, но честно предупреждает); по мере роста
@@ -902,6 +1027,16 @@ interface TradeSignal {
     entryToPrice?: number;
     /** готовый exit-план */
     exit: ExitPlan;
+    /**
+     * ПРОГНОЗ модели исхода: калиброванная P(win) и ожидаемый pnl (доли, нетто).
+     * informative=false = модель не побила prior по OOF-Brier — pWin равен prior,
+     * не притворяясь точнее данных. null = модель не обучалась (мало сделок).
+     */
+    probability?: {
+        pWin: number;
+        expectedPnl: number;
+        informative: boolean;
+    } | null;
     /** происхождение (аудит), не для ветвления */
     origin: SignalOrigin;
 }
@@ -1004,6 +1139,18 @@ interface SignalPolicy {
      * 10% минутного оборота — уже двигаешь цену). Тighten-only: min(trained, requested).
      */
     maxLiquidityShare?: number;
+    /**
+     * Порог калиброванной вероятности выигрыша (модель исхода): сигнал с
+     * probability.pWin ниже порога режется. Работает и при informative=false
+     * (тогда сравнивается prior). Тighten-only: max(trained, requested).
+     */
+    minPWin?: number;
+    /**
+     * Порог ожидаемой ценности, % на сделку: режем сигналы с E[pnl|x] ниже.
+     * Решение о входе как решение об ожидаемой ценности, а не о ступеньках.
+     * Тighten-only: max(trained, requested).
+     */
+    minExpectedPnlPct?: number;
 }
 declare const DEFAULT_POLICY: SignalPolicy;
 /**
@@ -1390,6 +1537,17 @@ interface TrainOptions {
      */
     channelTriage?: boolean;
     /**
+     * Модель исхода (P(win|признаки)): по умолчанию строится, если сделок достаточно.
+     * false — не строить (params.outcome = null).
+     */
+    outcomeModel?: boolean;
+    /**
+     * Принудительно считать momentum-фичу для модели исхода, даже если ось
+     * momentumGatePct не перебирается (стоит пре-фетча свечей на кандидата).
+     * По умолчанию фича есть только когда её уже считает гейт-ось.
+     */
+    momentumFeature?: boolean;
+    /**
      * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
      * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
      * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
@@ -1512,6 +1670,15 @@ interface TrainedParams {
      * Отключается opts.channelTriage: false. Сериализуется.
      */
     channelPlan?: Record<string, "invert" | "drop">;
+    /**
+     * МОДЕЛЬ ИСХОДА: калиброванная P(win|признаки) поверх torгуемого потока
+     * (наивный Байес с изотонными маржиналами + OOF-калибровка, см. outcome-model.ts).
+     * Признаки: independentClusters, momentum до поста (если считался), algoScore
+     * канала, hawkes-burstScore. Рантайм отдаёт probability в каждом TradeSignal
+     * и применяет гейты policy.minPWin / minExpectedPnlPct. null = данных мало
+     * или модель не лучше prior (informative-гвард честно отключает её).
+     */
+    outcome?: OutcomeModel | null;
     /**
      * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
      * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -1978,5 +2145,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
-export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
+export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

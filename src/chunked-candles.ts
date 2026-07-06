@@ -1,5 +1,35 @@
 import { GetCandles, ICandleData, CandleInterval, STEP_MS, alignTs } from "./candle";
 
+/**
+ * Кэширующая обёртка над getCandles (ключ = symbol|interval|limit|since).
+ *
+ *  - PROMISE-DEDUP: конкурентные запросы одного окна (пул разметки) сливаются в
+ *    один сетевой вызов — оба ждут общий promise, а не бьют биржу дважды.
+ *  - FIFO-кап держит память (окно 1445 свечей ≈ 130КБ; cap 512 ≈ 65МБ worst-case).
+ *  - Переживает границы fit: walkForward оборачивает источник ОДИН раз и передаёт
+ *    во все срезы — K переобучений не перезапрашивают одну и ту же историю.
+ *
+ * Запросы с eDate не кэшируются (внутренние пути либы их не используют).
+ * Ошибка источника НЕ кэшируется — следующий вызов попробует снова.
+ */
+export function withCandleCache(getCandles: GetCandles, capacity = 512): GetCandles {
+  const cache = new Map<string, Promise<ICandleData[]>>();
+  return async (symbol, interval, limit, sDate, eDate) => {
+    if (eDate !== undefined) return getCandles(symbol, interval, limit, sDate, eDate);
+    const key = `${symbol}|${interval}|${limit}|${sDate}`;
+    const hit = cache.get(key);
+    if (hit) return hit;
+    const p = Promise.resolve(getCandles(symbol, interval, limit, sDate));
+    if (cache.size >= capacity) {
+      const first = cache.keys().next().value;
+      if (first !== undefined) cache.delete(first);
+    }
+    cache.set(key, p);
+    p.catch(() => cache.delete(key)); // ошибку не кэшируем
+    return p;
+  };
+}
+
 /** Максимум свечей в одном чанке (как CC_MAX_CANDLES_PER_REQUEST в проде). */
 export const MAX_CANDLES_PER_CHUNK = 500;
 

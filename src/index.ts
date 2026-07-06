@@ -17,7 +17,15 @@ import { earlyWarning } from "./layers/early-warning";
 import { singleChannelSignals } from "./layers/single-channel";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
 
-/** Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор. */
+/**
+ * Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор
+ * (null-строки, нечисловой ts, невалидное направление). Используется и predict,
+ * и train: битая запись не должна молча искажать кластеризацию/разметку.
+ */
+export function normalizeParserItems(items: ParserItem[]): SignalEvent[] {
+  return normalize(items);
+}
+
 function normalize(items: ParserItem[]): SignalEvent[] {
   const out: SignalEvent[] = [];
   for (const it of items) {
@@ -158,7 +166,7 @@ export { resolveExit, resolveExitNoRegime } from "./exit-tensor";
 export type { ExitTensor, ResolvedExit, ResolveSource } from "./exit-tensor";
 export { enumerateBursts, enumeratePosts } from "./enumerate";
 export { labelBurst, exitKey } from "./label";
-export { fetchCandlesChunked, MAX_CANDLES_PER_CHUNK } from "./chunked-candles";
+export { fetchCandlesChunked, withCandleCache, MAX_CANDLES_PER_CHUNK } from "./chunked-candles";
 export type { LabeledBurst } from "./label";
 export { replayExit } from "./replay";
 export type { ExitParams, ExitReason, ReplayResult } from "./replay";

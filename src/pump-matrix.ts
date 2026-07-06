@@ -54,13 +54,13 @@ export class PumpMatrix {
   }
 
   /**
-   * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей (null у моделей из load() —
-   * они не результат обучения). Сохрани его и передай в opts.metaLedger следующего
-   * fit: тогда cadence-guard реально запрещает частый refit, а DSR дефлируется по
-   * всей цепочке попыток, а не только по текущему гриду.
+   * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей. Сериализуется в model.json
+   * (meta.ledger) — цепочка переживает save()/load(): передай его в
+   * opts.metaLedger следующего fit, и cadence-guard + family-wise DSR видят всю
+   * историю переобучений. null только у моделей без родословной (старый формат).
    */
   get ledgerAfterFit(): MetaLedgerState | null {
-    return this._ledger;
+    return this._ledger ?? this.params.meta.ledger ?? null;
   }
 
   /** Восстановить модель из сохранённого JSON (в проде, без обучения). */

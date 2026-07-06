@@ -539,6 +539,19 @@ declare const exitKey: (p: ExitParams) => string;
  */
 declare function labelBurst(getCandles: GetCandles, symbol: string, direction: Direction, ts: number, exitSets: ExitParams[], entryFromPrice?: number, entryToPrice?: number): Promise<LabelResult>;
 
+/**
+ * Кэширующая обёртка над getCandles (ключ = symbol|interval|limit|since).
+ *
+ *  - PROMISE-DEDUP: конкурентные запросы одного окна (пул разметки) сливаются в
+ *    один сетевой вызов — оба ждут общий promise, а не бьют биржу дважды.
+ *  - FIFO-кап держит память (окно 1445 свечей ≈ 130КБ; cap 512 ≈ 65МБ worst-case).
+ *  - Переживает границы fit: walkForward оборачивает источник ОДИН раз и передаёт
+ *    во все срезы — K переобучений не перезапрашивают одну и ту же историю.
+ *
+ * Запросы с eDate не кэшируются (внутренние пути либы их не используют).
+ * Ошибка источника НЕ кэшируется — следующий вызов попробует снова.
+ */
+declare function withCandleCache(getCandles: GetCandles, capacity?: number): GetCandles;
 /** Максимум свечей в одном чанке (как CC_MAX_CANDLES_PER_REQUEST в проде). */
 declare const MAX_CANDLES_PER_CHUNK = 500;
 /**
@@ -1250,6 +1263,14 @@ interface TrainOptions {
      */
     momentumWindowMinutes?: number;
     /**
+     * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
+     * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
+     * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
+     * (порядок кандидатов сохраняется независимо от порядка ответов сети).
+     * Подбирай под rate-limit своей биржи. По умолчанию 4. 1 = последовательно.
+     */
+    labelConcurrency?: number;
+    /**
      * Раунды УТОЧНЯЮЩЕГО брутфорса (coarse-to-fine) вокруг победителя грубой сетки.
      * Грубый шаг (×2–×4 между узлами) может целиком спрятать узкую прибыльную
      * область — истинный оптимум между узлами невидим, и fit ложно скажет «эджа
@@ -1394,6 +1415,8 @@ interface TrainedParams {
             outcomes: Partial<Record<LabelOutcome, number>>;
             /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
             errors: Record<string, number>;
+            /** сколько сырых parser-items отброшено нормализацией входа (мусор/битые поля) */
+            invalidItems?: number;
         };
         /**
          * Аудит автокалибровки (casual-режим): измеренный шум 1m-свечей, доступное
@@ -1411,6 +1434,11 @@ interface TrainedParams {
             evaluated: number;
             accepted: number;
         } | null;
+        /**
+         * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей — model.json несёт родословную
+         * переобучений: цепочка cadence-guard/family-wise DSR переживает save()/load().
+         */
+        ledger?: MetaLedgerState;
     };
 }
 interface TrainResult {
@@ -1439,7 +1467,7 @@ interface TrainResult {
  * поэтому stop hunting размечается как убыток. Объектив — shrinkage-expectancy
  * под time-series K-fold. Эмпирически выбирает импакт-горизонт (staleMinutes).
  */
-declare function train(items: ParserItem[], getCandles: GetCandles, opts?: TrainOptions): Promise<TrainResult>;
+declare function train(rawItems: ParserItem[], getCandles: GetCandles, opts?: TrainOptions): Promise<TrainResult>;
 declare function loadPredict(params: TrainedParams): (items: ParserItem[]) => PredictionResult;
 
 /**
@@ -1464,10 +1492,10 @@ declare class PumpMatrix {
     /** Обучить модель на истории сигналов. */
     static fit(history: ParserItem[], getCandles: GetCandles, opts?: TrainOptions): Promise<PumpMatrix>;
     /**
-     * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей (null у моделей из load() —
-     * они не результат обучения). Сохрани его и передай в opts.metaLedger следующего
-     * fit: тогда cadence-guard реально запрещает частый refit, а DSR дефлируется по
-     * всей цепочке попыток, а не только по текущему гриду.
+     * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей. Сериализуется в model.json
+     * (meta.ledger) — цепочка переживает save()/load(): передай его в
+     * opts.metaLedger следующего fit, и cadence-guard + family-wise DSR видят всю
+     * историю переобучений. null только у моделей без родословной (старый формат).
      */
     get ledgerAfterFit(): MetaLedgerState | null;
     /** Восстановить модель из сохранённого JSON (в проде, без обучения). */
@@ -1527,6 +1555,7 @@ declare class PumpMatrix {
         candidates: number;
         outcomes: Partial<Record<LabelOutcome, number>>;
         errors: Record<string, number>;
+        invalidItems?: number;
     };
     /**
      * Статистический сертификат: прошёл ли эдж пять барьеров (DSR ≥ 0.95, PBO ≤ 0.10,
@@ -1683,6 +1712,8 @@ interface WalkForwardSlice {
     /** сколько items в обучении / в тесте */
     nTrain: number;
     nTest: number;
+    /** сколько train-items выброшено эмбарго на границе (их метки заглядывали в тест) */
+    embargoDropped: number;
     /** сертифицировала ли себя модель этого среза (на своём train-прошлом) */
     certifiedOnTrain: boolean;
     /** confidence/reliable модели среза */
@@ -1720,9 +1751,24 @@ interface WalkForwardOptions {
     trainOptions?: TrainOptions;
     /** политика бэктеста тестовых блоков (сужает обученную, как в проде) */
     policy?: Partial<SignalPolicy>;
+    /** ёмкость общего кэша свечей на все срезы (окон по ~1445 свечей). Дефолт 1024. */
+    cacheCapacity?: number;
+    /**
+     * Эмбарго на границе train/test, минуты. Метка train-сделки, открытой впритык
+     * к границе, считается по свечам УЖЕ ТЕСТОВОГО периода — обучение подсматривало
+     * бы в цены, на которых его затем экзаменуют. Такие train-items выбрасываются.
+     * По умолчанию = max(staleMinutes грида) — горизонт жизни самой долгой сделки.
+     */
+    embargoMinutes?: number;
 }
 declare function walkForward(items: ParserItem[], getCandles: GetCandles, opts?: WalkForwardOptions): Promise<WalkForwardResult>;
 
+/**
+ * Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор
+ * (null-строки, нечисловой ts, невалидное направление). Используется и predict,
+ * и train: битая запись не должна молча искажать кластеризацию/разметку.
+ */
+declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
 /**
  * Чёрная коробка. Единственная точка входа.
  *
@@ -1739,5 +1785,5 @@ declare function walkForward(items: ParserItem[], getCandles: GetCandles, opts?:
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
 export type { AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

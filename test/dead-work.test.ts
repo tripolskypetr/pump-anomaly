@@ -165,7 +165,7 @@ describe("meta-ledger — встроен в train/fit", () => {
     expect(typeof res.ledger.attempts[0].certifiedNaive).toBe("boolean");
   });
 
-  it("PumpMatrix.fit отдаёт ledgerAfterFit; load() → null", async () => {
+  it("PumpMatrix.fit отдаёт ledgerAfterFit; цепочка переживает save/load", async () => {
     const fx = buildFixture();
     const gc = makeGetCandles([]);
     const m = await PumpMatrix.fit(fx.items.slice(0, 30), gc, {
@@ -181,8 +181,10 @@ describe("meta-ledger — встроен в train/fit", () => {
     });
     expect(m.ledgerAfterFit).not.toBe(null);
     expect(m.ledgerAfterFit!.attempts.length).toBe(1);
+    // родословная сериализуется: после save/load цепочка попыток на месте
     const loaded = PumpMatrix.load(m.save());
-    expect(loaded.ledgerAfterFit).toBe(null);
+    expect(loaded.ledgerAfterFit).not.toBe(null);
+    expect(loaded.ledgerAfterFit!.attempts.length).toBe(1);
   });
 });
 

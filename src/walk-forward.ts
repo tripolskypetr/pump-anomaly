@@ -1,6 +1,7 @@
 import { ParserItem } from "./types";
 import { GetCandles } from "./candle";
-import { TrainOptions } from "./train";
+import { withCandleCache } from "./chunked-candles";
+import { TrainOptions, DEFAULT_GRID } from "./train";
 import { SignalPolicy } from "./signal";
 import { PnlStats, pnlStats } from "./objective";
 import { sharpe } from "./statistics";
@@ -26,6 +27,8 @@ export interface WalkForwardSlice {
   /** сколько items в обучении / в тесте */
   nTrain: number;
   nTest: number;
+  /** сколько train-items выброшено эмбарго на границе (их метки заглядывали в тест) */
+  embargoDropped: number;
   /** сертифицировала ли себя модель этого среза (на своём train-прошлом) */
   certifiedOnTrain: boolean;
   /** confidence/reliable модели среза */
@@ -65,6 +68,15 @@ export interface WalkForwardOptions {
   trainOptions?: TrainOptions;
   /** политика бэктеста тестовых блоков (сужает обученную, как в проде) */
   policy?: Partial<SignalPolicy>;
+  /** ёмкость общего кэша свечей на все срезы (окон по ~1445 свечей). Дефолт 1024. */
+  cacheCapacity?: number;
+  /**
+   * Эмбарго на границе train/test, минуты. Метка train-сделки, открытой впритык
+   * к границе, считается по свечам УЖЕ ТЕСТОВОГО периода — обучение подсматривало
+   * бы в цены, на которых его затем экзаменуют. Такие train-items выбрасываются.
+   * По умолчанию = max(staleMinutes грида) — горизонт жизни самой долгой сделки.
+   */
+  embargoMinutes?: number;
 }
 
 const maxDrawdownOf = (equity: number[]): number => {
@@ -89,6 +101,9 @@ export async function walkForward(
   opts: WalkForwardOptions = {},
 ): Promise<WalkForwardResult> {
   const K = Math.max(1, opts.slices ?? 4);
+  // ОДИН кэш свечей на все срезы: K переобучений размечают пересекающиеся
+  // префиксы истории — без общего кэша каждый срез заново тянет те же окна с биржи.
+  const gc = withCandleCache(getCandles, opts.cacheCapacity ?? 1024);
   const sorted = [...items]
     .filter((i) => i && Number.isFinite(i.ts))
     .sort((a, b) => a.ts - b.ts);
@@ -104,22 +119,33 @@ export async function walkForward(
   const certPnls: number[] = [];
   let certSlices = 0;
 
+  // эмбарго = горизонт самой долгой сделки грида (если не переопределён)
+  const gridStale = opts.trainOptions?.grid?.staleMinutes ?? DEFAULT_GRID.staleMinutes;
+  const embargoMs = (opts.embargoMinutes ?? Math.max(...gridStale)) * 60_000;
+
   for (let s = 0; s < K; s++) {
     const trainEndIdx = blockSize * (s + 1);
     const testEndIdx = s === K - 1 ? sorted.length : blockSize * (s + 2);
-    const trainItems = sorted.slice(0, trainEndIdx);
+    const trainItemsAll = sorted.slice(0, trainEndIdx);
     const testItems = sorted.slice(trainEndIdx, testEndIdx);
+    // PURGE: train-items впритык к test-блоку выбрасываются — их метки считаются
+    // по свечам тестового периода (label peeking через границу). Если эмбарго
+    // выело всё обучение (вырожденно плотные данные) — честно оставляем как есть.
+    const boundaryTs = testItems[0].ts;
+    const trainItemsPurged = trainItemsAll.filter((i) => i.ts <= boundaryTs - embargoMs);
+    const trainItems = trainItemsPurged.length >= 2 ? trainItemsPurged : trainItemsAll;
+    const embargoDropped = trainItemsAll.length - trainItems.length;
     const trainUntil = trainItems[trainItems.length - 1].ts;
 
     // модель среза: видит ТОЛЬКО прошлое. cadence-guard обходим — walk-forward
     // это исследовательская серия fit-ов по построению, не боевой цикл.
-    const model = await PumpMatrix.fit(trainItems, getCandles, {
+    const model = await PumpMatrix.fit(trainItems, gc, {
       ...opts.trainOptions,
       ignoreCadence: true,
     });
 
     // OOS: бэктест ТЕСТОВЫХ сигналов обученной моделью (их обучение не видело)
-    const sigs = await model.backtest(testItems, getCandles, opts.policy);
+    const sigs = await model.backtest(testItems, gc, opts.policy);
     const entered = sigs
       .filter((x) => x.result.entered)
       .sort((a, b) => a.ts - b.ts);
@@ -137,6 +163,7 @@ export async function walkForward(
       testTo: testItems[testItems.length - 1]?.ts ?? trainUntil,
       nTrain: trainItems.length,
       nTest: testItems.length,
+      embargoDropped,
       certifiedOnTrain: certified,
       confidenceOnTrain: model.confidence,
       pnls,

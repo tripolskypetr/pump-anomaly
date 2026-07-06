@@ -5,7 +5,7 @@ import {
   PredictionResult,
 } from "./types";
 import { GetCandles, entryStartTs } from "./candle";
-import { fetchCandlesChunked } from "./chunked-candles";
+import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
 import { momentumPct } from "./volume";
 import { enumerateBursts, enumeratePosts } from "./enumerate";
 import { buildTable } from "./core/event-table";
@@ -34,7 +34,7 @@ import {
   ReliabilityConfig,
   DEFAULT_RELIABILITY,
 } from "./reliability";
-import { predict as predictRaw } from "./index";
+import { predict as predictRaw, normalizeParserItems } from "./index";
 
 // ─────────────────────────── grid + train опции ──────────────────────────────
 
@@ -157,6 +157,14 @@ export interface TrainOptions {
    * при выбранном гейте.
    */
   momentumWindowMinutes?: number;
+  /**
+   * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
+   * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
+   * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
+   * (порядок кандидатов сохраняется независимо от порядка ответов сети).
+   * Подбирай под rate-limit своей биржи. По умолчанию 4. 1 = последовательно.
+   */
+  labelConcurrency?: number;
   /**
    * Раунды УТОЧНЯЮЩЕГО брутфорса (coarse-to-fine) вокруг победителя грубой сетки.
    * Грубый шаг (×2–×4 между узлами) может целиком спрятать узкую прибыльную
@@ -303,6 +311,8 @@ export interface TrainedParams {
       outcomes: Partial<Record<LabelOutcome, number>>;
       /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
       errors: Record<string, number>;
+      /** сколько сырых parser-items отброшено нормализацией входа (мусор/битые поля) */
+      invalidItems?: number;
     };
     /**
      * Аудит автокалибровки (casual-режим): измеренный шум 1m-свечей, доступное
@@ -316,6 +326,11 @@ export interface TrainedParams {
      * переездов принято по правилу «улучшение > SE». null = уточнение выключено.
      */
     refinement?: { rounds: number; evaluated: number; accepted: number } | null;
+    /**
+     * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей — model.json несёт родословную
+     * переобучений: цепочка cadence-guard/family-wise DSR переживает save()/load().
+     */
+    ledger?: MetaLedgerState;
   };
 }
 
@@ -339,13 +354,35 @@ export interface TrainResult {
 
 // ─────────────────────────── time-series K-fold ──────────────────────────────
 
-function timeSeriesFolds(n: number, folds: number): Array<{ valLo: number; valHi: number }> {
+/**
+ * PURGED time-series фолды с ЭМБАРГО (López de Prado, Advances in Financial ML).
+ *
+ * Сделка живёт до staleMinutes ПОСЛЕ входа: pnl-путь последней сделки фолда k и
+ * первой сделки фолда k+1 перекрывается — fold-статистики коррелированы, SE
+ * занижен, 1-SE-коридор слишком тесен, stability/PBO завышены. Лечение: из начала
+ * каждого следующего валид-среза выбрасываются сделки, чей вход ближе embargoMs
+ * (= горизонт жизни оцениваемого exit) к последней сделке предыдущего среза.
+ * embargoMs=0 → старое поведение (для мгновенных горизонтов).
+ *
+ * @param tsArr ts сделок в хронологическом порядке (отсортированы)
+ */
+export function timeSeriesFolds(
+  tsArr: number[],
+  folds: number,
+  embargoMs: number,
+): Array<{ valLo: number; valHi: number }> {
+  const n = tsArr.length;
   const out: Array<{ valLo: number; valHi: number }> = [];
   const seg = Math.max(1, Math.floor(n / (folds + 1)));
+  let prevEndTs = -Infinity; // ts последней сделки предыдущего ВАЛИДАЦИОННОГО среза
   for (let f = 1; f <= folds; f++) {
-    const valLo = f * seg;
+    let valLo = f * seg;
     const valHi = f === folds ? n : (f + 1) * seg;
-    if (valLo < valHi) out.push({ valLo, valHi });
+    while (valLo < valHi && tsArr[valLo] < prevEndTs + embargoMs) valLo++; // purge
+    if (valLo < valHi) {
+      out.push({ valLo, valHi });
+      prevEndTs = tsArr[valHi - 1];
+    }
   }
   return out;
 }
@@ -359,7 +396,7 @@ function timeSeriesFolds(n: number, folds: number): Array<{ valLo: number; valHi
  * под time-series K-fold. Эмпирически выбирает импакт-горизонт (staleMinutes).
  */
 export async function train(
-  items: ParserItem[],
+  rawItems: ParserItem[],
   getCandles: GetCandles,
   opts: TrainOptions = {},
 ): Promise<TrainResult> {
@@ -373,6 +410,13 @@ export async function train(
       throw new Error(`cadence-guard: ${gate.reason} (nextAllowedTs=${gate.nextAllowedTs}; обойти: ignoreCadence)`);
     }
   }
+
+  // ── НОРМАЛИЗАЦИЯ ВХОДА: та же, что в predict ──
+  // Раньше train ел сырые items: битая запись (ts-строка, null, кривое направление)
+  // молча искажала кластеризацию и разметку. Теперь мусор отбрасывается, а счётчик
+  // уходит в meta.labeling.invalidItems — немых сбоев нет.
+  const items = normalizeParserItems(rawItems) as unknown as ParserItem[];
+  const invalidItems = rawItems.length - items.length;
 
   const grid: TrainGrid = { ...DEFAULT_GRID, ...opts.grid };
 
@@ -435,26 +479,12 @@ export async function train(
   const entryIndex = new Map<string, ParserItem>();
   for (const it of items) entryIndex.set(`${it.symbol}|${it.direction}|${it.ts}`, it);
 
-  // ── кэш свечей НА ВРЕМЯ fit ──
-  // Одни и те же окна запрашиваются многократно: single-режим размечает кандидатов
-  // по разу на каждый windowK, refinement-раунды переразмечают победившую
-  // кластеризацию. Без кэша это повторный IO к бирже за теми же свечами.
-  // FIFO-кап держит память (~30МБ worst-case при 1445-свечных окнах).
-  const candleCache = new Map<string, import("./candle").ICandleData[]>();
-  const CANDLE_CACHE_CAP = 256;
-  const gcCached: GetCandles = async (symbol, interval, limit, sDate, eDate) => {
-    if (eDate !== undefined) return getCandles(symbol, interval, limit, sDate, eDate);
-    const key = `${symbol}|${interval}|${limit}|${sDate}`;
-    const hit = candleCache.get(key);
-    if (hit) return hit;
-    const res = await getCandles(symbol, interval, limit, sDate);
-    if (candleCache.size >= CANDLE_CACHE_CAP) {
-      const first = candleCache.keys().next().value;
-      if (first !== undefined) candleCache.delete(first);
-    }
-    candleCache.set(key, res);
-    return res;
-  };
+  // ── кэш свечей НА ВРЕМЯ fit (promise-dedup — конкурентная разметка не бьёт
+  // биржу дважды за одно окно). Одни и те же окна запрашиваются многократно:
+  // single-режим размечает кандидатов по разу на каждый windowK, refinement
+  // переразмечает победившую кластеризацию. Если источник уже обёрнут
+  // withCandleCache снаружи (walkForward) — двойная обёртка безвредна.
+  const gcCached: GetCandles = withCandleCache(getCandles, 256);
 
   // полный список exit-наборов (декартово произведение exit+volume осей)
   const roundTripCostPct = opts.roundTripCostPct ?? 0;
@@ -508,23 +538,26 @@ export async function train(
   const momentumAxis: Array<number | null> =
     grid.momentumGatePct.length ? grid.momentumGatePct : [null];
   const needMomentum = momentumAxis.some((g) => g !== null);
-  const preMomCache = new Map<string, number | null>();
-  const preMomentumOf = async (symbol: string, ts: number): Promise<number | null> => {
-    if (!needMomentum) return null;
+  // promise-кэш: конкурентный пул разметки не должен считать фичу дважды
+  const preMomCache = new Map<string, Promise<number | null>>();
+  const preMomentumOf = (symbol: string, ts: number): Promise<number | null> => {
+    if (!needMomentum) return Promise.resolve(null);
     const key = `${symbol}|${ts}`;
-    if (preMomCache.has(key)) return preMomCache.get(key)!;
-    let m: number | null = null;
-    try {
-      const start = entryStartTs(ts, "1m");
-      const pre = await fetchCandlesChunked(
-        gcCached, symbol, "1m", momentumWindow, start - momentumWindow * 60_000,
-      );
-      // только свечи СТРОГО до сигнала (обрезаем возможный хвост от щедрого адаптера)
-      const cut = pre.filter((c) => c.timestamp < start);
-      m = momentumPct(cut, cut.length, momentumWindow);
-    } catch { m = null; }
-    preMomCache.set(key, m);
-    return m;
+    const hit = preMomCache.get(key);
+    if (hit) return hit;
+    const p = (async () => {
+      try {
+        const start = entryStartTs(ts, "1m");
+        const pre = await fetchCandlesChunked(
+          gcCached, symbol, "1m", momentumWindow, start - momentumWindow * 60_000,
+        );
+        // только свечи СТРОГО до сигнала (обрезаем возможный хвост от щедрого адаптера)
+        const cut = pre.filter((c) => c.timestamp < start);
+        return momentumPct(cut, cut.length, momentumWindow);
+      } catch { return null; }
+    })();
+    preMomCache.set(key, p);
+    return p;
   };
   /** проходит ли кандидат гейт: null-гейт пропускает всех; null-фича — fail-closed */
   const passGate = (b: Labeled, gate: number | null): boolean => {
@@ -542,47 +575,60 @@ export async function train(
   const errorTally = new Map<string, number>();
   const diagSeen = new Set<string>();
 
+  // ── КОНКУРЕНТНАЯ разметка: пул из N labelBurst в полёте (IO-bound фаза) ──
+  // Результат детерминирован: слоты заполняются по индексу кандидата, порядок
+  // не зависит от порядка ответов сети. Тэлли-счётчики — однопоточный JS, гонок нет.
+  const labelConcurrency = Math.max(1, opts.labelConcurrency ?? 4);
   const labelCandidates = async (
     cands: ReturnType<typeof enumerateBursts>,
     onTick?: (symbol: string) => void,
   ): Promise<Labeled[]> => {
-    const labeled: Labeled[] = [];
-    for (const b of cands) {
-      const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
-      const { outcome, burst, error } = await labelBurst(
-        gcCached, b.symbol, b.direction, b.ts, exitSets,
-        src?.entryFromPrice, src?.entryToPrice,
-      );
-      onTick?.(b.symbol);
-      const diagKey = `${b.symbol}|${b.direction}|${b.ts}`;
-      if (!diagSeen.has(diagKey)) {
-        diagSeen.add(diagKey);
-        outcomeTally.set(outcome, (outcomeTally.get(outcome) ?? 0) + 1);
-        if (error) errorTally.set(error, (errorTally.get(error) ?? 0) + 1);
+    const slots: Array<Labeled | null> = new Array(cands.length).fill(null);
+    let nextIdx = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = nextIdx++;
+        if (i >= cands.length) return;
+        const b = cands[i];
+        const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
+        const { outcome, burst, error } = await labelBurst(
+          gcCached, b.symbol, b.direction, b.ts, exitSets,
+          src?.entryFromPrice, src?.entryToPrice,
+        );
+        onTick?.(b.symbol);
+        const diagKey = `${b.symbol}|${b.direction}|${b.ts}`;
+        if (!diagSeen.has(diagKey)) {
+          diagSeen.add(diagKey);
+          outcomeTally.set(outcome, (outcomeTally.get(outcome) ?? 0) + 1);
+          if (error) errorTally.set(error, (errorTally.get(error) ?? 0) + 1);
+        }
+        if (!burst) continue;
+        const byExit = new Map<string, ExitRec>();
+        // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
+        // и он ДОЛЖЕН учитываться как «не вошли и не потеряли», иначе policy=veto нечестно
+        // сравнивать с policy=none. Поэтому храним и не-entered, помечая флагом.
+        for (const [k, r] of burst.byExit) {
+          byExit.set(k, {
+            pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
+            entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
+            heldMinutes: r.heldMinutes, peak: r.peak, inverted: r.inverted,
+          });
+        }
+        if (byExit.size === 0) continue;
+        slots[i] = {
+          channel: src?.channel ?? "_unknown",
+          symbol: b.symbol, direction: b.direction, ts: b.ts,
+          independentClusters: b.independentClusters,
+          id: b.id, ids: b.ids,
+          byExit,
+          momentum24hPct: await preMomentumOf(b.symbol, b.ts),
+        };
       }
-      if (!burst) continue;
-      const byExit = new Map<string, ExitRec>();
-      // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
-      // и он ДОЛЖЕН учитываться как «не вошли и не потеряли», иначе policy=veto нечестно
-      // сравнивать с policy=none. Поэтому храним и не-entered, помечая флагом.
-      for (const [k, r] of burst.byExit) {
-        byExit.set(k, {
-          pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
-          entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
-          heldMinutes: r.heldMinutes, peak: r.peak, inverted: r.inverted,
-        });
-      }
-      if (byExit.size === 0) continue;
-      labeled.push({
-        channel: src?.channel ?? "_unknown",
-        symbol: b.symbol, direction: b.direction, ts: b.ts,
-        independentClusters: b.independentClusters,
-        id: b.id, ids: b.ids,
-        byExit,
-        momentum24hPct: await preMomentumOf(b.symbol, b.ts),
-      });
-    }
-    return labeled;
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(labelConcurrency, Math.max(cands.length, 1)) }, worker),
+    );
+    return slots.filter((x): x is Labeled => x !== null);
   };
 
   // ── фаза разметки с прогрессом ──
@@ -705,13 +751,17 @@ export async function train(
     foldScores: number[]; foldMeans: number[]; foldSizes: number[];
     returns: number[]; wins: number[];
   };
-  const evalSelection = (labeled: Labeled[], ekey: string, minC: number, gate: number | null): EvalDetail => {
+  // эмбарго фолдов = горизонт жизни оцениваемого exit: пути соседних сделок
+  // через границу фолда не должны перекрываться (purged CV)
+  const embargoOf = (ex: ExitParams): number => ex.staleMinutes * 60_000;
+  const evalSelection = (labeled: Labeled[], ekey: string, minC: number, gate: number | null, embargoMs: number): EvalDetail => {
     const selected = labeled
       .filter((b) => b.independentClusters >= minC && passGate(b, gate) && b.byExit.has(ekey))
       .sort((a, b) => a.ts - b.ts);
     const d: EvalDetail = { foldScores: [], foldMeans: [], foldSizes: [], returns: [], wins: [] };
     if (selected.length === 0) return d;
-    for (const { valLo, valHi } of timeSeriesFolds(selected.length, folds)) {
+    const tsArr = selected.map((b) => b.ts);
+    for (const { valLo, valHi } of timeSeriesFolds(tsArr, folds, embargoMs)) {
       const valRet = selected.slice(valLo, valHi).map((b) => b.byExit.get(ekey)!.pnl);
       d.foldScores.push(shrinkageExpectancy(valRet, shrinkageK));
       d.foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
@@ -725,7 +775,7 @@ export async function train(
     evalSelection(
       labeledFor({ wK: cfg.windowK, jac: cfg.jaccardThreshold, lag: cfg.lagPeakThreshold, sw: cfg.stationarityWindowMs })
         .filter((b) => keep(b.ts)),
-      exitKey(ex), cfg.minClusters, gate,
+      exitKey(ex), cfg.minClusters, gate, embargoOf(ex),
     );
 
   // total для фазы score = число детекторных комбо (тик на каждое)
@@ -745,7 +795,7 @@ export async function train(
         for (const gate of momentumAxis)
           for (const ex of scoringExits) {
             const cfg = cfgFor(d, minC);
-            const ev = evalSelection(labeled, exitKey(ex), minC, gate);
+            const ev = evalSelection(labeled, exitKey(ex), minC, gate, embargoOf(ex));
             if (ev.foldScores.length === 0) {
               out.push({ config: cfg, exit: ex, gate, cvScore: 0, cvWinrate: 0, cvSupport: 0, _foldScores: [], _sharpe: 0, _n: 0 });
               continue;
@@ -915,7 +965,7 @@ export async function train(
       // оценка вариантов; каждый — честное испытание (в board → innerTrials/DSR)
       let bestVar: { exit: ExitParams; gate: number | null; score: number; ev: EvalDetail } | null = null;
       for (const vr of variants) {
-        const ev = evalSelection(labeledWin, exitKey(vr.exit), minC, vr.gate);
+        const ev = evalSelection(labeledWin, exitKey(vr.exit), minC, vr.gate, embargoOf(vr.exit));
         const score = +avgOf(ev.foldScores).toFixed(6);
         board.push({
           config: top.config, exit: vr.exit, gate: vr.gate,
@@ -981,12 +1031,19 @@ export async function train(
       const oosScores: number[] = [];
       const K = selection.nestedOuterFolds;
       const foldSize = Math.floor(uniqTs.length / K);
+      // эмбарго внешних фолдов: максимальный горизонт жизни сделки в гриде.
+      // Train-сделки впритык к test-блоку (с обеих сторон) имеют pnl-пути,
+      // перекрывающие test-период — выбор конфига подсматривал бы в цены теста.
+      const nestedEmbargoMs = Math.max(...grid.staleMinutes) * 60_000;
       for (let f = 0; f < K; f++) {
-        // outer-test = f-й временной блок; outer-train = всё остальное
+        // outer-test = f-й временной блок; outer-train = всё остальное минус эмбарго
         const testLo = uniqTs[f * foldSize];
         const testHi = f === K - 1 ? Infinity : uniqTs[(f + 1) * foldSize];
         const inTest = (ts: number) => ts >= testLo && (testHi === Infinity ? true : ts < testHi);
-        const inTrain = (ts: number) => !inTest(ts);
+        // train = строго раньше теста с зазором ИЛИ строго позже теста с зазором
+        const inTrain = (ts: number) =>
+          ts < testLo - nestedEmbargoMs ||
+          (testHi !== Infinity && ts >= testHi + nestedEmbargoMs);
 
         // на train-срезе выбираем конфиг тем же 1-SE
         const trainBoard = buildBoard(inTrain);
@@ -1083,15 +1140,16 @@ export async function train(
     let best: { ex: ExitParams; score: number } | null = null;
     for (const ex of exitSets) {
       const ekey = exitKey(ex);
+      // ts сохраняем: purged-фолдам нужен вход сделки для эмбарго
       const rows = subset
-        .map((b) => b.byExit.get(ekey))
-        .filter((r): r is ExitRec =>
-          !!r && (regime === undefined || r.volRegime === regime));
+        .map((b) => ({ ts: b.ts, r: b.byExit.get(ekey) }))
+        .filter((x): x is { ts: number; r: ExitRec } =>
+          !!x.r && (regime === undefined || x.r.volRegime === regime));
       if (rows.length === 0) continue;
-      const foldSpecs = timeSeriesFolds(rows.length, folds);
+      const foldSpecs = timeSeriesFolds(rows.map((x) => x.ts), folds, embargoOf(ex));
       const scores: number[] = [];
       for (const { valLo, valHi } of foldSpecs) {
-        scores.push(shrinkageExpectancy(rows.slice(valLo, valHi).map((r) => r.pnl), shrinkageK));
+        scores.push(shrinkageExpectancy(rows.slice(valLo, valHi).map((x) => x.r.pnl), shrinkageK));
       }
       const avg = scores.length ? scores.reduce((s, x) => s + x, 0) / scores.length : 0;
       if (!best || avg > best.score) best = { ex, score: avg };
@@ -1268,6 +1326,7 @@ export async function train(
         candidates: diagSeen.size,
         outcomes: Object.fromEntries(outcomeTally) as Partial<Record<LabelOutcome, number>>,
         errors: Object.fromEntries(errorTally),
+        invalidItems,
       },
       calibration,
       refinement: refineRounds > 0 ? refinement : null,
@@ -1280,12 +1339,14 @@ export async function train(
   );
 
   // реестр С ЭТОЙ попыткой: цепочка учёта переобучений стартует даже без входного
-  // ledger — вызывающему остаётся сохранить и передать в следующий fit.
+  // ledger. Сериализуется в params.meta.ledger — model.json несёт свою родословную,
+  // и следующий fit(…, { metaLedger: model.ledgerAfterFit }) работает после load().
   const ledger = recordAttempt(opts.metaLedger ?? emptyLedger(), {
     ts: params.meta.trainedAt,
     innerTrials,
     certifiedNaive: certification.certified,
   });
+  params.meta.ledger = ledger;
 
   return { predict: loadPredict(params), params, reliability, leaderboard, ledger };
 }

@@ -359,6 +359,21 @@ declare function oneStandardErrorSelect<T>(entries: T[], scoreOf: (e: T) => numb
  */
 declare function percentile(xs: number[], p: number): number;
 /**
+ * АДАПТИВНАЯ СИЛА УСАДКИ (эмпирический Байес, метод моментов) — вместо
+ * назначенного «k=5».
+ *
+ * Модель: pnl группы g = μ_g + шум, μ_g ~ N(μ₀, τ²), шум ~ (0, σ²).
+ * Дисперсия наблюдаемых средних групп: Var(mean_g) ≈ τ² + σ²/n_g, откуда
+ *   τ̂² = max(Var(means) − σ̂²·mean(1/n_g), 0),   k̂ = σ̂²/τ̂²
+ * (классический James-Stein: вес родителя k в формуле (n·x̄_g + k·μ₀)/(n+k)).
+ * Однородные группы → τ²≈0 → k̂ огромный → всё честно стягивается к родителю;
+ * реально различающиеся → k̂ маленький → группы отстаивают своё.
+ *
+ * < 3 валидных групп → fallback (межгрупповую дисперсию оценивать нечем).
+ * Кламп [0.5, 200] — санитарный (вырожденные τ̂²).
+ */
+declare function empiricalPoolK(groups: number[][], fallback: number): number;
+/**
  * КВАНТИЛЬНЫЕ ПРЕДЛОЖЕНИЯ EXIT из статистики пути (MAE/MFE-анализ, Sweeney).
  *
  * Перебор сетки судит конфиги по финальному pnl, выбрасывая информацию о пути.
@@ -1686,7 +1701,10 @@ interface TrainOptions {
      */
     labelConcurrency?: number;
     /**
-     * Раунды УТОЧНЯЮЩЕГО брутфорса (coarse-to-fine) вокруг победителя грубой сетки.
+     * КАП раундов уточняющего брутфорса (coarse-to-fine). Число раундов больше не
+     * выбор пользователя: зум ОСТАНАВЛИВАЕТСЯ САМ, когда раунд не принял ни одного
+     * переезда или шаг брекетов сошёлся (< 2% относительных). Значение — только
+     * предохранитель от бесконечности.
      * Грубый шаг (×2–×4 между узлами) может целиком спрятать узкую прибыльную
      * область — истинный оптимум между узлами невидим, и fit ложно скажет «эджа
      * нет». Каждый раунд пробует середины интервалов вокруг победителя по всем
@@ -2295,5 +2313,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
 export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

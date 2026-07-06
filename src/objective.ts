@@ -92,6 +92,45 @@ export function percentile(xs: number[], p: number): number {
 }
 
 /**
+ * АДАПТИВНАЯ СИЛА УСАДКИ (эмпирический Байес, метод моментов) — вместо
+ * назначенного «k=5».
+ *
+ * Модель: pnl группы g = μ_g + шум, μ_g ~ N(μ₀, τ²), шум ~ (0, σ²).
+ * Дисперсия наблюдаемых средних групп: Var(mean_g) ≈ τ² + σ²/n_g, откуда
+ *   τ̂² = max(Var(means) − σ̂²·mean(1/n_g), 0),   k̂ = σ̂²/τ̂²
+ * (классический James-Stein: вес родителя k в формуле (n·x̄_g + k·μ₀)/(n+k)).
+ * Однородные группы → τ²≈0 → k̂ огромный → всё честно стягивается к родителю;
+ * реально различающиеся → k̂ маленький → группы отстаивают своё.
+ *
+ * < 3 валидных групп → fallback (межгрупповую дисперсию оценивать нечем).
+ * Кламп [0.5, 200] — санитарный (вырожденные τ̂²).
+ */
+export function empiricalPoolK(groups: number[][], fallback: number): number {
+  const valid = groups.filter((g) => g.length >= 2);
+  if (valid.length < 3) return fallback;
+  const meanOf = (a: number[]) => a.reduce((s, x) => s + x, 0) / a.length;
+  // объединённая внутригрупповая дисперсия
+  let ssWithin = 0;
+  let dfWithin = 0;
+  let invN = 0;
+  const means: number[] = [];
+  for (const g of valid) {
+    const m = meanOf(g);
+    means.push(m);
+    for (const x of g) ssWithin += (x - m) ** 2;
+    dfWithin += g.length - 1;
+    invN += 1 / g.length;
+  }
+  const sigma2 = dfWithin > 0 ? ssWithin / dfWithin : 0;
+  if (!(sigma2 > 0)) return fallback;
+  const mBar = meanOf(means);
+  const varMeans = means.reduce((s, m) => s + (m - mBar) ** 2, 0) / (means.length - 1);
+  const tau2 = Math.max(varMeans - sigma2 * (invN / valid.length), 0);
+  if (tau2 <= sigma2 * 1e-9) return 200; // группы неразличимы — максимальный пулинг
+  return Math.min(Math.max(sigma2 / tau2, 0.5), 200);
+}
+
+/**
  * КВАНТИЛЬНЫЕ ПРЕДЛОЖЕНИЯ EXIT из статистики пути (MAE/MFE-анализ, Sweeney).
  *
  * Перебор сетки судит конфиги по финальному pnl, выбрасывая информацию о пути.

@@ -124,7 +124,7 @@ What deliberately **stays** constant: the certificate's α-levels (DSR 0.95 / PB
 
 ### Coarse-to-fine — the grid step must not hide the edge
 
-A coarse grid (×2–×4 between nodes) can miss a narrow profitable region entirely: if the true optimal `trailingTake` is 1.0 and the grid has [0.5, 2], `fit` honestly reports "no edge" while the edge sits *between the nodes*. `refineRounds` (default **2** in casual mode, 0 with an explicit grid) runs an iterative zoom after the coarse winner: geometric midpoints toward the neighboring nodes on every continuous exit axis (+ the momentum-gate threshold), one axis at a time, with brackets halving each round. Two guards keep the finer step from becoming an overfitting machine: a move is accepted only when the improvement **exceeds the winner's SE** (significance, not noise), and every evaluated variant is a real trial — it enters the board, so `innerTrials`/DSR/SPA see the *entire* search, including the zoom. The audit is serialized in `meta.refinement` (`{ rounds, evaluated, accepted }`); `nestedScore` is computed on the coarse grid only. Candles are cached for the whole `fit`, so refinement rounds re-label the winning clustering without re-hitting the exchange.
+A coarse grid (×2–×4 between nodes) can miss a narrow profitable region entirely: if the true optimal `trailingTake` is 1.0 and the grid has [0.5, 2], `fit` honestly reports "no edge" while the edge sits *between the nodes*. The zoom **stops by itself** — a round that accepts no move, or brackets converged below 2%, ends the search; `refineRounds` is only a safety cap (default 6 in casual mode, 0 with an explicit grid). It runs an iterative zoom after the coarse winner: geometric midpoints toward the neighboring nodes on every continuous exit axis (+ the momentum-gate threshold), one axis at a time, with brackets halving each round. Two guards keep the finer step from becoming an overfitting machine: a move is accepted only when the improvement **exceeds the winner's SE** (significance, not noise), and every evaluated variant is a real trial — it enters the board, so `innerTrials`/DSR/SPA see the *entire* search, including the zoom. The audit is serialized in `meta.refinement` (`{ rounds, evaluated, accepted }`); `nestedScore` is computed on the coarse grid only. Candles are cached for the whole `fit`, so refinement rounds re-label the winning clustering without re-hitting the exchange.
 
 Everything measured is serialized for audit:
 
@@ -390,10 +390,10 @@ The guarantee is verified: 720 `fit` runs on pure noise produce false naive cert
 **Hierarchical pooling (empirical Bayes).** Cells no longer pick exits independently on their 2-3 noisy trades, and the fallback is no longer a cliff. Each exit's CV score in a cell is **blended with its parent's** along the chain cell(regime) ← symbol-dir ← global:
 
 ```
-pooled(ex) = (n·score_cell + k·score_parent) / (n + k),   k = shrinkageK
+pooled(ex) = (n·score_cell + k·score_parent) / (n + k)
 ```
 
-A cell with a couple of trades inherits the parent's ranking (its own noise barely weighs), a cell with a large sample outweighs the parent with its `n`. No new constants — `k` is the existing shrinkage strength.
+A cell with a couple of trades inherits the parent's ranking (its own noise barely weighs), a cell with a large sample outweighs the parent with its `n`. The strength `k` is **estimated, not assigned** (empirical Bayes, method of moments): `k̂ = σ²_within / τ̂²_between` over the symbol-dir groups — homogeneous groups pool hard, genuinely different ones defend their own estimates. Fewer than 3 groups → fallback to `shrinkageK` (nothing to estimate the between-variance from). The same estimator drives the channel-score shrinkage.
 
 The model does NOT duplicate the stoploss/targets from the post, and does NOT mix exit math across sources. trailing/hardStop/impact-horizon are trained **separately per cell** of the tensor — every channel moves every symbol differently, a long-trap and a short-trap have different dynamics, and anomalous volume requires a tighter trailing.
 
@@ -696,7 +696,7 @@ Related math upgrades: `verdict.nEffClusters` — the **effective number of inde
 
 Three decisions that used to live in the operator's head are now automated:
 
-- **Channel triage (`channelPlan`)** — at `fit`, every channel with enough trades is judged: significantly loss-making (shrunk score < 0, |t| ≥ 2, n ≥ 10) **and mechanical** (`algoScore ≥ 0.7` — the stop-hunt-bot fingerprint) → `"invert"`, its signals are traded *against* the post automatically (exit from the inverse tensor cell, `origin.invertedFrom` keeps what the channel said); significantly loss-making but human → `"drop"`, its signals are cut. Everything else follows. The plan is part of the model, so **walk-forward validates the triage itself out-of-sample**. Opt out with `channelTriage: false`; inversion respects the `allow` list.
+- **Channel triage (`channelPlan`)** — at `fit`, every channel with enough trades is judged: significantly loss-making (|t| ≥ 2, n ≥ 10) → then the data decides directly whether inversion pays: `"invert"` only if the inverted flow is **significantly profitable net of double costs** (`−pnl − 2×roundTripCost`, same t-test — no `algoScore ≥ 0.7` magic; `algoScore` stays as diagnostics of *why* the channel is like that), otherwise `"drop"`. Inverted signals are traded *against* the post automatically (exit from the inverse tensor cell, `origin.invertedFrom` keeps what the channel said). Everything else follows. The plan is part of the model, so **walk-forward validates the triage itself out-of-sample**. Opt out with `channelTriage: false`; inversion respects the `allow` list.
 - **Capacity check (`policy.notionalQuote`)** — instead of "compare `origin.liquidityQuote` with your size yourself": give the policy your order size once, and signals where `notionalQuote > maxLiquidityShare × liquidityQuote` (default 10% of median per-minute turnover) are cut automatically. Tighten-only, candles required.
 - **The go/no-go checklist (`assessEdge`)** — the whole operational sequence "fit → certificate → walk-forward → certified-only slice → decide" is one call:
 
@@ -771,7 +771,7 @@ fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); //
 
 1. **selfTuneLag** — self-estimates the characteristic lag τ from the histogram of pairwise delays between channels. No magic constants.
 2. **jaccardScreen** — coarse sieve of channel proximity over a sliding window of raw timestamps.
-3. **lagXCorr** — directed graph of "who follows whom" from a sharp cross-correlation peak.
+3. **lagXCorr** — directed graph of "who follows whom" from a sharp cross-correlation peak. The sharpness cut is floored by a **binomial chance bound**: under H₀ (uniform lags over ±horizon) the expected in-peak share is `p₀ = peakWindow/horizon`, and an edge must beat `p₀ + 2√(p₀(1−p₀)/n)` — a small sample or a wide window can no longer manufacture "sharp" peaks out of noise, regardless of how low the user threshold is set.
 4. **clusterAuthors** — union-find: merges channels belonging to the same author.
 5. **earlyWarning** — density over INDEPENDENT clusters (deduplicating N channels of one actor).
 6. **hawkesBurst** — self-excitation of the event stream (Hawkes intensity, exponential kernel with τ from layer 1). A pump is a self-exciting cascade: raw event counts can't tell "5 posts/hour on a ticker that always gets 5 posts/hour" from the same burst on a ticker that posts once a week. `burstScore` = excitation over the Poisson chance bound (`λ₀τ + 2√(λ₀τ)`, same convention as viability); bursts below the bound get their confidence discounted.

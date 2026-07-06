@@ -54,7 +54,15 @@ export function lagXCorr(
 
     const within = deltas.filter((d) => Math.abs(d) <= peakWindow);
     const peakShare = within.length / deltas.length;
-    if (peakShare < peakThreshold) continue;
+    // ── БИНОМИАЛЬНЫЙ ПОРОГ СЛУЧАЙНОСТИ: острота против равномерного фона ──
+    // Под H0 (совпадения, лаги равномерны на ±HORIZON) ожидаемая доля лагов в
+    // окне пика p0 = peakWindow/HORIZON; порог = p0 + 2√(p0(1−p0)/n) — та же
+    // конвенция «+2σ», что в viability/hawkes. Фикс-порог юзера остаётся ручкой
+    // строгости, но НИЖЕ порога случайности пропустить ребро нельзя: маленький
+    // n или широкое окно больше не производят «острые» пики из шума.
+    const p0 = Math.min(peakWindow / HORIZON, 1);
+    const chanceBound = p0 + 2 * Math.sqrt((p0 * (1 - p0)) / deltas.length);
+    if (peakShare < Math.max(peakThreshold, chanceBound)) continue;
 
     const sorted = [...deltas].sort((x, y) => x - y);
     const med = sorted[Math.floor(sorted.length / 2)];

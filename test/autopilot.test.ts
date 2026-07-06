@@ -26,13 +26,16 @@ const baseOpts = {
 // АВТО-ТРИАЖ КАНАЛОВ: «drop убыточных, invert механических» — внутри fit.
 // ─────────────────────────────────────────────────────────────────────────────
 describe("channelPlan — триаж каналов без участия оператора", () => {
-  // Мир: goodhuman лонгует растущий GOODUSDT (+); botdump — cron-бот (ежедневно
-  // 14:00), лонгует падающий BADUSDT (значимый минус, механика) → invert;
-  // sadhuman — человек (рваное время), лонгует падающий SADUSDT → drop.
+  // Мир: goodhuman лонгует растущий GOODUSDT (+) → follow;
+  // botdump сливает КРУПНО (−1.2%/сделку): инверсия отбивает двойные издержки
+  // (2×0.2%) → invert — решают ДАННЫЕ, а не порог algoScore;
+  // sadhuman сливает МЕЛКО (−0.15% до издержек): убыточен значимо, но инверсия
+  // двойных издержек не отбивает → drop.
   const priceOf = (symbol: string, t: number): number => {
     const m = (t - t0) / MIN;
     if (symbol === "GOODUSDT") return 100 * Math.pow(1.0004, m);
-    return 300 * Math.pow(0.9996, m); // BADUSDT и SADUSDT падают
+    if (symbol === "SADUSDT") return 300 * Math.pow(0.99995, m); // −0.15% за 30м
+    return 300 * Math.pow(0.9996, m); // BADUSDT: −1.2% за 30м
   };
   const gc: GetCandles = async (symbol, _i, limit, sDate) => {
     const out: ICandleData[] = [];
@@ -55,16 +58,18 @@ describe("channelPlan — триаж каналов без участия опе
     items.push({ channel: "sadhuman", symbol: "SADUSDT", direction: "long", ts: t0 + 24 * HOUR + i * 23 * HOUR + (i * i * 37) % 900 * MIN });
   }
 
-  it("fit строит план: бот-слив → invert, человек-слив → drop, прибыльный → follow", async () => {
-    const res = await train(items, gc, baseOpts);
+  const triageOpts = { ...baseOpts, roundTripCostPct: 0.2 }; // издержки участвуют в решении invert
+
+  it("fit строит план: крупный слив → invert (окупает издержки), мелкий → drop", async () => {
+    const res = await train(items, gc, triageOpts);
     const plan = res.params.channelPlan!;
-    expect(plan.botdump).toBe("invert");   // значимый минус + algoScore (cron 14:00)
-    expect(plan.sadhuman).toBe("drop");    // значимый минус, человеческий паттерн
+    expect(plan.botdump).toBe("invert");   // −pnl − 2×издержки значимо > 0
+    expect(plan.sadhuman).toBe("drop");    // значимо убыточен, но инверсия издержки не отбивает
     expect(plan.goodhuman).toBeUndefined(); // follow
   });
 
   it("рантайм применяет план сам: drop режется, invert разворачивается", async () => {
-    const res = await train(items, gc, baseOpts);
+    const res = await train(items, gc, triageOpts);
     const m = PumpMatrix.load(PumpMatrix.load(res.params as never).save()); // план переживает save/load
     const freshTs = t0 + 60 * 24 * HOUR;
     const sigs = m.signals([
@@ -83,7 +88,7 @@ describe("channelPlan — триаж каналов без участия опе
   });
 
   it("инверсия плана уважает allow: без 'invert' канал режется как veto", async () => {
-    const res = await train(items, gc, baseOpts);
+    const res = await train(items, gc, triageOpts);
     const m = PumpMatrix.load(res.params as never);
     const sigs = m.signals(
       [{ channel: "botdump", symbol: "BADUSDT", direction: "long", ts: t0 + 60 * 24 * HOUR }],
@@ -93,7 +98,7 @@ describe("channelPlan — триаж каналов без участия опе
   });
 
   it("channelTriage: false → плана нет, все follow", async () => {
-    const res = await train(items, gc, { ...baseOpts, channelTriage: false });
+    const res = await train(items, gc, { ...triageOpts, channelTriage: false });
     expect(Object.keys(res.params.channelPlan ?? {}).length).toBe(0);
   });
 });

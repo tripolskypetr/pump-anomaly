@@ -25,7 +25,7 @@ import { labelBurst, exitKey, LabelOutcome } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats, percentile, exitProposalsFromPath } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats, percentile, exitProposalsFromPath, empiricalPoolK } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
 import {
   MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
@@ -194,7 +194,10 @@ export interface TrainOptions {
    */
   labelConcurrency?: number;
   /**
-   * Раунды УТОЧНЯЮЩЕГО брутфорса (coarse-to-fine) вокруг победителя грубой сетки.
+   * КАП раундов уточняющего брутфорса (coarse-to-fine). Число раундов больше не
+   * выбор пользователя: зум ОСТАНАВЛИВАЕТСЯ САМ, когда раунд не принял ни одного
+   * переезда или шаг брекетов сошёлся (< 2% относительных). Значение — только
+   * предохранитель от бесконечности.
    * Грубый шаг (×2–×4 между узлами) может целиком спрятать узкую прибыльную
    * область — истинный оптимум между узлами невидим, и fit ложно скажет «эджа
    * нет». Каждый раунд пробует середины интервалов вокруг победителя по всем
@@ -952,7 +955,8 @@ export async function train(
   //  (2) каждый вариант попадает в board → innerTrials/DSR/SPA видят ВЕСЬ перебор.
   // Новые replay дёшевы: ~16 вариантов/раунд × кандидаты победившей кластеризации,
   // свечи из кэша fit'а.
-  const refineRounds = Math.max(0, opts.refineRounds ?? (opts.grid == null ? 2 : 0));
+  // кап щедрый: авто-стоп срабатывает обычно за 2-3 раунда
+  const refineRounds = Math.max(0, opts.refineRounds ?? (opts.grid == null ? 6 : 0));
   const refinement = { rounds: 0, evaluated: 0, accepted: 0 };
   if (refineRounds > 0) {
     const labeledWin = labeledFor({
@@ -1105,16 +1109,22 @@ export async function train(
         curEval = bestVar.ev;
         refinement.accepted++;
       }
+      const acceptedThisRound = bestVar !== null && curExit === bestVar.exit && curGate === bestVar.gate;
       // ополовинить брекеты вокруг текущего значения — шаг сходится сам
+      let maxRatio = 1;
       for (const a of numAxes) {
         const cur = (curExit as unknown as Record<string, unknown>)[a.k];
         const br = brackets.get(a.k);
         if (typeof cur !== "number" || !br || !(br.lo > 0)) continue;
         brackets.set(a.k, { lo: Math.sqrt(cur * br.lo), hi: Math.sqrt(cur * br.hi) });
+        maxRatio = Math.max(maxRatio, br.hi / Math.max(br.lo, 1e-12));
       }
       if (curGate !== null && gateBracket) {
         gateBracket = { lo: (curGate + gateBracket.lo) / 2, hi: (curGate + gateBracket.hi) / 2 };
       }
+      // ── АВТО-СТОП: раунд без принятого переезда или сошедшийся шаг ──
+      // при более узком шаге SE-гвард тем более не пробить; дальше — жжение CPU
+      if (!acceptedThisRound || maxRatio < 1.02) break;
     }
 
     if (refinement.accepted > 0 && curEval) {
@@ -1294,7 +1304,7 @@ export async function train(
       const c = child.get(k);
       const n = c?.n ?? 0;
       out.set(k, {
-        score: (n * (c?.score ?? 0) + shrinkageK * p.score) / (n + shrinkageK),
+        score: (n * (c?.score ?? 0) + poolK * p.score) / (n + poolK),
         n,
         ex: p.ex,
       });
@@ -1335,6 +1345,17 @@ export async function train(
     const sk = `${b.symbol}\u0001${b.direction}`;
     (groupSD.get(sk) ?? groupSD.set(sk, []).get(sk)!).push(b);
   }
+
+  // ── АДАПТИВНАЯ СИЛА ПУЛИНГА (эмпирический Байес вместо «k=5») ──
+  // k̂ = σ²_внутри/τ̂²_между по pnl групп symbol-dir под exit победителя:
+  // однородные группы → сильный пулинг, реально различающиеся → слабый.
+  // < 3 групп → fallback shrinkageK (межгрупповую дисперсию оценивать нечем).
+  const topEkey = exitKey(top.exit);
+  const poolK = empiricalPoolK(
+    [...groupSD.values()].map((subset) =>
+      subset.map((b) => b.byExit.get(topEkey)?.pnl).filter((x): x is number => x !== undefined)),
+    shrinkageK,
+  );
 
   // symbol-dir уровень: скоры ячейки ПУЛЯТСЯ с глобальными (малое n → следует
   // глобальному ранжированию, большое n → перевешивает). Пулёные скоры сохраняем —
@@ -1444,10 +1465,13 @@ export async function train(
   for (const it of items) {
     (channelPosts.get(it.channel) ?? channelPosts.set(it.channel, []).get(it.channel)!).push(it.ts);
   }
+  // сила усадки скора каналов — эмпирический Байес по межканальной дисперсии
+  // (однородные каналы → жёсткая усадка, реально разные → мягкая); <3 каналов → shrinkageK
+  const channelK = empiricalPoolK([...channelPnls.values()], shrinkageK);
   const channelScore: Record<string, { score: number; median: number; n: number; algoScore?: number }> = {};
   for (const [ch, pnls] of channelPnls) {
     channelScore[ch] = {
-      score: +shrinkageExpectancy(pnls, shrinkageK).toFixed(6),
+      score: +shrinkageExpectancy(pnls, channelK).toFixed(6),
       median: +percentile(pnls, 0.5).toFixed(6),
       n: pnls.length,
       algoScore: algoSignatureOf(channelPosts.get(ch) ?? []).algoScore,
@@ -1455,13 +1479,15 @@ export async function train(
   }
 
   // ── АВТО-ТРИАЖ КАНАЛОВ: «что делать с каналом» решает статистика, не оператор ──
-  // Константы триажа: TRIAGE_MIN_N — не судим канал по паре сделок (тот же дух,
-  // что n<8 в algo-сигнатуре); |t| ≥ 2 ≈ 95%-значимость убыточности; ALGO_INVERT —
-  // порог «механического» происхождения, при котором анти-предиктивность канала
-  // направленная (стоп-хант бот) и её выгоднее инвертировать, чем выбрасывать.
+  // Константы: TRIAGE_MIN_N — не судим канал по паре сделок; |t| ≥ 2 ≈ 95% —
+  // α-конвенция, не подгонка. Порога «algoScore ≥ 0.7» больше НЕТ: invert
+  // решают сами данные — инвертированный поток канала должен быть значимо
+  // прибылен НЕТТО (pnl уже нетто; инверсия платит издержки второй раз:
+  // −pnl − 2×cost). Убыточен, но инверсия издержки не отбивает → drop.
+  // algoScore остаётся диагностикой «почему канал такой» в channelScore.
   const TRIAGE_MIN_N = 10;
   const TRIAGE_T = 2;
-  const TRIAGE_ALGO_INVERT = 0.7;
+  const tradeCostFrac = roundTripCostPct / 100;
   const channelPlan: Record<string, "invert" | "drop"> = {};
   if (opts.channelTriage ?? true) {
     for (const [ch, pnls] of channelPnls) {
@@ -1472,11 +1498,12 @@ export async function train(
       const variance = pnls.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1);
       const se = Math.sqrt(variance) / Math.sqrt(n);
       // se≈0 при одинаковых убытках — значимо по построению
-      const significant = se < Math.abs(mean) * 1e-9 || Math.abs(mean) / se >= TRIAGE_T;
-      if (!significant) continue;
-      channelPlan[ch] = (channelScore[ch].algoScore ?? 0) >= TRIAGE_ALGO_INVERT
-        ? "invert"   // механический анти-предиктивный канал → торгуем против него
-        : "drop";    // просто убыточный автор → не торгуем его вовсе
+      const sigLoss = se < Math.abs(mean) * 1e-9 || Math.abs(mean) / se >= TRIAGE_T;
+      if (!sigLoss) continue;
+      // инверсия: матожидание −pnl минус двойные издержки, значимость тем же t
+      const invMean = -mean - 2 * tradeCostFrac;
+      const sigInvert = invMean > 0 && (se < invMean * 1e-9 || invMean / se >= TRIAGE_T);
+      channelPlan[ch] = sigInvert ? "invert" : "drop";
     }
   }
 

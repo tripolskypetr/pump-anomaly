@@ -215,7 +215,7 @@ export {
   momentumPct, rangeFeatures, zoneOffsetPct,
 } from "./volume";
 export type { VolumeFeatures, VolRegime } from "./volume";
-export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect, pnlStats } from "./objective";
+export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect, pnlStats, empiricalPoolK } from "./objective";
 export type { RiskRewardStats, PnlStats } from "./objective";
 export {
   computeReliability,

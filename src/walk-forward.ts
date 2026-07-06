@@ -6,6 +6,7 @@ import { SignalPolicy } from "./signal";
 import { PnlStats, pnlStats } from "./objective";
 import { sharpe } from "./statistics";
 import { PumpMatrix } from "./pump-matrix";
+import { CapitalTrade, CapitalSimResult, simulateCapital } from "./capital";
 
 /**
  * WALK-FORWARD — единственный честный ответ на «будет ли это зарабатывать».
@@ -59,6 +60,16 @@ export interface WalkForwardResult {
     /** сколько блоков были «зелёными» */
     slicesUsed: number;
   };
+  /**
+   * КАПИТАЛЬНАЯ ОДНОВРЕМЕННОСТЬ: Σpnl выше предполагает бесконечный капитал —
+   * пампы кластеризуются, и в плотный час открылось бы больше позиций, чем есть
+   * слотов. Здесь та же OOS-цепочка прогнана через жадную очередь слотов
+   * (opts.maxConcurrentPositions; без опции лимит=∞ — тогда это чистый замер
+   * СПРОСА: demandPeak говорит, сколько параллельных позиций подразумевает Σpnl).
+   * sumUnconstrained − sumConstrained = сколько бумажного дохода недоступно
+   * при твоём капитале.
+   */
+  capital: CapitalSimResult;
 }
 
 export interface WalkForwardOptions {
@@ -77,6 +88,14 @@ export interface WalkForwardOptions {
    * По умолчанию = max(staleMinutes грида) — горизонт жизни самой долгой сделки.
    */
   embargoMinutes?: number;
+  /**
+   * Сколько позиций твой капитал держит ОДНОВРЕМЕННО. Включает честную симуляцию
+   * очереди слотов (result.capital): сигнал при заполненных слотах пропускается,
+   * при одновременном прибытии первым берётся больший E[pnl] модели исхода.
+   * Не задано = ∞ (старое поведение Σpnl), но result.capital.demandPeak всё равно
+   * покажет, сколько параллельных позиций эта сумма молча предполагает.
+   */
+  maxConcurrentPositions?: number;
 }
 
 const maxDrawdownOf = (equity: number[]): number => {
@@ -120,6 +139,7 @@ export async function walkForward(
   const slices: WalkForwardSlice[] = [];
   const oosPnls: number[] = [];
   const certPnls: number[] = [];
+  const capitalTrades: CapitalTrade[] = [];
   let certSlices = 0;
 
   // эмбарго = горизонт самой долгой сделки грида (если не переопределён)
@@ -153,6 +173,14 @@ export async function walkForward(
       .filter((x) => x.result.entered)
       .sort((a, b) => a.ts - b.ts);
     const pnls = entered.map((x) => x.result.pnl);
+    for (const x of entered) {
+      capitalTrades.push({
+        ts: x.ts,
+        heldMinutes: x.result.heldMinutes,
+        pnl: x.result.pnl,
+        priority: x.probability?.expectedPnl ?? null,
+      });
+    }
 
     const certified = model.certification.certified;
     if (certified) {
@@ -191,5 +219,6 @@ export async function walkForward(
       maxDrawdown: +maxDrawdownOf(cert.equity).toFixed(6),
       slicesUsed: certSlices,
     },
+    capital: simulateCapital(capitalTrades, opts.maxConcurrentPositions ?? null),
   };
 }

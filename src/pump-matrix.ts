@@ -838,7 +838,7 @@ export class PumpMatrix {
     // Мягкая замена ступенчатых гейтов: каждый признак — вклад в правдоподобие,
     // отсутствующий признак честно даёт 0. Гейты minPWin / minExpectedPnlPct
     // превращают вход в решение об ожидаемой ценности.
-    let probability: { pWin: number; expectedPnl: number; informative: boolean } | null = null;
+    let probability: TradeSignal["probability"] = null;
     if (this.params.outcome) {
       const pred = predictOutcome(this.params.outcome, {
         clusters: v.independentClusters ?? null,
@@ -859,6 +859,7 @@ export class PumpMatrix {
       probability = pred;
       note("pWin", pred.pWin);
       note("expectedPnlPct", +(pred.expectedPnl * 100).toFixed(4));
+      note("recommendedRiskFrac", pred.recommendedRiskFrac);
       if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) {
         return reject("min-pwin", `P(win) ${pred.pWin} < порога ${policy.minPWin}`);
       }

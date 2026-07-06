@@ -5,6 +5,8 @@ import { walkForward, WalkForwardResult, WalkForwardOptions } from "./walk-forwa
 import { minTrackRecordLength } from "./statistics";
 import { withCandleCache, withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { PumpMatrix } from "./pump-matrix";
+import { placeboItems } from "./placebo";
+import { PnlStats } from "./objective";
 
 /**
  * ASSESS EDGE — операционный чеклист «можно ли этим торговать», автоматизированный.
@@ -44,6 +46,21 @@ export interface EdgeAssessment {
   summary: string;
   /** конкретные следующие действия, по одному на строку */
   nextSteps: string[];
+  /**
+   * ПЛАЦЕБО-КОНТРОЛЬ (opts.placebo: true): тот же walk-forward, но время постов
+   * каждого канала сдвинуто назад на детерминированный лаг — информация постов
+   * уничтожена, свойства рынка сохранены. Если плацебо не хуже реального прогона,
+   * «эдж» объясняется рынком, не постами: вердикт "trade" понижается до "paper".
+   * null = контроль не запускался.
+   */
+  placebo?: {
+    stats: PnlStats;
+    sharpe: number;
+    trades: number;
+    /** true = реальный прогон ЗНАЧИМО лучше плацебо (эдж именно в постах) */
+    beatsPlacebo: boolean;
+    note: string;
+  } | null;
 }
 
 export interface AssessOptions {
@@ -51,6 +68,12 @@ export interface AssessOptions {
   trainOptions?: TrainOptions;
   /** опции walk-forward (slices/policy/embargo/…) */
   walkForward?: Omit<WalkForwardOptions, "trainOptions">;
+  /**
+   * Прогнать плацебо-контроль (сдвинутые ts постов, см. placeboItems). Удваивает
+   * время оценки, но отвечает на вопрос, который DSR/PBO не закрывают: эдж в
+   * ПОСТАХ или в рынке. При placebo ≥ реального вердикт "trade" не выдаётся.
+   */
+  placebo?: boolean;
 }
 
 export async function assessEdge(
@@ -68,6 +91,28 @@ export async function assessEdge(
     ...opts.walkForward,
     trainOptions: opts.trainOptions,
   });
+
+  // ── плацебо: тот же пайплайн, время постов уничтожено (сдвиг по каналам) ──
+  let placebo: EdgeAssessment["placebo"] = null;
+  if (opts.placebo) {
+    const pwf = await walkForward(placeboItems(items), gc, {
+      ...opts.walkForward,
+      trainOptions: opts.trainOptions,
+    });
+    // сравнение по полной OOS-цепочке обеих веток (одинаковые правила игры);
+    // «бьёт плацебо» = реальный прогон лучше и по медиане, и по Sharpe —
+    // без новых порогов: плацебо, которое не хуже, само и есть порог.
+    const beats = wf.stats.median > pwf.stats.median && wf.sharpe > pwf.sharpe;
+    placebo = {
+      stats: pwf.stats,
+      sharpe: pwf.sharpe,
+      trades: pwf.oosPnls.length,
+      beatsPlacebo: beats,
+      note: beats
+        ? `реальный прогон лучше плацебо (медиана ${(wf.stats.median * 100).toFixed(3)}% vs ${(pwf.stats.median * 100).toFixed(3)}%, Sharpe ${wf.sharpe.toFixed(2)} vs ${pwf.sharpe.toFixed(2)}) — эдж несут именно посты`
+        : `плацебо НЕ хуже реального прогона (медиана ${(pwf.stats.median * 100).toFixed(3)}% vs ${(wf.stats.median * 100).toFixed(3)}%, Sharpe ${pwf.sharpe.toFixed(2)} vs ${wf.sharpe.toFixed(2)}) — «эдж» объясняется рынком, не информацией постов`,
+    };
+  }
 
   // режим эксплуатации — «торгуем только когда сертификат зелёный»; если ни один
   // срез не сертифицировался, честно оцениваем всю OOS-цепочку, но до "trade"
@@ -102,7 +147,8 @@ export async function assessEdge(
   } else {
     const enough = pnls.length >= minTRL;
     const finalCertified = model.certification.certified;
-    if (certifiedMode && enough && finalCertified) {
+    const placeboOk = placebo === null || placebo.beatsPlacebo;
+    if (certifiedMode && enough && finalCertified && placeboOk) {
       verdict = "trade";
       reasons.push(`OOS-медиана +${(stats.median * 100).toFixed(3)}%/сделку, Sharpe ${sharpeOos.toFixed(3)}, N=${pnls.length} ≥ minTRL=${minTRL.toFixed(0)}`);
       reasons.push("финальная модель сертифицирована (DSR/PBO/SPA/minTRL/nested)");
@@ -115,9 +161,11 @@ export async function assessEdge(
         reasons.push("но финальный сертификат красный:");
         for (const r of model.certification.reasons) reasons.push(`  ${r}`);
       }
+      if (!placeboOk) reasons.push(`но ${placebo!.note}`);
       reasons.push("вердикт: бумага/микро-размер, копить форвард-данные до minTRL");
     }
   }
+  if (placebo && placebo.beatsPlacebo) reasons.push(`плацебо-контроль пройден: ${placebo.note}`);
 
   // ── человеческий итог: числа переведены в текст и действия ──
   const nextSteps: string[] = [];
@@ -131,6 +179,14 @@ export async function assessEdge(
   if (pnls.length > 0) {
     sum.push(`Результат вне обучения: медиана ${(stats.median * 100).toFixed(2)}% на сделку (нетто издержек), просадка цепочки ${(wf.maxDrawdown * 100).toFixed(1)}%.`);
   }
+  // капитальная одновременность: Σpnl молча предполагает demandPeak параллельных позиций
+  const cap = wf.capital;
+  if (cap.skipped > 0) {
+    sum.push(`Ёмкость капитала: при ${cap.maxConcurrentPositions} слотах взято ${cap.taken}/${cap.taken + cap.skipped} сделок; доход ${(cap.sumConstrained * 100).toFixed(1)}% против ${(cap.sumUnconstrained * 100).toFixed(1)}% на бумаге с бесконечным капиталом.`);
+  } else if (cap.demandPeak > 1) {
+    sum.push(`Внимание: Σpnl предполагает до ${cap.demandPeak} одновременных позиций — задайте walkForward.maxConcurrentPositions под свой капитал.`);
+  }
+  if (placebo) sum.push(`Плацебо-контроль: ${placebo.note}.`);
   if (verdict === "trade") {
     nextSteps.push("деплой a.model; риск на сделку малый; переобучение не чаще cadence-guard");
     nextSteps.push("следить: форвард-медиана должна сходиться с бэктестовой — при рассинхроне стоп");
@@ -144,7 +200,10 @@ export async function assessEdge(
     nextSteps.push("не торговать; проверить качество каналов (model.channelScore) и издержки (calibration.spreadPct)");
     nextSteps.push("если сигналов подозрительно мало — model.explainSignals(items, candles) покажет, какой фильтр режет");
   }
+  if (placebo && !placebo.beatsPlacebo) {
+    nextSteps.push("плацебо не проиграло — искать эдж в отборе каналов (channelScore/триаж), сырой поток постов не информативен");
+  }
   const summary = [...sum, "Что делать: " + nextSteps.map((x, i) => `${i + 1}) ${x}`).join("; ") + "."].join("\n");
 
-  return { verdict, reasons, model, walkForward: wf, minTRL, oosTrades: pnls.length, summary, nextSteps };
+  return { verdict, reasons, model, walkForward: wf, minTRL, oosTrades: pnls.length, summary, nextSteps, placebo };
 }

@@ -83,8 +83,13 @@ export interface TradeSignal {
    * ПРОГНОЗ модели исхода: калиброванная P(win) и ожидаемый pnl (доли, нетто).
    * informative=false = модель не побила prior по OOF-Brier — pWin равен prior,
    * не притворяясь точнее данных. null = модель не обучалась (мало сделок).
+   * recommendedRiskFrac — доля банкролла под позицию (четверть-Келли, 0..1;
+   * 0 при E[pnl] ≤ 0): sizing перестаёт быть магической константой пользователя.
    */
-  probability?: { pWin: number; expectedPnl: number; informative: boolean } | null;
+  probability?: {
+    pWin: number; expectedPnl: number; informative: boolean;
+    recommendedRiskFrac: number;
+  } | null;
   /** происхождение (аудит), не для ветвления */
   origin: SignalOrigin;
 }

@@ -258,3 +258,8 @@ export { assessEdge } from "./assess";
 export { validateGetCandles, inspectItems } from "./doctor";
 export type { AdapterCheck, ItemsReport } from "./doctor";
 export type { EdgeAssessment, EdgeVerdict, AssessOptions } from "./assess";
+export { simulateCapital } from "./capital";
+export type { CapitalTrade, CapitalSimResult } from "./capital";
+export { PaperTrader } from "./paper-trader";
+export type { ForwardTrade, DriftReport } from "./paper-trader";
+export { placeboItems } from "./placebo";

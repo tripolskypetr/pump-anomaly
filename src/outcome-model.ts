@@ -221,7 +221,20 @@ export interface OutcomePrediction {
   /** E[pnl|x] = pWin·meanWin + (1−pWin)·meanLoss, доли */
   expectedPnl: number;
   informative: boolean;
+  /**
+   * РАЗМЕР ПОЗИЦИИ: рекомендуемая доля банкролла (0..1), четверть-Келли.
+   * Полный Келли f* = p/|meanLoss| − (1−p)/meanWin оптимален только при ТОЧНЫХ
+   * параметрах; оценки из ~100 сделок шумные, а перебор Келли наказывается
+   * экспоненциально (2×Келли = нулевой рост). Четверть — стандартная конвенция
+   * защиты от ошибки оценивания (как 1.96 для 95%), не подгоночный параметр.
+   * Кап 1.0 = «не больше банкролла» (советов с плечом не даём). 0 при E[pnl] ≤ 0.
+   * Раньше sizing был магической константой НА СТОРОНЕ пользователя.
+   */
+  recommendedRiskFrac: number;
 }
+
+/** четверть-Келли — стандартный дисконт против ошибки оценивания параметров */
+const KELLY_FRACTION = 0.25;
 
 export function predictOutcome(
   model: OutcomeModel,
@@ -232,9 +245,17 @@ export function predictOutcome(
     ? stepPredict(model.calibration, rawScore(model.features, model.prior, features))
     : model.prior;
   const expectedPnl = pWin * model.meanWin + (1 - pWin) * model.meanLoss;
+  // Келли по бинарной аппроксимации исхода: выигрыш b=meanWin, проигрыш a=|meanLoss|
+  const b = model.meanWin;
+  const a = Math.abs(model.meanLoss);
+  let kelly = 0;
+  if (expectedPnl > 0 && a > 0 && b > 0) {
+    kelly = Math.min(Math.max(KELLY_FRACTION * (pWin / a - (1 - pWin) / b), 0), 1);
+  }
   return {
     pWin: +pWin.toFixed(6),
     expectedPnl: +expectedPnl.toFixed(6),
     informative: model.informative,
+    recommendedRiskFrac: +kelly.toFixed(6),
   };
 }

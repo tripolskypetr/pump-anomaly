@@ -983,6 +983,20 @@ declare const exitKey: (p: ExitParams) => string;
 declare function labelBurst(getCandles: GetCandles, symbol: string, direction: Direction, ts: number, exitSets: ExitParams[], entryFromPrice?: number, entryToPrice?: number): Promise<LabelResult>;
 
 /**
+ * Дефолтное терпение к сети: сколько ждать ответа getCandles, прежде чем честно
+ * упасть. КОНСТАНТА СРЕДЫ (не влияет на математику при живой сети) — но её
+ * ОТСУТСТВИЕ было худшей магической константой из всех: неявная ∞, при которой
+ * повисший адаптер = навсегда повисший fit/plan без единого сообщения.
+ */
+declare const DEFAULT_CANDLE_TIMEOUT_MS = 30000;
+/**
+ * Дедлайн-обёртка над getCandles: любой вызов либо отвечает за timeoutMs, либо
+ * отклоняется с внятной ошибкой. Внутри конвейера отказ пойман штатно:
+ * в разметке кандидат станет adapter-error с текстом таймаута в meta.labeling.errors,
+ * в plan()/backtest() — сигнал без свечей. Зависание превращается в диагностику.
+ */
+declare function withTimeout(getCandles: GetCandles, timeoutMs: number): GetCandles;
+/**
  * Кэширующая обёртка над getCandles (ключ = symbol|interval|limit|since).
  *
  *  - PROMISE-DEDUP: конкурентные запросы одного окна (пул разметки) сливаются в
@@ -1711,6 +1725,12 @@ interface TrainOptions {
      */
     authorGraph?: "xcorr" | "hawkes";
     /**
+     * Терпение к сети: максимум мс на ОДИН вызов getCandles, дальше — честная
+     * ошибка (кандидат станет adapter-error с текстом таймаута, fit не виснет).
+     * Константа среды: при живой сети на результат не влияет. Дефолт 30000.
+     */
+    candleTimeoutMs?: number;
+    /**
      * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
      * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
      * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
@@ -1975,6 +1995,12 @@ declare class PumpMatrix {
     private readonly params;
     private readonly _predict;
     private readonly _ledger;
+    /**
+     * АНТИ-ЗАВИСАНИЕ live-путей: дедлайн на один вызов getCandles в plan()/backtest().
+     * Повисший адаптер превращается в «сигнал без свечей» / result no-candles, а не
+     * в вечно висящий прод. Константа среды, настраиваемая процессом целиком.
+     */
+    static candleTimeoutMs: number;
     private constructor();
     /** Обучить модель на истории сигналов. */
     static fit(history: ParserItem[], getCandles: GetCandles, opts?: TrainOptions): Promise<PumpMatrix>;
@@ -2354,6 +2380,7 @@ interface AdapterCheck {
 declare function validateGetCandles(getCandles: GetCandles, opts?: {
     symbol?: string;
     ts?: number;
+    timeoutMs?: number;
 }): Promise<AdapterCheck>;
 interface ItemsReport {
     total: number;
@@ -2393,5 +2420,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
+export { CASCADE_AGGRESSION, DEFAULT_CANDLE_TIMEOUT_MS, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, withTimeout, zoneOffsetPct };
 export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

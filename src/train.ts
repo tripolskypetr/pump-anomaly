@@ -5,7 +5,7 @@ import {
   PredictionResult,
 } from "./types";
 import { GetCandles, entryStartTs } from "./candle";
-import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
+import { fetchCandlesChunked, withCandleCache, withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { momentumPct, rangeFeatures, zoneOffsetPct } from "./volume";
 import { algoSignatureOf } from "./layers/algo-signature";
 import { hawkesBurst } from "./layers/hawkes-burst";
@@ -185,6 +185,12 @@ export interface TrainOptions {
    * с разными trainOptions.authorGraph.
    */
   authorGraph?: "xcorr" | "hawkes";
+  /**
+   * Терпение к сети: максимум мс на ОДИН вызов getCandles, дальше — честная
+   * ошибка (кандидат станет adapter-error с текстом таймаута, fit не виснет).
+   * Константа среды: при живой сети на результат не влияет. Дефолт 30000.
+   */
+  candleTimeoutMs?: number;
   /**
    * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
    * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
@@ -484,6 +490,11 @@ export async function train(
   const items = normalizeParserItems(rawItems) as unknown as ParserItem[];
   const invalidItems = rawItems.length - items.length;
 
+  // ── АНТИ-ЗАВИСАНИЕ: у каждого сетевого вызова есть дедлайн ──
+  // Повисший адаптер без таймаута вешал fit навсегда (неявная ∞ — худшая из
+  // магических констант). Теперь зависание = внятная ошибка в диагностике.
+  const gcSafe = withTimeout(getCandles, opts.candleTimeoutMs ?? DEFAULT_CANDLE_TIMEOUT_MS);
+
   const grid: TrainGrid = { ...DEFAULT_GRID, ...opts.grid };
 
   // ── АВТОКАЛИБРОВКА (casual): размер осей из данных, а не из головы ──
@@ -494,7 +505,7 @@ export async function train(
   let calibration: Calibration | null = null;
   const wantCalibration = opts.autoCalibrate ?? (opts.grid == null);
   if (wantCalibration) {
-    calibration = await calibrateGrid(items, getCandles, {
+    calibration = await calibrateGrid(items, gcSafe, {
       staleMinutes: grid.staleMinutes,
       stalenessSinceMinutes: grid.stalenessSinceMinutes,
     });
@@ -551,7 +562,7 @@ export async function train(
   // single-режим размечает кандидатов по разу на каждый windowK, refinement
   // переразмечает победившую кластеризацию. Если источник уже обёрнут
   // withCandleCache снаружи (walkForward) — двойная обёртка безвредна.
-  const gcCached: GetCandles = withCandleCache(getCandles, 256);
+  const gcCached: GetCandles = withCandleCache(gcSafe, 256);
 
   // ── АВТО-ИЗДЕРЖКИ: спред из данных + табличная комиссия ──
   // Дефолт «0» был худшей магической константой (идеальное исполнение,

@@ -1,6 +1,33 @@
 import { GetCandles, ICandleData, CandleInterval, STEP_MS, alignTs } from "./candle";
 
 /**
+ * Дефолтное терпение к сети: сколько ждать ответа getCandles, прежде чем честно
+ * упасть. КОНСТАНТА СРЕДЫ (не влияет на математику при живой сети) — но её
+ * ОТСУТСТВИЕ было худшей магической константой из всех: неявная ∞, при которой
+ * повисший адаптер = навсегда повисший fit/plan без единого сообщения.
+ */
+export const DEFAULT_CANDLE_TIMEOUT_MS = 30_000;
+
+/**
+ * Дедлайн-обёртка над getCandles: любой вызов либо отвечает за timeoutMs, либо
+ * отклоняется с внятной ошибкой. Внутри конвейера отказ пойман штатно:
+ * в разметке кандидат станет adapter-error с текстом таймаута в meta.labeling.errors,
+ * в plan()/backtest() — сигнал без свечей. Зависание превращается в диагностику.
+ */
+export function withTimeout(getCandles: GetCandles, timeoutMs: number): GetCandles {
+  return (symbol, interval, limit, sDate, eDate) =>
+    new Promise<ICandleData[]>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(
+        `getCandles не ответил за ${timeoutMs}мс (${symbol} ${interval} limit=${limit}) — сеть/адаптер завис (таймаут candleTimeoutMs)`,
+      )), timeoutMs);
+      Promise.resolve(getCandles(symbol, interval, limit, sDate, eDate)).then(
+        (r) => { clearTimeout(timer); resolve(r); },
+        (e) => { clearTimeout(timer); reject(e); },
+      );
+    });
+}
+
+/**
  * Кэширующая обёртка над getCandles (ключ = symbol|interval|limit|since).
  *
  *  - PROMISE-DEDUP: конкурентные запросы одного окна (пул разметки) сливаются в

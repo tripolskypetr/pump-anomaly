@@ -3,7 +3,7 @@ import { GetCandles } from "./candle";
 import { TrainOptions } from "./train";
 import { walkForward, WalkForwardResult, WalkForwardOptions } from "./walk-forward";
 import { minTrackRecordLength } from "./statistics";
-import { withCandleCache } from "./chunked-candles";
+import { withCandleCache, withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { PumpMatrix } from "./pump-matrix";
 
 /**
@@ -59,7 +59,10 @@ export async function assessEdge(
   opts: AssessOptions = {},
 ): Promise<EdgeAssessment> {
   // один кэш свечей на walk-forward И финальный fit
-  const gc = withCandleCache(getCandles, opts.walkForward?.cacheCapacity ?? 1024);
+  const gc = withCandleCache(
+    withTimeout(getCandles, opts.trainOptions?.candleTimeoutMs ?? DEFAULT_CANDLE_TIMEOUT_MS),
+    opts.walkForward?.cacheCapacity ?? 1024,
+  );
 
   const wf = await walkForward(items, gc, {
     ...opts.walkForward,

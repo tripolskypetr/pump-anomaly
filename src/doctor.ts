@@ -1,4 +1,5 @@
 import { GetCandles, alignTs, STEP_MS } from "./candle";
+import { withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { ParserItem } from "./types";
 import { normalizeParserItems } from "./index";
 
@@ -27,8 +28,10 @@ export interface AdapterCheck {
  */
 export async function validateGetCandles(
   getCandles: GetCandles,
-  opts: { symbol?: string; ts?: number } = {},
+  opts: { symbol?: string; ts?: number; timeoutMs?: number } = {},
 ): Promise<AdapterCheck> {
+  // доктор не имеет права зависнуть, диагностируя зависший адаптер
+  const gc = withTimeout(getCandles, opts.timeoutMs ?? DEFAULT_CANDLE_TIMEOUT_MS);
   const issues: string[] = [];
   const notes: string[] = [];
   const step = STEP_MS["1m"];
@@ -39,7 +42,7 @@ export async function validateGetCandles(
 
   let candles;
   try {
-    candles = await getCandles(symbol, "1m", 50, ragged);
+    candles = await gc(symbol, "1m", 50, ragged);
   } catch (e) {
     return {
       ok: false,
@@ -89,7 +92,7 @@ export async function validateGetCandles(
   if (badOhlc) issues.push(`битые OHLCV: ${badOhlc} свечей (high < max(open,close), low > min(open,close), NaN или отрицательный объём)`);
   // 5) малый лимит соблюдается
   try {
-    const five = await getCandles(symbol, "1m", 5, base);
+    const five = await gc(symbol, "1m", 5, base);
     if (Array.isArray(five) && five.length > 5) issues.push(`limit=5 не соблюдён: получено ${five.length}`);
   } catch { notes.push("повторный запрос (limit=5) бросил — нестабильный адаптер?"); }
 

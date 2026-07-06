@@ -206,7 +206,7 @@ export { resolveExit, resolveExitNoRegime } from "./exit-tensor";
 export type { ExitTensor, ResolvedExit, ResolveSource } from "./exit-tensor";
 export { enumerateBursts, enumeratePosts } from "./enumerate";
 export { labelBurst, exitKey } from "./label";
-export { fetchCandlesChunked, withCandleCache, MAX_CANDLES_PER_CHUNK } from "./chunked-candles";
+export { fetchCandlesChunked, withCandleCache, withTimeout, MAX_CANDLES_PER_CHUNK, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 export type { LabeledBurst } from "./label";
 export { replayExit } from "./replay";
 export type { ExitParams, ExitReason, ReplayResult } from "./replay";

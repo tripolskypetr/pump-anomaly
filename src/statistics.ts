@@ -182,7 +182,17 @@ export function minTrackRecordLength(
 export function probabilityOfBacktestOverfitting(perf: number[][]): number {
   const nConfigs = perf.length;
   if (nConfigs === 0) return NaN; // нечего оценивать → НЕ выдаём ложный 0.5
-  const S = perf[0].length;
+  let S = perf[0].length;
+  // ── АНТИ-ЗАВИСАНИЕ: C(S, S/2) взрывной (S=20 → 184к, S=30 → 155 МИЛЛИОНОВ
+  // комбинаций — процесс «висит»). Кап 12 → максимум C(12,6)=924 разбиения;
+  // при S>12 берём 12 равномерно разнесённых фолдов (сохраняет временнóе
+  // покрытие; точность CSCV на 924 разбиениях уже избыточна).
+  const MAX_CSCV_FOLDS = 12;
+  let foldPick = Array.from({ length: S }, (_, i) => i);
+  if (S > MAX_CSCV_FOLDS) {
+    foldPick = Array.from({ length: MAX_CSCV_FOLDS }, (_, i) => Math.floor((i * S) / MAX_CSCV_FOLDS));
+    S = MAX_CSCV_FOLDS;
+  }
   if (S < 2 || S % 2 !== 0) {
     // CSCV требует чётное число фолдов ≥ 2. Возвращаем NaN (не 0.5!), иначе
     // реальный эдж с нечётным числом фолдов читался бы как «оверфит». Вызывающий
@@ -190,7 +200,7 @@ export function probabilityOfBacktestOverfitting(perf: number[][]): number {
     return NaN;
   }
   const half = S / 2;
-  const folds = Array.from({ length: S }, (_, i) => i);
+  const folds = foldPick;
   const combos = chooseCombinations(folds, half);
   let overfit = 0;
   let total = 0;

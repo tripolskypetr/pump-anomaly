@@ -79,6 +79,7 @@ const paperTrades = await model.plan(liveItems, getCandles, { acknowledgeUncerti
 - **`model.explainSignals(items, candles?)`** — why each potential signal did or did not come out: the machine-readable filter code (`momentum-gate`, `capacity`, `channel-plan:drop`, …), a human reason with numbers, and the feature values at the decision point. `plan()` stays silent by design; this is the debugging counterpart.
 - **`model.report()`** and **`assessEdge(...).summary` / `.nextSteps`** — the statistics translated into actions: «мало сделок: есть 22, нужно ≥49 — копите форвард» instead of «DSR 0.36 < 0.95». Ready to log or pipe to Telegram.
 - The progress bar now shows an **ETA** per phase.
+- **No infinite waits.** Every `getCandles` call has a deadline (`candleTimeoutMs`, default 30s — an environment constant that never affects results on a live network; its previous *absence* was the worst magic constant of all: an implicit ∞ where a hung adapter froze `fit`/`plan` forever with no message). A timeout becomes visible diagnostics: an `adapter-error` with the timeout text in `meta.labeling.errors` during fit, a candle-less signal in `plan()` (process-wide knob: `PumpMatrix.candleTimeoutMs`). The CSCV combinatorial blow-up is capped too: PBO subsamples to ≤12 evenly-spaced folds (`C(12,6)=924` splits max) — `folds: 30` no longer means 155 million iterations.
 
 Three execution methods, by what candles they're allowed to see:
 

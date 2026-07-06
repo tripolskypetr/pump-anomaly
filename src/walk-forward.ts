@@ -1,6 +1,6 @@
 import { ParserItem } from "./types";
 import { GetCandles } from "./candle";
-import { withCandleCache } from "./chunked-candles";
+import { withCandleCache, withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { TrainOptions, DEFAULT_GRID } from "./train";
 import { SignalPolicy } from "./signal";
 import { PnlStats, pnlStats } from "./objective";
@@ -103,7 +103,10 @@ export async function walkForward(
   const K = Math.max(1, opts.slices ?? 4);
   // ОДИН кэш свечей на все срезы: K переобучений размечают пересекающиеся
   // префиксы истории — без общего кэша каждый срез заново тянет те же окна с биржи.
-  const gc = withCandleCache(getCandles, opts.cacheCapacity ?? 1024);
+  const gc = withCandleCache(
+    withTimeout(getCandles, opts.trainOptions?.candleTimeoutMs ?? DEFAULT_CANDLE_TIMEOUT_MS),
+    opts.cacheCapacity ?? 1024,
+  );
   const sorted = [...items]
     .filter((i) => i && Number.isFinite(i.ts))
     .sort((a, b) => a.ts - b.ts);

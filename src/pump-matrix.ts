@@ -1,6 +1,6 @@
 import { ParserItem, PumpVerdict, Direction } from "./types";
 import { GetCandles, ICandleData, entryStartTs, STEP_MS } from "./candle";
-import { fetchCandlesChunked } from "./chunked-candles";
+import { fetchCandlesChunked, withTimeout, DEFAULT_CANDLE_TIMEOUT_MS } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
 import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, momentumPct, rangeFeatures, zoneOffsetPct, VolRegime } from "./volume";
 import { replayExit } from "./replay";
@@ -38,6 +38,13 @@ import { predictOutcome } from "./outcome-model";
  * (allow-список), но не шире, чем зашито в обученную модель (readonly-инвариант).
  */
 export class PumpMatrix {
+  /**
+   * АНТИ-ЗАВИСАНИЕ live-путей: дедлайн на один вызов getCandles в plan()/backtest().
+   * Повисший адаптер превращается в «сигнал без свечей» / result no-candles, а не
+   * в вечно висящий прод. Константа среды, настраиваемая процессом целиком.
+   */
+  static candleTimeoutMs = DEFAULT_CANDLE_TIMEOUT_MS;
+
   private constructor(
     private readonly params: TrainedParams,
     private readonly _predict: (items: ParserItem[]) => ReturnType<TrainResult["predict"]>,
@@ -337,9 +344,10 @@ export class PumpMatrix {
 
   private async planLiveViaGetCandles(
     items: ParserItem[],
-    getCandles: GetCandles,
+    getCandlesRaw: GetCandles,
     policy?: Partial<SignalPolicy>,
   ): Promise<TradeSignal[]> {
+    const getCandles = withTimeout(getCandlesRaw, PumpMatrix.candleTimeoutMs);
     const eff = intersectPolicy(this.params.policy, policy);
     // окно ДО сигнала (единый источник — геттер lookbackMinutes): базлайн объёма +
     // горизонт каскада, всё в прошлом, без forward. Momentum-фильтр требует своё
@@ -397,9 +405,10 @@ export class PumpMatrix {
 
   private async backtestViaGetCandles(
     items: ParserItem[],
-    getCandles: GetCandles,
+    getCandlesRaw: GetCandles,
     policy?: Partial<SignalPolicy>,
   ): Promise<BacktestSignal[]> {
+    const getCandles = withTimeout(getCandlesRaw, PumpMatrix.candleTimeoutMs);
     const eff = intersectPolicy(this.params.policy, policy);
     const maxLife = this.params.exit.global.staleMinutes;
     // momentum-фильтр меряется по свечам ДО сигнала — тянем окно и в бэктесте.

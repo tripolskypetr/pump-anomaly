@@ -726,8 +726,11 @@ fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); //
 3. **lagXCorr** — directed graph of "who follows whom" from a sharp cross-correlation peak.
 4. **clusterAuthors** — union-find: merges channels belonging to the same author.
 5. **earlyWarning** — density over INDEPENDENT clusters (deduplicating N channels of one actor).
+6. **hawkesBurst** — self-excitation of the event stream (Hawkes intensity, exponential kernel with τ from layer 1). A pump is a self-exciting cascade: raw event counts can't tell "5 posts/hour on a ticker that always gets 5 posts/hour" from the same burst on a ticker that posts once a week. `burstScore` = excitation over the Poisson chance bound (`λ₀τ + 2√(λ₀τ)`, same convention as viability); bursts below the bound get their confidence discounted.
+7. **authorInfluence** — leadership from the *direction* of layer-3 edges (previously collapsed by union-find). A burst carried by graph **leaders** and a burst of pure **echo channels** whose leaders stay silent are different events: echo without a leader smells of copy-paste, not independent confirmation. Neutral composition → no change; echo-heavy → discount (conservative: leaders get no bonus). Exposed as `predict().influence` and `verdict.leaderShare`.
+8. **algoSignature** — per-channel bot fingerprint (formalizes the [algorithmic stop-hunt research](https://habr.com/ru/articles/1028592/)): interval-lattice regularity (log-histogram entropy) and cron-like hour-of-day concentration. Serialized as `channelScore[ch].algoScore`; high `algoScore` + negative `score` = inversion candidate, the call is the operator's.
 
-All five are computed over the stationarity window. In single mode the matrix isn't needed — every post becomes an entry directly (`singleChannelSignals`).
+`confidence = dedup × fill × hawkes × leadership`. Layers 1–7 are computed over the stationarity window. In single mode the matrix isn't needed — every post becomes an entry directly (`singleChannelSignals`); layer 8 is computed at `fit` from the raw post stream.
 
 **Honest auto-diagnostics.** `model.modeReason` explains WHY `single` or `matrix` was chosen — no guessing. Examples: `auto → single: one channel — correlation impossible`, `auto → matrix: 3 strong edges, overlap 5, clusters >1: 2`. Matrix requires ≥2 INDEPENDENT author clusters on the same ticker; echo channels (always firing together) correctly collapse into 1 cluster and don't produce a false matrix signal. On single-channel data it's always single fallback.
 

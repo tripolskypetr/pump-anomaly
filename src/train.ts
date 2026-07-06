@@ -7,6 +7,7 @@ import {
 import { GetCandles, entryStartTs } from "./candle";
 import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
 import { momentumPct } from "./volume";
+import { algoSignatureOf } from "./layers/algo-signature";
 import { enumerateBursts, enumeratePosts } from "./enumerate";
 import { buildTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
@@ -260,8 +261,12 @@ export interface TrainedParams {
    * обгонит канал с 30 стабильными: малое n усаживается к нулю. median/n — для
    * аудита. Runtime-фильтр policy.minChannelScore режет сигналы каналов ниже
    * порога (matrix-сигналы межканальные — проходят всегда). Сериализуется.
+   *
+   * algoScore (слой 8) — подозрение на АЛГОРИТМИЧЕСКОЕ происхождение канала по
+   * механическим паттернам постинга (решётка интервалов, cron-расписание).
+   * Высокий algoScore + отрицательный score = кандидат на инверсию (habr 1028592).
    */
-  channelScore?: Record<string, { score: number; median: number; n: number }>;
+  channelScore?: Record<string, { score: number; median: number; n: number; algoScore?: number }>;
   /**
    * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
    * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -1278,12 +1283,19 @@ export async function train(
     if (!h.entered) continue;
     (channelPnls.get(h.channel) ?? channelPnls.set(h.channel, []).get(h.channel)!).push(h.pnl);
   }
-  const channelScore: Record<string, { score: number; median: number; n: number }> = {};
+  // слой 8: алгоритмическая сигнатура — по ВСЕМ постам канала (не только сделкам):
+  // механика постинга видна в сыром потоке, независимо от того, вошли ли мы
+  const channelPosts = new Map<string, number[]>();
+  for (const it of items) {
+    (channelPosts.get(it.channel) ?? channelPosts.set(it.channel, []).get(it.channel)!).push(it.ts);
+  }
+  const channelScore: Record<string, { score: number; median: number; n: number; algoScore?: number }> = {};
   for (const [ch, pnls] of channelPnls) {
     channelScore[ch] = {
       score: +shrinkageExpectancy(pnls, shrinkageK).toFixed(6),
       median: +percentile(pnls, 0.5).toFixed(6),
       n: pnls.length,
+      algoScore: algoSignatureOf(channelPosts.get(ch) ?? []).algoScore,
     };
   }
 

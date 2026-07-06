@@ -83,6 +83,10 @@ interface PumpVerdict {
     /** зона входа из parser-item — нужна для открытия live-позиции */
     entryFromPrice?: number;
     entryToPrice?: number;
+    /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
+    burstScore?: number;
+    /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */
+    leaderShare?: number;
 }
 /** Карта авторства: канал → id кластера-автора. */
 type AuthorMap = Map<string, number>;
@@ -104,6 +108,8 @@ interface PredictionResult {
     usedMode: "matrix" | "single";
     /** Оценка жизнеспособности матрицы (почему выбран режим в auto). */
     viability: ViabilityReport;
+    /** Слой 7: влиятельность каналов из направленного lead-lag графа (matrix/auto). */
+    influence?: Map<string, number>;
 }
 interface DetectorConfig {
     windowK: number;
@@ -250,11 +256,114 @@ declare function clusterAuthors(channels: string[], edges: DirectedEdge[]): Auth
  * а РАЗНЫХ кластеров. Всплеск из N каналов одного автора → 1 кластер → skip.
  * Всплеск из ≥ minClusters независимых кластеров → open.
  *
- * confidence = dedup × fill, где
- *   dedup = clusters/channels (1 = все источники независимы, <1 = есть дубли автора)
- *   fill  = насыщенность окна относительно minClusters·2 (растёт с числом источников)
+ * confidence = dedup × fill × hawkes × leadership, где
+ *   dedup     = clusters/channels (1 = все источники независимы, <1 = дубли автора)
+ *   fill      = насыщенность окна относительно minClusters·2
+ *   hawkes    = слой 6: дисконт всплеска, не превысившего порог случайности фона
+ *               тикера (пачка постов на вечно шумном тикере ≠ пачка на тихом)
+ *   leadership= слой 7: дисконт всплеска из одних «эхо»-каналов (лидеры молчат);
+ *               нейтральный/лидерский состав → 1 (без изменений)
  */
-declare function earlyWarning(tbl: EventTable, clusterOf: AuthorMap, cfg: DetectorConfig, tau: number): PumpVerdict[];
+declare function earlyWarning(tbl: EventTable, clusterOf: AuthorMap, cfg: DetectorConfig, tau: number, 
+/** влиятельность каналов из направленного графа (слой 7); нет → нейтрально */
+influence?: Map<string, number>): PumpVerdict[];
+
+/**
+ * Слой 6 — САМОВОЗБУЖДЕНИЕ потока событий (Hawkes-интенсивность).
+ *
+ * Памп — самовозбуждающийся каскад: пост порождает посты (пересылы, братские
+ * каналы, реакция других авторов). Голый счёт событий в окне (слой 5) не
+ * различает «5 постов за час на тикере, где обычно 5 постов в час» и «5 постов
+ * за час на тикере, где пост бывает раз в неделю». Hawkes-мера различает:
+ *
+ *   возбуждение E(t) = Σ_{tᵢ<t} exp(−(t−tᵢ)/τ)   — экспоненциальное ядро, τ из слоя 1
+ *   фон       λ₀·τ  = средняя скорость группы × τ — матожидание E при Пуассоне
+ *
+ * burstScore = E / (λ₀τ + 2·√(λ₀τ) + ε) — кратность превышения ПОРОГА СЛУЧАЙНОСТИ
+ * (та же конвенция λ+2√λ, что в viability). score ≥ 1 — возбуждение статистически
+ * не объяснимо фоном; score < 1 — «всплеск» в пределах обычной болтовни тикера.
+ *
+ * Используется как вес confidence в earlyWarning: разреженный тикер с внезапной
+ * пачкой постов ценнее, чем вечно шумный с той же пачкой.
+ */
+interface HawkesBurst {
+    /** кратность превышения порога случайности (≥1 = значимо) */
+    score: number;
+    /** сырое возбуждение E(t) на момент события */
+    excitation: number;
+    /** порог случайности λ₀τ + 2√(λ₀τ) */
+    chanceBound: number;
+}
+declare function hawkesBurst(
+/** ts событий группы (symbol,direction), отсортированы по возрастанию */
+groupTs: number[], 
+/** индекс события-якоря, на момент которого меряем интенсивность */
+idx: number, 
+/** характерный лаг τ, мс (из selfTuneLag) */
+tau: number): HawkesBurst;
+/** Вес для confidence: ниже порога случайности — дисконт, выше — без штрафа. */
+declare const hawkesWeight: (score: number) => number;
+
+/**
+ * Слой 7 — ВЛИЯТЕЛЬНОСТЬ авторов из направленного lead-lag графа.
+ *
+ * Слой 3 уже знает, КТО ЗА КЕМ повторяет (leader/follower с остротой пика), но
+ * до сих пор эта информация схлопывалась в ненаправленный union-find (слой 4).
+ * Направление несёт сигнал: всплеск, в котором участвуют ЛИДЕРЫ графа, и всплеск
+ * из одних «эхо»-каналов (чьи лидеры молчат) — разные события. Эхо без лидера —
+ * подозрение на копипасту/бота, а не на независимое подтверждение.
+ *
+ * influence ∈ [0,1] на канал: сглаженная (Лаплас) доля лидерства по рёбрам,
+ * взвешенная остротой пика ребра:
+ *
+ *   influence = (0.5 + Σ_lead peakShare) / (1 + Σ_lead peakShare + Σ_follow peakShare)
+ *
+ * Изолированный канал (нет рёбер) → нейтральные 0.5: независимость не награда
+ * и не штраф, мы просто ничего не знаем о его роли.
+ */
+declare function authorInfluence(channels: string[], edges: DirectedEdge[]): Map<string, number>;
+/**
+ * Вес всплеска по лидерству участников: среднее influence каналов среза,
+ * нормированное так, что нейтральный состав (0.5) → 1 (без изменений),
+ * чистое эхо → дисконт к 0, лидеры → без бонуса (консервативно, cap 1).
+ */
+declare function leadershipWeight(sliceChannels: Iterable<string>, influence: Map<string, number>): {
+    weight: number;
+    leaderShare: number;
+};
+
+/**
+ * Слой 8 — АЛГОРИТМИЧЕСКАЯ СИГНАТУРА канала (формализация habr 1028592).
+ *
+ * В исследовании алгоритмическое происхождение сигналов выдали механические
+ * паттерны: решётка интервалов между постами (одинаковые множители) и посты по
+ * расписанию. Такой канал — не человек с инсайтом, а бот-стратегия, и его
+ * сигналы часто анти-предиктивны (стоп-хант: 8/8 шортов TRX двинулись против) —
+ * кандидат на ИНВЕРСИЮ, а не на следование.
+ *
+ * Две интерпретируемые компоненты, обе ∈ [0,1]:
+ *  - intervalRegularity: 1 − нормированная энтропия лог-гистограммы интервалов
+ *    между постами. Метроном → энтропия 0 → регулярность 1; человеческий поток
+ *    (широкое распределение) → регулярность ≈ 0.
+ *  - modalHourShare*: доля постов в модальном часе суток (UTC), нормированная
+ *    от фона 1/24 к 1. Бот на cron постит в одно время; человек размазан.
+ *
+ * algoScore = max(компонент): любой ОДИН механический паттерн — уже сигнатура.
+ * n < 8 → algoScore 0 (не судим по паре постов). Это ДИАГНОСТИКА (advisory):
+ * сериализуется в channelScore, решение «инвертировать/выкинуть канал» — за
+ * оператором, у которого есть контекст.
+ */
+interface AlgoSignature {
+    /** итоговое подозрение на алгоритмическое происхождение, 0..1 */
+    algoScore: number;
+    /** регулярность интервалов (1 = метроном/решётка) */
+    intervalRegularity: number;
+    /** концентрация по часу суток, нормированная (1 = все посты в один час) */
+    modalHourConcentration: number;
+    /** по скольким постам судим */
+    n: number;
+}
+declare function algoSignatureOf(postTs: number[]): AlgoSignature;
 
 /**
  * Single-channel fallback. Когда корреляция недоступна (один канал / mode="single"),
@@ -1361,11 +1470,16 @@ interface TrainedParams {
      * обгонит канал с 30 стабильными: малое n усаживается к нулю. median/n — для
      * аудита. Runtime-фильтр policy.minChannelScore режет сигналы каналов ниже
      * порога (matrix-сигналы межканальные — проходят всегда). Сериализуется.
+     *
+     * algoScore (слой 8) — подозрение на АЛГОРИТМИЧЕСКОЕ происхождение канала по
+     * механическим паттернам постинга (решётка интервалов, cron-расписание).
+     * Высокий algoScore + отрицательный score = кандидат на инверсию (habr 1028592).
      */
     channelScore?: Record<string, {
         score: number;
         median: number;
         n: number;
+        algoScore?: number;
     }>;
     /**
      * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
@@ -1530,6 +1644,7 @@ declare class PumpMatrix {
         score: number;
         median: number;
         n: number;
+        algoScore?: number;
     }>;
     /** Надёжна ли модель (хватило ли данных при обучении). */
     get reliable(): boolean;
@@ -1785,5 +1900,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
-export type { AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
+export type { AlgoSignature, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

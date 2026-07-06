@@ -13,6 +13,7 @@ import { selfTuneLag } from "./layers/self-tune-lag";
 import { jaccardScreen } from "./layers/jaccard-screen";
 import { lagXCorr } from "./layers/lag-xcorr";
 import { clusterAuthors } from "./layers/cluster-authors";
+import { authorInfluence } from "./layers/author-influence";
 import { earlyWarning } from "./layers/early-warning";
 import { singleChannelSignals } from "./layers/single-channel";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
@@ -90,6 +91,7 @@ export function predict(
   let authors: AuthorMap;
   let matrixVerdicts: PumpVerdict[];
   let viability: ViabilityReport;
+  let influence: Map<string, number> | undefined;
   if (cfg.mode === "single") {
     authors = new Map(tbl.channels.map((c, i) => [c, i]));
     matrixVerdicts = [];
@@ -106,7 +108,9 @@ export function predict(
     const screened = jaccardScreen(tbl, window, cfg.jaccardThreshold);
     const directed = lagXCorr(tbl, screened, cfg.lagPeakThreshold, window);
     authors = clusterAuthors(tbl.channels, directed);
-    matrixVerdicts = earlyWarning(tbl, authors, cfg, tau);
+    // слой 7: направление рёбер несёт информацию (лидер vs эхо) — вес всплеска
+    influence = authorInfluence(tbl.channels, directed);
+    matrixVerdicts = earlyWarning(tbl, authors, cfg, tau, influence);
     // оценка жизнеспособности матрицы (строгий критерий: явные кластеры + перекрытие).
     // Порог перекрытия авто-поднимается до границы случайности (Пуассон), если
     // пользователь не зафиксировал minSharedEvents явно — фикс «3» без плотности
@@ -149,6 +153,7 @@ export function predict(
     windowMs: window,
     usedMode,
     viability,
+    influence,
   };
 }
 
@@ -160,6 +165,11 @@ export { jaccardScreen, jaccardPair } from "./layers/jaccard-screen";
 export { lagXCorr } from "./layers/lag-xcorr";
 export { clusterAuthors } from "./layers/cluster-authors";
 export { earlyWarning } from "./layers/early-warning";
+export { hawkesBurst, hawkesWeight } from "./layers/hawkes-burst";
+export type { HawkesBurst } from "./layers/hawkes-burst";
+export { authorInfluence, leadershipWeight } from "./layers/author-influence";
+export { algoSignatureOf } from "./layers/algo-signature";
+export type { AlgoSignature } from "./layers/algo-signature";
 export { singleChannelSignals } from "./layers/single-channel";
 export { assessViability, DEFAULT_VIABILITY } from "./viability";
 export { resolveExit, resolveExitNoRegime } from "./exit-tensor";

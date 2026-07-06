@@ -125,7 +125,7 @@ export class PumpMatrix {
    * score = shrinkage-expectancy (усажен к нулю при малом n). Основа для
    * runtime-фильтра policy.minChannelScore и для ручного аудита каналов.
    */
-  get channelScore(): Record<string, { score: number; median: number; n: number }> {
+  get channelScore(): Record<string, { score: number; median: number; n: number; algoScore?: number }> {
     return { ...(this.params.channelScore ?? {}) };
   }
 

@@ -1,5 +1,7 @@
 import { AuthorMap, DetectorConfig, PumpVerdict } from "../types";
 import { EventTable, splitKey } from "../core/event-table";
+import { hawkesBurst, hawkesWeight } from "./hawkes-burst";
+import { leadershipWeight } from "./author-influence";
 
 /**
  * Слой 5 — early-warning по НЕЗАВИСИМЫМ кластерам-авторам.
@@ -8,21 +10,28 @@ import { EventTable, splitKey } from "../core/event-table";
  * а РАЗНЫХ кластеров. Всплеск из N каналов одного автора → 1 кластер → skip.
  * Всплеск из ≥ minClusters независимых кластеров → open.
  *
- * confidence = dedup × fill, где
- *   dedup = clusters/channels (1 = все источники независимы, <1 = есть дубли автора)
- *   fill  = насыщенность окна относительно minClusters·2 (растёт с числом источников)
+ * confidence = dedup × fill × hawkes × leadership, где
+ *   dedup     = clusters/channels (1 = все источники независимы, <1 = дубли автора)
+ *   fill      = насыщенность окна относительно minClusters·2
+ *   hawkes    = слой 6: дисконт всплеска, не превысившего порог случайности фона
+ *               тикера (пачка постов на вечно шумном тикере ≠ пачка на тихом)
+ *   leadership= слой 7: дисконт всплеска из одних «эхо»-каналов (лидеры молчат);
+ *               нейтральный/лидерский состав → 1 (без изменений)
  */
 export function earlyWarning(
   tbl: EventTable,
   clusterOf: AuthorMap,
   cfg: DetectorConfig,
   tau: number,
+  /** влиятельность каналов из направленного графа (слой 7); нет → нейтрально */
+  influence?: Map<string, number>,
 ): PumpVerdict[] {
   const window = Math.min(cfg.windowK * tau, cfg.maxBurstWindowMs);
   const verdicts: PumpVerdict[] = [];
 
   for (const [k, evs] of tbl.byKey) {
     const [symbol, direction] = splitKey(k);
+    const groupTs = evs.map((e) => e.ts);
     let lo = 0;
     let best: PumpVerdict | null = null;
 
@@ -35,7 +44,11 @@ export function earlyWarning(
       if (clusters.size >= cfg.minClusters) {
         const dedup = clusters.size / channels.size;
         const fill = Math.min(slice.length / (cfg.minClusters * 2), 1);
-        const confidence = +(dedup * fill).toFixed(6);
+        const burst = hawkesBurst(groupTs, hi, tau);
+        const lw = influence
+          ? leadershipWeight(channels, influence)
+          : { weight: 1, leaderShare: 0.5 };
+        const confidence = +(dedup * fill * hawkesWeight(burst.score) * lw.weight).toFixed(6);
         const cand: PumpVerdict = {
           symbol,
           direction,
@@ -44,9 +57,12 @@ export function earlyWarning(
           independentClusters: clusters.size,
           totalChannels: channels.size,
           confidence,
+          burstScore: +burst.score.toFixed(6),
+          leaderShare: +lw.leaderShare.toFixed(6),
           reason:
             `${clusters.size} независимых кластеров по ${symbol} ${direction} ` +
-            `в окне ${(window / 60000).toFixed(0)}м (каналов: ${channels.size})`,
+            `в окне ${(window / 60000).toFixed(0)}м (каналов: ${channels.size}, ` +
+            `hawkes ×${burst.score.toFixed(2)}, лидерство ${lw.leaderShare.toFixed(2)})`,
           source: "matrix",
           channel: null,
           entryFromPrice: evs[hi].entryFromPrice,

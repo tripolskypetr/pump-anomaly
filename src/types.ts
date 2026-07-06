@@ -91,6 +91,10 @@ export interface PumpVerdict {
   /** зона входа из parser-item — нужна для открытия live-позиции */
   entryFromPrice?: number;
   entryToPrice?: number;
+  /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
+  burstScore?: number;
+  /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */
+  leaderShare?: number;
 }
 
 /** Карта авторства: канал → id кластера-автора. */
@@ -114,6 +118,8 @@ export interface PredictionResult {
   usedMode: "matrix" | "single";
   /** Оценка жизнеспособности матрицы (почему выбран режим в auto). */
   viability: ViabilityReport;
+  /** Слой 7: влиятельность каналов из направленного lead-lag графа (matrix/auto). */
+  influence?: Map<string, number>;
 }
 
 export interface DetectorConfig {

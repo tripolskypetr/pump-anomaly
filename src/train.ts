@@ -6,7 +6,7 @@ import {
 } from "./types";
 import { GetCandles, entryStartTs } from "./candle";
 import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
-import { momentumPct } from "./volume";
+import { momentumPct, rangeFeatures, zoneOffsetPct } from "./volume";
 import { algoSignatureOf } from "./layers/algo-signature";
 import { hawkesBurst } from "./layers/hawkes-burst";
 import { fitHawkesGraph } from "./layers/hawkes-graph";
@@ -582,6 +582,12 @@ export async function train(
     byExit: Map<string, ExitRec>;
     /** направленно-нейтральный momentum ДО сигнала, % (null = не измерился/не нужен) */
     momentum24hPct: number | null;
+    /** средний минутный диапазон пре-окна, % (обобщение anti-harvesting) */
+    preRangePct?: number | null;
+    /** сжатие: последняя четверть пре-окна против первых трёх (розжиг из сжатия) */
+    preCompression?: number | null;
+    /** направленная геометрия зоны входа, % (chase > 0, pullback < 0) */
+    zoneOffsetPct?: number | null;
     /** скорость схождения подтверждений всплеска, мс (0 = одиночный пост) */
     confirmSpanMs?: number;
   };
@@ -595,14 +601,23 @@ export async function train(
   const momentumAxis: Array<number | null> =
     grid.momentumGatePct.length ? grid.momentumGatePct : [null];
   const needMomentum = momentumAxis.some((g) => g !== null) || opts.momentumFeature === true;
-  // promise-кэш: конкурентный пул разметки не должен считать фичу дважды
-  const preMomCache = new Map<string, Promise<number | null>>();
-  const preMomentumOf = (symbol: string, ts: number): Promise<number | null> => {
-    if (!needMomentum) return Promise.resolve(null);
+  // promise-кэш: конкурентный пул разметки не должен считать фичи дважды.
+  // ОДИН пре-фетч → все пре-сигнальные фичи: momentum, диапазон/сжатие, last close
+  // (для геометрии зоны) — IO не растёт с числом фич.
+  type PreFeatures = {
+    momentum: number | null;
+    rangePct: number | null;
+    compression: number | null;
+    lastClose: number | null;
+  };
+  const NO_PRE: PreFeatures = { momentum: null, rangePct: null, compression: null, lastClose: null };
+  const preMomCache = new Map<string, Promise<PreFeatures>>();
+  const preFeaturesOf = (symbol: string, ts: number): Promise<PreFeatures> => {
+    if (!needMomentum) return Promise.resolve(NO_PRE);
     const key = `${symbol}|${ts}`;
     const hit = preMomCache.get(key);
     if (hit) return hit;
-    const p = (async () => {
+    const p = (async (): Promise<PreFeatures> => {
       try {
         const start = entryStartTs(ts, "1m");
         const pre = await fetchCandlesChunked(
@@ -610,8 +625,14 @@ export async function train(
         );
         // только свечи СТРОГО до сигнала (обрезаем возможный хвост от щедрого адаптера)
         const cut = pre.filter((c) => c.timestamp < start);
-        return momentumPct(cut, cut.length, momentumWindow);
-      } catch { return null; }
+        const rf = rangeFeatures(cut, cut.length);
+        return {
+          momentum: momentumPct(cut, cut.length, momentumWindow),
+          rangePct: rf.rangePct,
+          compression: rf.compression,
+          lastClose: cut.length ? cut[cut.length - 1].close : null,
+        };
+      } catch { return NO_PRE; }
     })();
     preMomCache.set(key, p);
     return p;
@@ -672,13 +693,18 @@ export async function train(
           });
         }
         if (byExit.size === 0) continue;
+        const pre = await preFeaturesOf(b.symbol, b.ts);
         slots[i] = {
           channel: src?.channel ?? "_unknown",
           symbol: b.symbol, direction: b.direction, ts: b.ts,
           independentClusters: b.independentClusters,
           id: b.id, ids: b.ids,
           byExit,
-          momentum24hPct: await preMomentumOf(b.symbol, b.ts),
+          momentum24hPct: pre.momentum,
+          preRangePct: pre.rangePct,
+          preCompression: pre.compression,
+          // геометрия зоны считается по направлению ПОСТА (так же и в рантайме)
+          zoneOffsetPct: zoneOffsetPct(src?.entryFromPrice, src?.entryToPrice, pre.lastClose, b.direction),
           confirmSpanMs: b.confirmSpanMs,
         };
       }
@@ -1457,22 +1483,38 @@ export async function train(
       if (idx < 0) return null;
       return hawkesBurst(group.map((e) => e.ts), idx, globalTau).score;
     };
-    // momentum-фича: значения из promise-кэша (к этому моменту все резолвлены)
-    const momentumOf = new Map<string, number | null>();
-    for (const [k, p] of preMomCache) momentumOf.set(k, await p);
+    // per-кандидатные фичи — из размеченных кандидатов победителя (один источник)
+    const labeledByKey = new Map<string, (typeof winSelected)[number]>();
+    for (const b of winSelected) labeledByKey.set(`${b.symbol}|${b.direction}|${b.ts}`, b);
 
-    // скорость схождения подтверждений: карта из размеченных кандидатов победителя
-    const spanOf = new Map<string, number>();
-    for (const b of winSelected) {
-      if (b.confirmSpanMs !== undefined) spanOf.set(`${b.symbol}|${b.direction}|${b.ts}`, b.confirmSpanMs);
+    // УСТАЛОСТЬ СИМВОЛА: gap до предыдущего события по символу ВНЕ окна
+    // собственного всплеска (исключение = maxBurstWindowMs — существующая
+    // константа конфига, та же в рантайме). Повторный памп по свежепрожаренному
+    // тикеру работает хуже — толпа обожжена; изотоника выучит форму сама.
+    const symbolTs = new Map<string, number[]>();
+    for (const it of items) {
+      (symbolTs.get(it.symbol) ?? symbolTs.set(it.symbol, []).get(it.symbol)!).push(it.ts);
     }
+    for (const arr of symbolTs.values()) arr.sort((a, b) => a - b);
+    const gapOf = (symbol: string, ts: number): number | null => {
+      const arr = symbolTs.get(symbol);
+      if (!arr) return null;
+      const cutoff = ts - maxBurstWindowMs;
+      let lo = 0, hi = arr.length - 1, best = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] <= cutoff) { best = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return best >= 0 ? ts - arr[best] : null;
+    };
+
     const rows: OutcomeRow[] = [];
     for (const h of history) {
       if (!h.entered) continue;
+      const b = labeledByKey.get(`${h.symbol}|${h.direction}|${h.ts}`);
       // confirmPace: мс на одно подтверждение (только у matrix-всплесков с ≥2 кластерами)
-      const span = spanOf.get(`${h.symbol}|${h.direction}|${h.ts}`);
-      const pace = h.independentClusters > 1 && span !== undefined
-        ? span / (h.independentClusters - 1)
+      const pace = h.independentClusters > 1 && b?.confirmSpanMs !== undefined
+        ? b.confirmSpanMs / (h.independentClusters - 1)
         : null;
       rows.push({
         y: h.pnl > 0 ? 1 : 0,
@@ -1480,10 +1522,14 @@ export async function train(
         ts: h.ts,
         features: {
           clusters: h.independentClusters,
-          momentum: momentumOf.get(`${h.symbol}|${h.ts}`) ?? null,
+          momentum: b?.momentum24hPct ?? null,
           algo: channelScore[h.channel]?.algoScore ?? null,
           burst: burstOf(h.symbol, h.direction, h.ts),
           confirmPace: pace,
+          range: b?.preRangePct ?? null,
+          compression: b?.preCompression ?? null,
+          zoneOffset: b?.zoneOffsetPct ?? null,
+          fatigueGap: gapOf(h.symbol, h.ts),
         },
       });
     }

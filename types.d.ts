@@ -90,6 +90,10 @@ interface PumpVerdict {
     /** время от первого до последнего события всплеска, мс: скорость схождения
      *  подтверждений (сжатые = каскад одного события, размазанные = совпадение) */
     confirmSpanMs?: number;
+    /** усталость символа: мс до предыдущего события по символу вне окна собственного
+     *  всплеска (null = первый в наблюдаемой ленте). Повторный памп по горячему
+     *  тикеру работает хуже — толпа обожжена. */
+    symbolGapMs?: number | null;
     /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
     burstScore?: number;
     /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */
@@ -682,6 +686,54 @@ declare function volumeZScore(candles: ICandleData[], entryIdx: number, baseline
  * это ловушка (stop hunt / squeeze), входить опасно либо выходить раньше.
  */
 declare function squeezePressure(candles: ICandleData[], entryIdx: number, dir: Direction, horizon: number): number;
+/**
+ * LIVE-вариант squeezePressure: считает давление каскада по свечам СТРОГО ДО входа
+ * (никакого look-ahead). В live свечей ПОСЛЕ сигнала ещё нет — поэтому ловушку
+ * оцениваем по уже произошедшим свечам перед сигналом: высокая доля объёма на
+ * движениях против позиции в недавнем прошлом = рынок уже под давлением каскада.
+ *
+ * entryIdx — индекс входной свечи; окно [entryIdx-horizon, entryIdx) (НЕ включая
+ * саму входную, чтобы не зависеть от её формирования). Симметрия по dir та же.
+ */
+declare function squeezePressureBefore(candles: ICandleData[], entryIdx: number, dir: Direction, horizon: number): number;
+/**
+ * Momentum цены ДО входа, %: (close_последней / close_первой − 1)·100 по окну
+ * [entryIdx − windowMinutes, entryIdx) СТРОГО до сигнальной свечи (без look-ahead).
+ *
+ * Это ключевой фильтр эджа (habr 1041898): сырые посты ≈ нулевая сумма после
+ * комиссий, но посты, перед которыми цена УЖЕ двигалась не против сигнала
+ * (приток реального капитала до публикации), статистически отрабатывают.
+ * null = данных мало (окно < 2 свечей) — вызывающий решает консервативно.
+ */
+declare function momentumPct(candles: ICandleData[], entryIdx: number, windowMinutes: number): number | null;
+/**
+ * ДИАПАЗОННЫЕ признаки пре-окна (обобщение anti-liquidity-harvesting из habr
+ * 1041898: «шорты на активе с мёртвым диапазоном = сбор ликвидности»).
+ *
+ *  - rangePct: средний минутный диапазон (high−low)/close по пре-окну, %.
+ *    Мёртвый флэт → «памп» на нём — ловушка; живой диапазон — честный рынок.
+ *  - compression: диапазон ПОСЛЕДНЕЙ ЧЕТВЕРТИ окна против первых трёх четвертей.
+ *    Классика: настоящий памп воспламеняется из сжатия (<1 — рынок сжался перед
+ *    сигналом), расширение (>1) — движение уже идёт/выдохлось.
+ *
+ * Окно-относительная конструкция (четверти доступного пре-окна) — без абсолютных
+ * констант времени. Меньше 40 свечей → null (квартильные средние шумны).
+ */
+declare function rangeFeatures(candles: ICandleData[], 
+/** конец пре-окна (эксклюзивно) — свечи СТРОГО до сигнала */
+endIdx: number): {
+    rangePct: number | null;
+    compression: number | null;
+};
+/**
+ * ГЕОМЕТРИЯ ЗОНЫ ВХОДА: где автор поставил зону относительно последней цены,
+ * в % и НАПРАВЛЕННО (положительное = «догоняющий» вход по ходу сигнала,
+ * отрицательное = откатная лимитка против хода). long с зоной выше рынка и
+ * short с зоной ниже — chase; зеркальные — pullback. У этих режимов разная
+ * статистика исходов; у ботов размещение зоны механическое (habr 1028592).
+ * null = зоны нет или цены нет.
+ */
+declare function zoneOffsetPct(entryFromPrice: number | undefined, entryToPrice: number | undefined, lastClose: number | null, postDirection: Direction): number | null;
 /** Считает оба признака разом для входа на entryIdx. */
 declare function volumeFeatures(candles: ICandleData[], entryIdx: number, dir: Direction, baselineWindow: number, horizon: number): VolumeFeatures;
 /** Режим объёма по порогу volZ: спокойный или аномальный (топливо накоплено). */
@@ -2208,5 +2260,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
 export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

@@ -135,6 +135,59 @@ export function momentumPct(
   return (last / first - 1) * 100;
 }
 
+/**
+ * ДИАПАЗОННЫЕ признаки пре-окна (обобщение anti-liquidity-harvesting из habr
+ * 1041898: «шорты на активе с мёртвым диапазоном = сбор ликвидности»).
+ *
+ *  - rangePct: средний минутный диапазон (high−low)/close по пре-окну, %.
+ *    Мёртвый флэт → «памп» на нём — ловушка; живой диапазон — честный рынок.
+ *  - compression: диапазон ПОСЛЕДНЕЙ ЧЕТВЕРТИ окна против первых трёх четвертей.
+ *    Классика: настоящий памп воспламеняется из сжатия (<1 — рынок сжался перед
+ *    сигналом), расширение (>1) — движение уже идёт/выдохлось.
+ *
+ * Окно-относительная конструкция (четверти доступного пре-окна) — без абсолютных
+ * констант времени. Меньше 40 свечей → null (квартильные средние шумны).
+ */
+export function rangeFeatures(
+  candles: ICandleData[],
+  /** конец пре-окна (эксклюзивно) — свечи СТРОГО до сигнала */
+  endIdx: number,
+): { rangePct: number | null; compression: number | null } {
+  const end = Math.min(Math.max(endIdx, 0), candles.length);
+  const pre = candles.slice(0, end);
+  if (pre.length < 40) return { rangePct: null, compression: null };
+  const r = (c: ICandleData) => (c.close > 0 ? (c.high - c.low) / c.close : 0);
+  const mean = (xs: ICandleData[]) => xs.reduce((s, c) => s + r(c), 0) / xs.length;
+  const q = Math.floor(pre.length * 0.75);
+  const base = mean(pre.slice(0, q));
+  const recent = mean(pre.slice(q));
+  return {
+    rangePct: +(mean(pre) * 100).toFixed(6),
+    compression: base > 0 ? +(recent / base).toFixed(6) : null,
+  };
+}
+
+/**
+ * ГЕОМЕТРИЯ ЗОНЫ ВХОДА: где автор поставил зону относительно последней цены,
+ * в % и НАПРАВЛЕННО (положительное = «догоняющий» вход по ходу сигнала,
+ * отрицательное = откатная лимитка против хода). long с зоной выше рынка и
+ * short с зоной ниже — chase; зеркальные — pullback. У этих режимов разная
+ * статистика исходов; у ботов размещение зоны механическое (habr 1028592).
+ * null = зоны нет или цены нет.
+ */
+export function zoneOffsetPct(
+  entryFromPrice: number | undefined,
+  entryToPrice: number | undefined,
+  lastClose: number | null,
+  postDirection: Direction,
+): number | null {
+  if (entryFromPrice === undefined || entryToPrice === undefined) return null;
+  if (lastClose === null || !(lastClose > 0)) return null;
+  const mid = (entryFromPrice + entryToPrice) / 2;
+  const raw = ((mid - lastClose) / lastClose) * 100;
+  return +(postDirection === "long" ? raw : -raw).toFixed(6);
+}
+
 /** Считает оба признака разом для входа на entryIdx. */
 export function volumeFeatures(
   candles: ICandleData[],

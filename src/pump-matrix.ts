@@ -2,7 +2,7 @@ import { ParserItem, PumpVerdict, Direction } from "./types";
 import { GetCandles, ICandleData, entryStartTs, STEP_MS } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
-import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, momentumPct, VolRegime } from "./volume";
+import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, momentumPct, rangeFeatures, zoneOffsetPct, VolRegime } from "./volume";
 import { replayExit } from "./replay";
 import { RiskRewardStats, PnlStats } from "./objective";
 import { DEFAULT_VIABILITY } from "./viability";
@@ -644,13 +644,20 @@ export class PumpMatrix {
     // режем консервативно (signals() без свечей с этим флагом всегда пуст — см. policy).
     if (policy.requireVolumeConfirm && volRegime !== "anomalous") return null;
 
-    // momentum до сигнала — нужен и гейту, и модели исхода; считается один раз
+    // пре-сигнальные фичи — нужны и гейту, и модели исхода; считаются один раз
     let momentumVal: number | null = null;
+    let rangeVal: number | null = null;
+    let compressionVal: number | null = null;
+    let lastPreClose: number | null = null;
     if (candles && candles.length > 0) {
       const startTs = entryStartTs(v.ts, "1m");
       let preEnd = candles.findIndex((c) => c.timestamp >= startTs);
       if (preEnd < 0) preEnd = candles.length; // вся серия до сигнала
       momentumVal = momentumPct(candles, preEnd, policy.momentumWindowMinutes ?? 1440);
+      const rf = rangeFeatures(candles, preEnd);
+      rangeVal = rf.rangePct;
+      compressionVal = rf.compression;
+      lastPreClose = preEnd > 0 ? candles[preEnd - 1].close : null;
     }
 
     // ── MOMENTUM-ФИЛЬТР (эдж из habr 1041898): цена уже двигалась не против ──
@@ -678,6 +685,12 @@ export class PumpMatrix {
         confirmPace: v.independentClusters > 1 && v.confirmSpanMs !== undefined
           ? v.confirmSpanMs / (v.independentClusters - 1)
           : null,
+        range: rangeVal,
+        compression: compressionVal,
+        // геометрия зоны — по направлению ПОСТА (модель обучена на нём же;
+        // channelPlan мог перевернуть торговое направление, но зону ставил автор)
+        zoneOffset: zoneOffsetPct(v.entryFromPrice, v.entryToPrice, lastPreClose, v.direction!),
+        fatigueGap: v.symbolGapMs ?? null,
       });
       probability = pred;
       if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) return null;

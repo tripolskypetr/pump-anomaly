@@ -148,6 +148,25 @@ export function predict(
     signals = fb; // в fallback все вердикты — это входы
   }
 
+  // усталость символа: gap до предыдущего события по символу вне окна собственного
+  // всплеска (исключение = cfg.maxBurstWindowMs — та же константа, что при обучении).
+  // Считаем по ПОЛНОЙ таблице (не по окну стационарности) — памяти больше.
+  const symbolTs = new Map<string, number[]>();
+  for (const e of fullTbl.events) {
+    (symbolTs.get(e.symbol) ?? symbolTs.set(e.symbol, []).get(e.symbol)!).push(e.ts);
+  }
+  for (const v of verdicts) {
+    const arr = symbolTs.get(v.symbol);
+    if (!arr) { v.symbolGapMs = null; continue; }
+    const cutoff = v.ts - cfg.maxBurstWindowMs;
+    let lo = 0, hi = arr.length - 1, best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] <= cutoff) { best = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    v.symbolGapMs = best >= 0 ? v.ts - arr[best] : null;
+  }
+
   return {
     signals,
     verdicts,
@@ -192,7 +211,8 @@ export type { LabeledBurst } from "./label";
 export { replayExit } from "./replay";
 export type { ExitParams, ExitReason, ReplayResult } from "./replay";
 export {
-  volumeZScore, squeezePressure, volumeFeatures, volRegimeOf,
+  volumeZScore, squeezePressure, squeezePressureBefore, volumeFeatures, volRegimeOf,
+  momentumPct, rangeFeatures, zoneOffsetPct,
 } from "./volume";
 export type { VolumeFeatures, VolRegime } from "./volume";
 export { shrinkageExpectancy, winrate, percentile, riskRewardStats, standardError, oneStandardErrorSelect, pnlStats } from "./objective";

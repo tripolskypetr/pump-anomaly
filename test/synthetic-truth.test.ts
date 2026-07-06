@@ -229,3 +229,31 @@ describe("синтетика: заложенная сезонность восс
     expect(p9.recommendedRiskFrac).toBeGreaterThanOrEqual(p21.recommendedRiskFrac);
   }, 120_000);
 });
+
+describe("синтетика: заложенный стоп-хант канал инвертируется триажем", () => {
+  it("посты «long», за которыми заложен слив −3% → channelPlan=invert, сигнал торгует short", async () => {
+    const spanFrom = t0 - 20 * DAY;
+    const items: ParserItem[] = Array.from({ length: 40 }, (_, k) => ({
+      channel: "stophunter", symbol: "SOLUSDT", direction: "long" as const, ts: t0 + k * 12 * HOUR,
+    }));
+    // истина: канал анти-предиктивен — после каждого long-поста цена падает
+    const gc = syntheticExchange({
+      seed: 99, spanFrom, spanTo: t0 + 21 * DAY,
+      pumps: items.map((it) => ({ symbol: it.symbol, ts: it.ts, pct: -0.03 })),
+    });
+    const res = await train(items, gc, { ...baseOpts, roundTripCostPct: 0.2 });
+    // триаж по данным: следование значимо убыточно, инверсия отбивает двойные
+    // издержки (−pnl − 2×0.2%) → invert, не drop
+    expect(res.params.channelPlan?.stophunter).toBe("invert");
+
+    // runtime: направление РАЗВЁРНУТО против поста, происхождение честно помечено
+    const m = PumpMatrix.load(PumpMatrix.load(res.params).save());
+    const sigs = m.plan([
+      { channel: "stophunter", symbol: "SOLUSDT", direction: "long", ts: t0 + 30 * DAY },
+    ], {}, { acknowledgeUncertified: true });
+    expect(sigs.length).toBe(1);
+    expect(sigs[0].direction).toBe("short");
+    expect(sigs[0].action).toBe("invert");
+    expect(sigs[0].origin.invertedFrom).toBe("long");
+  }, 120_000);
+});

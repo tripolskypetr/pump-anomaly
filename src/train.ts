@@ -9,6 +9,7 @@ import { fetchCandlesChunked, withCandleCache } from "./chunked-candles";
 import { momentumPct } from "./volume";
 import { algoSignatureOf } from "./layers/algo-signature";
 import { hawkesBurst } from "./layers/hawkes-burst";
+import { fitHawkesGraph } from "./layers/hawkes-graph";
 import { OutcomeModel, OutcomeRow, fitOutcomeModel } from "./outcome-model";
 import { SignalEvent } from "./types";
 import { enumerateBursts, enumeratePosts } from "./enumerate";
@@ -177,6 +178,13 @@ export interface TrainOptions {
    * По умолчанию фича есть только когда её уже считает гейт-ось.
    */
   momentumFeature?: boolean;
+  /**
+   * Оценщик графа авторства для matrix-режима: "xcorr" (дефолт, конвейер сита)
+   * или "hawkes" (multivariate Hawkes, слой 9). Прошивается в config модели —
+   * predict после load() использует его же. Сравнение оценщиков = два walkForward
+   * с разными trainOptions.authorGraph.
+   */
+  authorGraph?: "xcorr" | "hawkes";
   /**
    * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
    * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
@@ -508,8 +516,9 @@ export async function train(
     );
     const probeTau = selfTuneLag(probeTbl);
     const probeWin = Math.min(3 * probeTau, maxBurstWindowMs);
-    const probeScreened = jaccardScreen(probeTbl, probeWin, 0.3);
-    const probeDirected = lagXCorr(probeTbl, probeScreened, 0.5, probeWin);
+    const probeDirected = (opts.authorGraph ?? "xcorr") === "hawkes"
+      ? fitHawkesGraph(probeTbl, probeTau).edges
+      : lagXCorr(probeTbl, jaccardScreen(probeTbl, probeWin, 0.3), 0.5, probeWin);
     const probeAuthors = clusterAuthors(probeTbl.channels, probeDirected);
     const v = assessViability(probeTbl, probeDirected, probeAuthors, {
       ...DEFAULT_VIABILITY, ...opts.viability,
@@ -573,6 +582,8 @@ export async function train(
     byExit: Map<string, ExitRec>;
     /** направленно-нейтральный momentum ДО сигнала, % (null = не измерился/не нужен) */
     momentum24hPct: number | null;
+    /** скорость схождения подтверждений всплеска, мс (0 = одиночный пост) */
+    confirmSpanMs?: number;
   };
   const labeledCache = new Map<string, Labeled[]>();
   const seenCluster = new Set<string>();
@@ -668,6 +679,7 @@ export async function train(
           id: b.id, ids: b.ids,
           byExit,
           momentum24hPct: await preMomentumOf(b.symbol, b.ts),
+          confirmSpanMs: b.confirmSpanMs,
         };
       }
     };
@@ -699,7 +711,7 @@ export async function train(
             labeledCache.set(`__enum_${skey}`, []); // маркер «уже перечислили»
             passes.push({ ckey, skey, cands: enumeratePosts(items, wK, maxBurstWindowMs) });
           } else {
-            passes.push({ ckey, cands: enumerateBursts(items, wK, jac, lag, maxBurstWindowMs, sw) });
+            passes.push({ ckey, cands: enumerateBursts(items, wK, jac, lag, maxBurstWindowMs, sw, opts.authorGraph ?? "xcorr") });
           }
         }
   labeledCache.clear();
@@ -776,7 +788,7 @@ export async function train(
   const cfgFor = (d: DetCombo, minC: number): DetectorConfig => {
     const k = `${d.wK}|${d.jac}|${d.lag}|${d.sw}|${minC}`;
     let c = cfgCache.get(k);
-    if (!c) cfgCache.set(k, (c = cfgOf(d.wK, minC, d.jac, d.lag, maxBurstWindowMs, effMode, d.sw)));
+    if (!c) cfgCache.set(k, (c = cfgOf(d.wK, minC, d.jac, d.lag, maxBurstWindowMs, effMode, d.sw, opts.authorGraph)));
     return c;
   };
 
@@ -1449,9 +1461,19 @@ export async function train(
     const momentumOf = new Map<string, number | null>();
     for (const [k, p] of preMomCache) momentumOf.set(k, await p);
 
+    // скорость схождения подтверждений: карта из размеченных кандидатов победителя
+    const spanOf = new Map<string, number>();
+    for (const b of winSelected) {
+      if (b.confirmSpanMs !== undefined) spanOf.set(`${b.symbol}|${b.direction}|${b.ts}`, b.confirmSpanMs);
+    }
     const rows: OutcomeRow[] = [];
     for (const h of history) {
       if (!h.entered) continue;
+      // confirmPace: мс на одно подтверждение (только у matrix-всплесков с ≥2 кластерами)
+      const span = spanOf.get(`${h.symbol}|${h.direction}|${h.ts}`);
+      const pace = h.independentClusters > 1 && span !== undefined
+        ? span / (h.independentClusters - 1)
+        : null;
       rows.push({
         y: h.pnl > 0 ? 1 : 0,
         pnl: h.pnl,
@@ -1461,6 +1483,7 @@ export async function train(
           momentum: momentumOf.get(`${h.symbol}|${h.ts}`) ?? null,
           algo: channelScore[h.channel]?.algoScore ?? null,
           burst: burstOf(h.symbol, h.direction, h.ts),
+          confirmPace: pace,
         },
       });
     }
@@ -1537,8 +1560,9 @@ function cfgOf(
   windowK: number, minClusters: number, jaccardThreshold: number,
   lagPeakThreshold: number, maxBurstWindowMs: number,
   mode: "matrix" | "single", stationarityWindowMs: number,
+  authorGraph?: "xcorr" | "hawkes",
 ): DetectorConfig {
-  return { windowK, minClusters, jaccardThreshold, lagPeakThreshold, maxBurstWindowMs, mode, stationarityWindowMs };
+  return { windowK, minClusters, jaccardThreshold, lagPeakThreshold, maxBurstWindowMs, mode, stationarityWindowMs, authorGraph };
 }
 
 // ─────────────────── десериализация: params → predict ─────────────────────────

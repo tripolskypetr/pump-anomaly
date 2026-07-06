@@ -70,6 +70,7 @@ export function earlyWarning(
           ts: evs[hi].ts,
           independentClusters: clusters.size,
           nEffClusters: +nEff.toFixed(3),
+          confirmSpanMs: evs[hi].ts - evs[lo].ts,
           totalChannels: channels.size,
           confidence,
           burstScore: +burst.score.toFixed(6),

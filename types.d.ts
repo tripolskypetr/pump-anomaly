@@ -87,6 +87,9 @@ interface PumpVerdict {
      *  {5 постов A, 1 пост B} → 1.4, а не «2 кластера». Гейт minClusters остаётся
      *  на целочисленном independentClusters; N_eff взвешивает confidence. */
     nEffClusters?: number;
+    /** время от первого до последнего события всплеска, мс: скорость схождения
+     *  подтверждений (сжатые = каскад одного события, размазанные = совпадение) */
+    confirmSpanMs?: number;
     /** слой 6: кратность превышения Hawkes-возбуждения над порогом случайности (≥1 = значимо) */
     burstScore?: number;
     /** слой 7: среднее лидерство каналов всплеска (0.5 нейтрально, <0.5 — эхо без лидеров) */
@@ -846,6 +849,13 @@ interface CandidateBurst {
     independentClusters: number;
     totalChannels: number;
     confidence: number;
+    /**
+     * Время от первого до последнего события лучшего среза, мс: СКОРОСТЬ схождения
+     * подтверждений. У настоящего пампа подтверждения сжаты (порождены одним
+     * событием), у совпадения — размазаны по окну. Фича модели исхода
+     * (confirmPace = span/(clusters−1)). 0 у одиночного поста.
+     */
+    confirmSpanMs?: number;
     /** id якорного (последнего в окне) события — для сопоставления с парсингом */
     id?: string;
     /** id ВСЕХ событий, вошедших во всплеск (в matrix может быть несколько) */
@@ -857,7 +867,9 @@ interface CandidateBurst {
  * Кластеризация зависит от jaccard/lag/windowK, поэтому пересчитывается на эти оси grid;
  * а minClusters — пост-фильтр, его перебор бесплатный.
  */
-declare function enumerateBursts(items: ParserItem[] | SignalEvent[], windowK: number, jaccardThreshold: number, lagPeakThreshold: number, maxBurstWindowMs: number, stationarityWindowMs?: number): CandidateBurst[];
+declare function enumerateBursts(items: ParserItem[] | SignalEvent[], windowK: number, jaccardThreshold: number, lagPeakThreshold: number, maxBurstWindowMs: number, stationarityWindowMs?: number, 
+/** оценщик графа авторства: конвейер xcorr (дефолт) или multivariate Hawkes */
+authorGraph?: "xcorr" | "hawkes"): CandidateBurst[];
 /**
  * Перечисляет КАЖДЫЙ пост как кандидата (single-channel fallback), схлопывая
  * близкие посты по одному (symbol,direction) в пределах окна в один вход.
@@ -1591,6 +1603,13 @@ interface TrainOptions {
      * По умолчанию фича есть только когда её уже считает гейт-ось.
      */
     momentumFeature?: boolean;
+    /**
+     * Оценщик графа авторства для matrix-режима: "xcorr" (дефолт, конвейер сита)
+     * или "hawkes" (multivariate Hawkes, слой 9). Прошивается в config модели —
+     * predict после load() использует его же. Сравнение оценщиков = два walkForward
+     * с разными trainOptions.authorGraph.
+     */
+    authorGraph?: "xcorr" | "hawkes";
     /**
      * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
      * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных

@@ -674,6 +674,10 @@ export class PumpMatrix {
         momentum: momentumVal,
         algo: v.channel !== null ? this.params.channelScore?.[v.channel]?.algoScore ?? null : null,
         burst: v.burstScore ?? null,
+        // скорость схождения подтверждений: мс на подтверждение (только matrix ≥2 кластеров)
+        confirmPace: v.independentClusters > 1 && v.confirmSpanMs !== undefined
+          ? v.confirmSpanMs / (v.independentClusters - 1)
+          : null,
       });
       probability = pred;
       if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) return null;

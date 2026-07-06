@@ -4,6 +4,7 @@ import { selfTuneLag } from "./layers/self-tune-lag";
 import { jaccardScreen } from "./layers/jaccard-screen";
 import { lagXCorr } from "./layers/lag-xcorr";
 import { clusterAuthors } from "./layers/cluster-authors";
+import { fitHawkesGraph } from "./layers/hawkes-graph";
 
 /** Кандидат-всплеск без применённого порога minClusters — для переиспользования в grid. */
 export interface CandidateBurst {
@@ -13,6 +14,13 @@ export interface CandidateBurst {
   independentClusters: number;
   totalChannels: number;
   confidence: number;
+  /**
+   * Время от первого до последнего события лучшего среза, мс: СКОРОСТЬ схождения
+   * подтверждений. У настоящего пампа подтверждения сжаты (порождены одним
+   * событием), у совпадения — размазаны по окну. Фича модели исхода
+   * (confirmPace = span/(clusters−1)). 0 у одиночного поста.
+   */
+  confirmSpanMs?: number;
   /** id якорного (последнего в окне) события — для сопоставления с парсингом */
   id?: string;
   /** id ВСЕХ событий, вошедших во всплеск (в matrix может быть несколько) */
@@ -32,6 +40,8 @@ export function enumerateBursts(
   lagPeakThreshold: number,
   maxBurstWindowMs: number,
   stationarityWindowMs: number = Infinity,
+  /** оценщик графа авторства: конвейер xcorr (дефолт) или multivariate Hawkes */
+  authorGraph: "xcorr" | "hawkes" = "xcorr",
 ): CandidateBurst[] {
   const events = items as SignalEvent[];
   const fullTbl: EventTable = buildTable(events);
@@ -51,8 +61,9 @@ export function enumerateBursts(
       : fullTbl;
     const tau = selfTuneLag(tbl);
     const window = Math.min(windowK * tau, maxBurstWindowMs); // окно СИНХРОННОСТИ пампа
-    const screened = jaccardScreen(tbl, window, jaccardThreshold);
-    const directed = lagXCorr(tbl, screened, lagPeakThreshold, window);
+    const directed = authorGraph === "hawkes"
+      ? fitHawkesGraph(tbl, tau).edges
+      : lagXCorr(tbl, jaccardScreen(tbl, window, jaccardThreshold), lagPeakThreshold, window);
     const clusterOf = clusterAuthors(tbl.channels, directed);
     return { window, clusterOf };
   };
@@ -91,6 +102,7 @@ export function enumerateBursts(
           independentClusters: clusters.size,
           totalChannels: channels.size,
           confidence: +(dedup * fill).toFixed(6),
+          confirmSpanMs: evs[hi].ts - evs[lo].ts,
           id: anchorId,
           // ids ВСЕГО временно́го кластера [i..j], чтобы ни один parser-item не пропал
           ids: evs.slice(i, j + 1).map((e) => {
@@ -144,6 +156,7 @@ export function enumeratePosts(
       current = {
         symbol, direction, ts: e.ts,
         independentClusters: 1, totalChannels: 1, confidence: 0.5,
+        confirmSpanMs: 0, // одиночный пост — подтверждений нет
         id,
         ids: id != null ? [id] : [],
       };

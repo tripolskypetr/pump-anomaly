@@ -73,6 +73,13 @@ const paperTrades = await model.plan(liveItems, getCandles, { acknowledgeUncerti
 
 `backtest()`/`planForAt()` are research over the past and are never gated; legacy `model.json` without a certificate in meta is not gated either.
 
+### For non-mathematicians: doctor, traces, human reports
+
+- **`validateGetCandles(gc)`** — checks your candle adapter against the contract *before* the first fit (start alignment, limit, sorting, duplicates, OHLC sanity) and returns concrete complaints instead of silently degraded labels. **`inspectItems(items)`** does the same for parser data (garbage rows, duplicates, span, "one channel → single mode" warnings).
+- **`model.explainSignals(items, candles?)`** — why each potential signal did or did not come out: the machine-readable filter code (`momentum-gate`, `capacity`, `channel-plan:drop`, …), a human reason with numbers, and the feature values at the decision point. `plan()` stays silent by design; this is the debugging counterpart.
+- **`model.report()`** and **`assessEdge(...).summary` / `.nextSteps`** — the statistics translated into actions: «мало сделок: есть 22, нужно ≥49 — копите форвард» instead of «DSR 0.36 < 0.95». Ready to log or pipe to Telegram.
+- The progress bar now shows an **ETA** per phase.
+
 Three execution methods, by what candles they're allowed to see:
 
 | method | candles | use |

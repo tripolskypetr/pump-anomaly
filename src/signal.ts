@@ -214,6 +214,25 @@ export interface SignalPolicy {
   acknowledgeUncertified?: boolean;
 }
 
+/**
+ * Объяснение судьбы одного потенциального сигнала (explainSignals):
+ * вышел / кем отсечён / почему (человеческим языком, с числами) / значения фич.
+ */
+export interface SignalExplanation {
+  symbol: string;
+  direction: Direction | null;
+  ts: number;
+  channel: string | null;
+  emitted: boolean;
+  /** машиночитаемый код фильтра-отсекателя (momentum-gate, capacity, …) */
+  rejectedBy?: string;
+  /** человеческая причина с числами */
+  detail?: string;
+  /** собранные значения фич/порогов на момент решения */
+  values: Record<string, number | string | null>;
+  signal?: TradeSignal;
+}
+
 export const DEFAULT_POLICY: SignalPolicy = {
   allow: ["enter", "invert", "tighten"],
 };

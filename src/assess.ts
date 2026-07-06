@@ -40,6 +40,10 @@ export interface EdgeAssessment {
   minTRL: number;
   /** сколько OOS-сделок реально есть в оценивавшейся цепочке */
   oosTrades: number;
+  /** связный отчёт на человеческом языке (для лога/телеграма) */
+  summary: string;
+  /** конкретные следующие действия, по одному на строку */
+  nextSteps: string[];
 }
 
 export interface AssessOptions {
@@ -112,5 +116,32 @@ export async function assessEdge(
     }
   }
 
-  return { verdict, reasons, model, walkForward: wf, minTRL, oosTrades: pnls.length };
+  // ── человеческий итог: числа переведены в текст и действия ──
+  const nextSteps: string[] = [];
+  const sum: string[] = [];
+  sum.push(verdict === "trade"
+    ? "МОЖНО ТОРГОВАТЬ (малым риском)."
+    : verdict === "paper"
+      ? "ТОЛЬКО БУМАГА/МИКРО — эдж виден, но не доказан."
+      : "НЕ ТОРГОВАТЬ — эджа в out-of-sample цепочке нет.");
+  sum.push(`Проверка «как в жизни»: ${wf.slices.length} переобучений по прошлому, ${pnls.length} сделок вне обучения.`);
+  if (pnls.length > 0) {
+    sum.push(`Результат вне обучения: медиана ${(stats.median * 100).toFixed(2)}% на сделку (нетто издержек), просадка цепочки ${(wf.maxDrawdown * 100).toFixed(1)}%.`);
+  }
+  if (verdict === "trade") {
+    nextSteps.push("деплой a.model; риск на сделку малый; переобучение не чаще cadence-guard");
+    nextSteps.push("следить: форвард-медиана должна сходиться с бэктестовой — при рассинхроне стоп");
+  } else if (verdict === "paper") {
+    const need = Number.isFinite(minTRL) ? Math.max(0, Math.ceil(minTRL - pnls.length)) : null;
+    if (need !== null && need > 0) nextSteps.push(`копить ещё ~${need} сделок форварда (бумага/микро) до статистической значимости`);
+    if (!certifiedMode) nextSteps.push("срезы walk-forward не сертифицируются — нужен больший объём истории на срез");
+    if (!model.certification.certified) nextSteps.push("финальный сертификат красный — см. model.report() для причин человеческим языком");
+    nextSteps.push("paper-режим: model.plan(items, getCandles, { acknowledgeUncertified: true })");
+  } else {
+    nextSteps.push("не торговать; проверить качество каналов (model.channelScore) и издержки (calibration.spreadPct)");
+    nextSteps.push("если сигналов подозрительно мало — model.explainSignals(items, candles) покажет, какой фильтр режет");
+  }
+  const summary = [...sum, "Что делать: " + nextSteps.map((x, i) => `${i + 1}) ${x}`).join("; ") + "."].join("\n");
+
+  return { verdict, reasons, model, walkForward: wf, minTRL, oosTrades: pnls.length, summary, nextSteps };
 }

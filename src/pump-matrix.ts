@@ -8,7 +8,7 @@ import { RiskRewardStats, PnlStats } from "./objective";
 import { DEFAULT_VIABILITY } from "./viability";
 import {
   TradeSignal, BacktestSignal, BacktestResult, SignalAction, SignalPolicy, ExitPlan, SignalOrigin,
-  intersectPolicy, DEFAULT_POLICY,
+  SignalExplanation, intersectPolicy, DEFAULT_POLICY,
 } from "./signal";
 import {
   train,
@@ -469,6 +469,86 @@ export class PumpMatrix {
     return this._predict(items);
   }
 
+  /**
+   * ТРАССИРОВКА ОТКАЗОВ: почему каждый потенциальный сигнал вышел или НЕ вышел.
+   * plan() молчит осознанно (прод не думает) — но при интеграции молчание девяти
+   * фильтров превращает отладку в гадание. Здесь каждый вердикт проходит тот же
+   * live-конвейер с трассировкой: код фильтра-отсекателя, человеческая причина
+   * с числами и собранные значения фич (momentum, pWin, ёмкость, …).
+   *
+   * candlesBySymbol опционален: без свечей видно, какие фильтры режут из-за
+   * их отсутствия (частый случай «почему plan пуст, а signals нет»).
+   */
+  explainSignals(
+    items: ParserItem[],
+    candlesBySymbol?: Record<string, ICandleData[]>,
+    policy?: Partial<SignalPolicy>,
+  ): SignalExplanation[] {
+    const eff = intersectPolicy(this.params.policy, policy);
+    const res = this._predict(items);
+    const out: SignalExplanation[] = [];
+    for (const v of res.verdicts) {
+      if (v.action === "skip") {
+        out.push({
+          symbol: v.symbol, direction: v.direction, ts: v.ts, channel: v.channel,
+          emitted: false, rejectedBy: "detector", detail: v.reason, values: {},
+        });
+        continue;
+      }
+      const trace = { rejectedBy: undefined as string | undefined, detail: undefined as string | undefined, values: {} as Record<string, number | string | null> };
+      const sig = this.buildSignalCore(v, candlesBySymbol?.[v.symbol] ?? null, eff, "live", trace);
+      out.push({
+        symbol: v.symbol, direction: v.direction, ts: v.ts, channel: v.channel,
+        emitted: sig !== null,
+        rejectedBy: sig === null ? trace.rejectedBy : undefined,
+        detail: sig === null ? trace.detail : undefined,
+        values: trace.values,
+        signal: sig ?? undefined,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * ОТЧЁТ НА ЧЕЛОВЕЧЕСКОМ ЯЗЫКЕ — статистика переведена в действия.
+   * Для тех, кто не обязан знать, что такое DSR: каждая метрика сертификата
+   * превращается в понятную фразу, а в конце — что делать дальше.
+   */
+  report(): string {
+    const m = this.params.meta;
+    const lines: string[] = [];
+    const d = this.deployment;
+    lines.push(d.verdict === "trade"
+      ? "ВЕРДИКТ: можно торговать — статистический сертификат зелёный."
+      : d.verdict === "paper"
+        ? "ВЕРДИКТ: только бумага/микро — эдж не доказан (live-сигналы требуют acknowledgeUncertified)."
+        : "ВЕРДИКТ: неизвестен — модель старого формата без сертификата.");
+    lines.push(`Обучено на ${m.totalSamples} сделках; медианный результат ${(this.params.pnl.global.median * 100).toFixed(2)}% на сделку (нетто издержек), импакт-горизонт ~${m.impactHorizonMinutes} мин.`);
+    const cost = this.params.exit.global.roundTripCostPct ?? 0;
+    lines.push(`Издержки в метках: ${cost}% за круг${m.calibration?.spreadPct != null ? ` (в т.ч. измеренный спред ${m.calibration.spreadPct.toFixed(3)}%)` : ""}.`);
+    // перевод сертификата с числового на человеческий
+    const c = m.certification;
+    if (c && !c.certified) {
+      lines.push("Почему эдж не доказан:");
+      if (c.actualN < c.minTRL) lines.push(`  • мало сделок: есть ${c.actualN}, нужно ≥${Math.ceil(c.minTRL === Infinity ? 0 : c.minTRL)} — копите форвард-данные;`);
+      if (c.dsr < 0.95) lines.push(`  • результат пока неотличим от удачи при таком числе перебранных вариантов (DSR ${c.dsr.toFixed(2)});`);
+      if (!Number.isNaN(c.pbo) && c.pbo > 0.10) lines.push(`  • выбранная конфигурация похожа на подгонку под историю (PBO ${c.pbo.toFixed(2)});`);
+      if (c.spaPValue > 0.05) lines.push(`  • такой результат легко получить простым перебором (SPA p=${c.spaPValue.toFixed(2)});`);
+      if (c.nestedScore !== null && c.nestedScore <= 0) lines.push("  • на скользящей проверке система не зарабатывает;");
+    }
+    const plan = this.params.channelPlan ?? {};
+    const drops = Object.values(plan).filter((x) => x === "drop").length;
+    const inverts = Object.values(plan).filter((x) => x === "invert").length;
+    if (drops || inverts) lines.push(`Триаж каналов: ${drops} отключено (сливают), ${inverts} инвертировано (стабильно анти-предиктивны).`);
+    if ((m.labeling.invalidItems ?? 0) > 0) lines.push(`Внимание: ${m.labeling.invalidItems} битых записей входа отброшено.`);
+    const errs = Object.entries(m.labeling.errors ?? {});
+    if (errs.length) lines.push(`Внимание: ошибки источника свечей — ${errs.map(([e, n]) => `«${e}»×${n}`).join(", ")} (проверьте адаптер: validateGetCandles).`);
+    lines.push(d.verdict === "trade"
+      ? "Дальше: walkForward/assessEdge на свежей истории перед каждым переобучением; refit не чаще cadence-guard."
+      : "Дальше: plan(items, getCandles, { acknowledgeUncertified: true }) на бумаге, копить сделки до minTRL, затем переобучить.");
+    return lines.join("\n");
+  }
+
   // ── общий сборщик: predict → buildSignal → отсев null (veto/не разрешено) ──
   // signals() — без свечей. Используем LIVE-сборку: каскад не оценивается (нет свечей),
   // и result не доклеивается — signals() отдаёт чистый TradeSignal, не BacktestSignal.
@@ -582,9 +662,19 @@ export class PumpMatrix {
     candles: ICandleData[] | null,
     policy: SignalPolicy,
     mode: "live" | "backtest",
+    /** трассировка отказов для explainSignals: причина и значения фич */
+    trace?: { rejectedBy?: string; detail?: string; values: Record<string, number | string | null> },
   ): TradeSignal | null {
     const ch = v.channel ?? "_matrix";
     const allow = new Set(policy.allow);
+    // немой return null → говорящий отказ (код фильтра + человеческая причина)
+    const reject = (code: string, detail: string): null => {
+      if (trace) { trace.rejectedBy = code; trace.detail = detail; }
+      return null;
+    };
+    const note = (k: string, x: number | string | null | undefined) => {
+      if (trace && x !== undefined) trace.values[k] = x;
+    };
 
     // ── ЧЕСТНОСТЬ ПО УМОЛЧАНИЮ: несертифицированная модель не торгует молча ──
     // Путь fit→load→plan прикладного кодера не обязан включать walkForward —
@@ -597,7 +687,7 @@ export class PumpMatrix {
       this.params.meta.certification !== undefined &&
       !this.params.meta.certification.certified &&
       !policy.acknowledgeUncertified
-    ) return null;
+    ) return reject("uncertified-model", "сертификат модели красный: live-сигналы требуют acknowledgeUncertified (см. model.deployment)");
 
     // ── АВТО-ТРИАЖ КАНАЛА (channelPlan из fit): drop/invert без участия оператора ──
     // "drop": канал значимо убыточен — сигнал не отдаётся. "invert": механический
@@ -609,9 +699,9 @@ export class PumpMatrix {
     let planInverted: Direction | null = null;
     if (v.channel !== null) {
       const plan = this.params.channelPlan?.[v.channel];
-      if (plan === "drop") return null;
+      if (plan === "drop") return reject("channel-plan:drop", `канал ${v.channel} значимо убыточен по бэктест-истории (channelPlan=drop)`);
       if (plan === "invert") {
-        if (!allow.has("invert")) return null; // инверсия запрещена → как veto
+        if (!allow.has("invert")) return reject("channel-plan:invert-not-allowed", `канал ${v.channel} требует инверсии, но 'invert' не в allow`); // как veto
         planInverted = dir;
         dir = dir === "long" ? "short" : "long";
       }
@@ -623,7 +713,12 @@ export class PumpMatrix {
       // rrMetric гарантированно задан intersectPolicy (там ?? "mean"), здесь не дефолтим
       const metric = policy.rrMetric!;
       // нет статистики по символу → нечем подтвердить RR → режем (консервативно)
-      if (!rr || rr[metric] < policy.minRiskReward) return null;
+      note("riskReward", rr ? rr[metric] : null);
+      if (!rr || rr[metric] < policy.minRiskReward) {
+        return reject("min-risk-reward", rr
+          ? `RR символа ${rr[metric].toFixed(3)} (${metric}) < порога ${policy.minRiskReward}`
+          : `по символу ${v.symbol} нет RR-статистики — режем консервативно`);
+      }
     }
 
     // ── фильтр КАЧЕСТВА АВТОРА: single-каналы ниже порога скора режутся ──
@@ -632,7 +727,12 @@ export class PumpMatrix {
     // консервативно режем (нечем подтвердить).
     if (policy.minChannelScore !== undefined && v.channel !== null) {
       const cs = this.params.channelScore?.[v.channel];
-      if (!cs || cs.score < policy.minChannelScore) return null;
+      note("channelScore", cs?.score ?? null);
+      if (!cs || cs.score < policy.minChannelScore) {
+        return reject("min-channel-score", cs
+          ? `скор канала ${cs.score} < порога ${policy.minChannelScore}`
+          : `по каналу ${v.channel} нет статистики — режем консервативно`);
+      }
     }
 
     let volRegime: VolRegime | null = null;
@@ -656,6 +756,7 @@ export class PumpMatrix {
         ? squeezePressureBefore(candles, entryIdx, dir, horizon)
         : squeezePressure(candles, entryIdx, dir, horizon);
       volRegime = volRegimeOf(volZ, volZThr);
+      note("volZ", +volZ.toFixed(4));
       // advisory-ёмкость: медианный минутный оборот до сигнала (котируемая валюта).
       // Прод сравнивает со своим размером сам — фильтровать за него нельзя (не знаем ордер).
       const pre = candles.slice(Math.max(0, entryIdx - 60), entryIdx);
@@ -666,6 +767,11 @@ export class PumpMatrix {
       }
     }
 
+    note("volRegime", volRegime);
+    note("sqPressure", sqPressure !== null ? +sqPressure.toFixed(4) : null);
+    note("liquidityQuote", liquidityQuote);
+    note("symbolGapMs", v.symbolGapMs ?? null);
+
     // ── ФИЛЬТР ЁМКОСТИ: сверка твоего размера с минутным оборотом — внутри ──
     // Ордер, сопоставимый с минутным оборотом, сам двигает цену: эджа на таком
     // размере нет. Раньше сравнение оставалось оператору («смотри liquidityQuote»);
@@ -673,14 +779,22 @@ export class PumpMatrix {
     // подтвердить ёмкость нечем → режем консервативно.
     if (policy.notionalQuote !== undefined) {
       const share = policy.maxLiquidityShare ?? 0.1;
-      if (liquidityQuote === null || policy.notionalQuote > share * liquidityQuote) return null;
+      if (liquidityQuote === null || policy.notionalQuote > share * liquidityQuote) {
+        return reject("capacity", liquidityQuote === null
+          ? "ёмкость не подтверждена: нет свечей для оценки оборота"
+          : `размер ${policy.notionalQuote} > ${(share * 100).toFixed(0)}% минутного оборота (${liquidityQuote.toFixed(0)})`);
+      }
     }
 
     // ── ПОДТВЕРЖДЕНИЕ РЫНКОМ: пост без аномального объёма на ленте — не памп ──
     // Реальному пампу предшествует набор позиции автором → всплеск объёма ДО поста.
     // calm-лента = пост без рыночной реакции = шум. Нет свечей → подтвердить нечем →
     // режем консервативно (signals() без свечей с этим флагом всегда пуст — см. policy).
-    if (policy.requireVolumeConfirm && volRegime !== "anomalous") return null;
+    if (policy.requireVolumeConfirm && volRegime !== "anomalous") {
+      return reject("volume-confirm", volRegime === null
+        ? "подтверждение объёмом требуется, но свечей нет"
+        : "лента до поста спокойная (volRegime=calm) — рыночной реакции нет");
+    }
 
     // пре-сигнальные фичи — нужны и гейту, и модели исхода; считаются один раз
     let momentumVal: number | null = null;
@@ -697,15 +811,18 @@ export class PumpMatrix {
       compressionVal = rf.compression;
       lastPreClose = preEnd > 0 ? candles[preEnd - 1].close : null;
     }
+    note("momentum", momentumVal !== null ? +momentumVal.toFixed(4) : null);
 
     // ── MOMENTUM-ФИЛЬТР (эдж из habr 1041898): цена уже двигалась не против ──
     // сигнала ДО публикации (приток реального капитала). Momentum считается по
     // свечам СТРОГО до сигнальной минуты — без look-ahead. Нет свечей/окна →
     // подтвердить нечем → режем консервативно.
     if (policy.minMomentum24hPct !== undefined) {
-      if (momentumVal === null) return null;
+      if (momentumVal === null) return reject("momentum-gate", "momentum-фильтр требует свечей до сигнала, их нет/мало");
       const directional = dir === "long" ? momentumVal : -momentumVal;
-      if (directional < policy.minMomentum24hPct) return null;
+      if (directional < policy.minMomentum24hPct) {
+        return reject("momentum-gate", `направленный momentum ${directional.toFixed(2)}% < порога ${policy.minMomentum24hPct}% (окно ${policy.momentumWindowMinutes ?? 1440}м)`);
+      }
     }
 
     // ── МОДЕЛЬ ИСХОДА: калиброванная P(win|признаки) и ожидаемая ценность ──
@@ -731,8 +848,14 @@ export class PumpMatrix {
         fatigueGap: v.symbolGapMs ?? null,
       });
       probability = pred;
-      if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) return null;
-      if (policy.minExpectedPnlPct !== undefined && pred.expectedPnl * 100 < policy.minExpectedPnlPct) return null;
+      note("pWin", pred.pWin);
+      note("expectedPnlPct", +(pred.expectedPnl * 100).toFixed(4));
+      if (policy.minPWin !== undefined && pred.pWin < policy.minPWin) {
+        return reject("min-pwin", `P(win) ${pred.pWin} < порога ${policy.minPWin}`);
+      }
+      if (policy.minExpectedPnlPct !== undefined && pred.expectedPnl * 100 < policy.minExpectedPnlPct) {
+        return reject("min-expected-pnl", `E[pnl] ${(pred.expectedPnl * 100).toFixed(3)}% < порога ${policy.minExpectedPnlPct}%`);
+      }
     }
 
     let resolved = volRegime
@@ -752,12 +875,12 @@ export class PumpMatrix {
     if (fires) {
       const pol = exit.squeezePolicy;
       if (pol === "veto") {
-        return null; // каскад — НЕ входить. veto не попадает в выдачу.
+        return reject("cascade-veto", `давление каскада ${sqPressure!.toFixed(2)} ≥ порога — политика veto`); // не входить
       }
       if (pol === "invert" && !planInverted) {
         // канальная инверсия ГЛАВНЕЕ: двойной разворот (план + каскад) вернул бы
         // направление поста, чью анти-предиктивность триаж уже доказал — не делаем.
-        if (!allow.has("invert")) return null; // инверсия запрещена → защищаемся как veto
+        if (!allow.has("invert")) return reject("invert-not-allowed", "каскад требует инверсии, но 'invert' не в allow — защищаемся как veto");
         action = "invert";
         finalDir = dir === "long" ? "short" : "long";
         invertedFrom = dir;
@@ -766,7 +889,7 @@ export class PumpMatrix {
         resolved = resolveExit(this.params.exit, v.source, ch, v.symbol, finalDir, volRegime!);
         exit = resolved.exit;
       } else if (pol === "tighten") {
-        if (!allow.has("tighten")) return null;
+        if (!allow.has("tighten")) return reject("tighten-not-allowed", "каскад требует ужатия, но 'tighten' не в allow");
         // при канальной инверсии маркер "invert" важнее: ужатие применяем к плану,
         // но action не затираем (origin.invertedFrom + ужатый trailing в exit)
         if (!planInverted) action = "tighten";
@@ -779,7 +902,7 @@ export class PumpMatrix {
       // в стороннем анализе. pol === "none" ведёт себя так же (вход без реакции).
     }
 
-    if (action === "enter" && !allow.has("enter")) return null;
+    if (action === "enter" && !allow.has("enter")) return reject("enter-not-allowed", "'enter' не в allow-списке политики");
 
     const plan = this.flatExit(exit);
     if (tightenFired) {

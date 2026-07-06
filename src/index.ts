@@ -241,6 +241,7 @@ export type {
 export { PumpMatrix } from "./pump-matrix";
 export type {
   TradeSignal, BacktestSignal, BacktestResult, SignalAction, SignalOrigin, ExitPlan, SignalPolicy,
+  SignalExplanation,
 } from "./signal";
 export { DEFAULT_POLICY, intersectPolicy } from "./signal";
 export { DEFAULT_SELECTION, CASCADE_AGGRESSION, cascadeAggressionOf, conservatismKey, isMoreConservative } from "./selection";
@@ -254,4 +255,6 @@ export type { Calibration, CalibrationAxes } from "./calibrate";
 export { walkForward } from "./walk-forward";
 export type { WalkForwardResult, WalkForwardSlice, WalkForwardOptions } from "./walk-forward";
 export { assessEdge } from "./assess";
+export { validateGetCandles, inspectItems } from "./doctor";
+export type { AdapterCheck, ItemsReport } from "./doctor";
 export type { EdgeAssessment, EdgeVerdict, AssessOptions } from "./assess";

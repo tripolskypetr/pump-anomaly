@@ -27,17 +27,29 @@ export interface ProgressEvent {
 
 export type ProgressFn = (e: ProgressEvent) => void;
 
-/** Дефолтный stdout-бар в стиле пользователя. */
+// ETA: долгий fit без оценки времени выглядит зависшим. Скорость меряем по
+// текущей фазе (label IO-bound, score CPU-bound — темпы разные, смешивать нельзя).
+let etaPhase: string | null = null;
+let etaStart = 0;
+
+/** Дефолтный stdout-бар в стиле пользователя (+ ETA по темпу текущей фазы). */
 export const stdoutProgress: ProgressFn = (e) => {
   if (e.total <= 0) return;
+  if (etaPhase !== e.phase) { etaPhase = e.phase; etaStart = Date.now(); }
   const ratio = Math.min(e.done / e.total, 1);
   const percent = Math.round(ratio * 100);
   const filled = Math.round(ratio * BAR_LENGTH);
   const empty = BAR_LENGTH - filled;
   const bar = BAR_FILLED_CHAR.repeat(filled) + BAR_EMPTY_CHAR.repeat(empty);
+  let eta = "";
+  if (e.done >= 3 && e.done < e.total) {
+    const perUnit = (Date.now() - etaStart) / e.done;
+    const leftSec = Math.round((perUnit * (e.total - e.done)) / 1000);
+    eta = leftSec >= 60 ? ` ~${Math.floor(leftSec / 60)}м${leftSec % 60}с` : ` ~${leftSec}с`;
+  }
   // фикс. ширина: pad пробелами + slice. Иначе при более короткой новой метке
   // (SOLUSDT после FARTCOINUSDT) \r не стирает хвост → "BTCUSDTTUSDT".
-  const line = `[${bar}] ${percent}% (${e.done}/${e.total}) ${e.phase} ${e.label}`;
+  const line = `[${bar}] ${percent}% (${e.done}/${e.total})${eta} ${e.phase} ${e.label}`;
   process.stdout.write("\r" + line.padEnd(LINE_WIDTH).slice(0, LINE_WIDTH));
   if (e.done >= e.total) process.stdout.write("\n");
 };

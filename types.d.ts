@@ -1070,7 +1070,7 @@ interface ProgressEvent {
     label: string;
 }
 type ProgressFn = (e: ProgressEvent) => void;
-/** Дефолтный stdout-бар в стиле пользователя. */
+/** Дефолтный stdout-бар в стиле пользователя (+ ETA по темпу текущей фазы). */
 declare const stdoutProgress: ProgressFn;
 /** No-op для тестов/тихого режима. */
 declare const silentProgress: ProgressFn;
@@ -1283,6 +1283,24 @@ interface SignalPolicy {
      * (исследование прошлого). Модели без сертификата в meta (legacy) не гейтятся.
      */
     acknowledgeUncertified?: boolean;
+}
+/**
+ * Объяснение судьбы одного потенциального сигнала (explainSignals):
+ * вышел / кем отсечён / почему (человеческим языком, с числами) / значения фич.
+ */
+interface SignalExplanation {
+    symbol: string;
+    direction: Direction | null;
+    ts: number;
+    channel: string | null;
+    emitted: boolean;
+    /** машиночитаемый код фильтра-отсекателя (momentum-gate, capacity, …) */
+    rejectedBy?: string;
+    /** человеческая причина с числами */
+    detail?: string;
+    /** собранные значения фич/порогов на момент решения */
+    values: Record<string, number | string | null>;
+    signal?: TradeSignal;
 }
 declare const DEFAULT_POLICY: SignalPolicy;
 /**
@@ -2146,6 +2164,23 @@ declare class PumpMatrix {
     planForAt(symbol: string, direction: Direction, channel: string | null, candles: ICandleData[], entryTs: number, policy?: Partial<SignalPolicy>): BacktestSignal | null;
     /** Полный отчёт (все вердикты + карта авторства) — для разбора. */
     explain(items: ParserItem[]): PredictionResult;
+    /**
+     * ТРАССИРОВКА ОТКАЗОВ: почему каждый потенциальный сигнал вышел или НЕ вышел.
+     * plan() молчит осознанно (прод не думает) — но при интеграции молчание девяти
+     * фильтров превращает отладку в гадание. Здесь каждый вердикт проходит тот же
+     * live-конвейер с трассировкой: код фильтра-отсекателя, человеческая причина
+     * с числами и собранные значения фич (momentum, pWin, ёмкость, …).
+     *
+     * candlesBySymbol опционален: без свечей видно, какие фильтры режут из-за
+     * их отсутствия (частый случай «почему plan пуст, а signals нет»).
+     */
+    explainSignals(items: ParserItem[], candlesBySymbol?: Record<string, ICandleData[]>, policy?: Partial<SignalPolicy>): SignalExplanation[];
+    /**
+     * ОТЧЁТ НА ЧЕЛОВЕЧЕСКОМ ЯЗЫКЕ — статистика переведена в действия.
+     * Для тех, кто не обязан знать, что такое DSR: каждая метрика сертификата
+     * превращается в понятную фразу, а в конце — что делать дальше.
+     */
+    report(): string;
     private collect;
     private flatExit;
     /**
@@ -2282,6 +2317,10 @@ interface EdgeAssessment {
     minTRL: number;
     /** сколько OOS-сделок реально есть в оценивавшейся цепочке */
     oosTrades: number;
+    /** связный отчёт на человеческом языке (для лога/телеграма) */
+    summary: string;
+    /** конкретные следующие действия, по одному на строку */
+    nextSteps: string[];
 }
 interface AssessOptions {
     /** опции обучения (grid/costs/mode/…) — общие для срезов walk-forward и финального fit */
@@ -2290,6 +2329,47 @@ interface AssessOptions {
     walkForward?: Omit<WalkForwardOptions, "trainOptions">;
 }
 declare function assessEdge(items: ParserItem[], getCandles: GetCandles, opts?: AssessOptions): Promise<EdgeAssessment>;
+
+/**
+ * ДОКТОР — самопроверка интеграции до первого fit.
+ *
+ * Ловушка №1 при онбординге — контракт getCandles: семантика
+ * (limit, sDate) → [align(sDate), align(sDate)+limit·step) нарушается в чужих
+ * адаптерах постоянно (не выровнен старт, лимит не соблюдён, несортировано,
+ * дубли), и это деградирует МОЛЧА: метки тихо превращаются в no-candles /
+ * truncated, модель «просто хуже». Доктор превращает тихую порчу в конкретный
+ * список проблем с человеческими формулировками.
+ */
+interface AdapterCheck {
+    ok: boolean;
+    /** конкретные нарушения контракта — чинить обязательно */
+    issues: string[];
+    /** наблюдения, не являющиеся нарушением (дыры в истории и т.п.) */
+    notes: string[];
+}
+/**
+ * Прогоняет адаптер тестовыми запросами и проверяет контракт. Нужна точка, где
+ * у биржи ТОЧНО есть данные: symbol + ts (по умолчанию BTCUSDT, двое суток назад).
+ */
+declare function validateGetCandles(getCandles: GetCandles, opts?: {
+    symbol?: string;
+    ts?: number;
+}): Promise<AdapterCheck>;
+interface ItemsReport {
+    total: number;
+    valid: number;
+    /** отброшено нормализацией (null, нечисловой ts, кривое направление) */
+    invalid: number;
+    channels: number;
+    symbols: number;
+    spanDays: number;
+    /** точные дубликаты (channel|symbol|direction|ts) */
+    duplicates: number;
+    issues: string[];
+    notes: string[];
+}
+/** Санитария parser-items ДО fit: что за данные и хватит ли их. */
+declare function inspectItems(items: ParserItem[]): ItemsReport;
 
 /**
  * Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор
@@ -2313,5 +2393,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
-export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, zoneOffsetPct };
+export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

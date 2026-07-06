@@ -115,8 +115,10 @@ describe("range-фича в модели исхода — anti-harvesting выу
   };
   const items: ParserItem[] = [];
   for (let k = 0; k < 12; k++) {
+    // ОДИН ts у пары: смещение на час делало вход DEAD на плоском участке цикла
+    // (половина DEAD случайно выигрывала), а час поста — прокси символа
     items.push({ channel: "ch", symbol: "TIGHTUSDT", direction: "long", ts: t0 + 240 * HOUR + k * 12 * HOUR });
-    items.push({ channel: "ch", symbol: "DEADUSDT", direction: "long", ts: t0 + 240 * HOUR + k * 12 * HOUR + HOUR });
+    items.push({ channel: "ch", symbol: "DEADUSDT", direction: "long", ts: t0 + 240 * HOUR + k * 12 * HOUR });
   }
 
   it("outcome строит range-маржинал; живой диапазон получает pWin выше мёртвого", async () => {

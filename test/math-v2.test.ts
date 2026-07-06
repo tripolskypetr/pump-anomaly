@@ -107,8 +107,10 @@ describe("outcome-model e2e — probability в сигнале, гейты minPWi
   const items: ParserItem[] = [];
   for (let k = 0; k < 14; k++) {
     const base = t0 + 24 * HOUR + k * 6 * HOUR;
+    // ОДИН ts у пары: иначе час поста — идеальный прокси символа (конфаундер
+    // фикстуры), и модель честно выучивает сезонность вместо momentum
     items.push({ channel: "ch", symbol: "GOODUSDT", direction: "long", ts: base });
-    items.push({ channel: "ch", symbol: "BADUSDT", direction: "long", ts: base + 90 * MIN });
+    items.push({ channel: "ch", symbol: "BADUSDT", direction: "long", ts: base });
   }
   const opts = {
     folds: 3, mode: "single" as const, onProgress: silentProgress,

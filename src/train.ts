@@ -179,6 +179,15 @@ export interface TrainOptions {
    */
   momentumFeature?: boolean;
   /**
+   * РЫНОЧНЫЙ ФОН для модели исхода: символ-бенчмарк, чей momentum перед сигналом
+   * становится признаком "market" (памп в падающем рынке живёт иначе). По
+   * умолчанию "BTCUSDT" (константа среды — базовый актив крипторынка, не ось
+   * оптимизации); null = фон не считать (нет доп. запросов свечей). Окно —
+   * общий momentumWindowMinutes. Символ сериализуется в meta.marketSymbol,
+   * рантайм использует его же.
+   */
+  marketSymbol?: string | null;
+  /**
    * Оценщик графа авторства для matrix-режима: "xcorr" (дефолт, конвейер сита)
    * или "hawkes" (multivariate Hawkes, слой 9). Прошивается в config модели —
    * predict после load() использует его же. Сравнение оценщиков = два walkForward
@@ -311,7 +320,12 @@ export interface TrainedParams {
    * механическим паттернам постинга (решётка интервалов, cron-расписание).
    * Высокий algoScore + отрицательный score = кандидат на инверсию (habr 1028592).
    */
-  channelScore?: Record<string, { score: number; median: number; n: number; algoScore?: number }>;
+  channelScore?: Record<string, {
+    score: number; median: number; n: number; algoScore?: number;
+    /** сглаженный (Лаплас) winrate канала по всей train-истории — рантайм-значение
+     *  prequential-признака channelWinRate модели исхода */
+    winRate?: number;
+  }>;
   /**
    * АВТО-ТРИАЖ КАНАЛОВ — неочевидная логика «что делать с каналом» автоматизирована:
    *  - "drop"   — канал ЗНАЧИМО убыточен (усаженный скор < 0, |t| ≥ 2, n достаточно):
@@ -403,6 +417,9 @@ export interface TrainedParams {
      * переобучений: цепочка cadence-guard/family-wise DSR переживает save()/load().
      */
     ledger?: MetaLedgerState;
+    /** символ-бенчмарк признака "market" модели исхода (рантайм фетчит его же);
+     *  отсутствует = фон не считался */
+    marketSymbol?: string;
   };
 }
 
@@ -1479,13 +1496,18 @@ export async function train(
   // сила усадки скора каналов — эмпирический Байес по межканальной дисперсии
   // (однородные каналы → жёсткая усадка, реально разные → мягкая); <3 каналов → shrinkageK
   const channelK = empiricalPoolK([...channelPnls.values()], shrinkageK);
-  const channelScore: Record<string, { score: number; median: number; n: number; algoScore?: number }> = {};
+  const channelScore: Record<string, {
+    score: number; median: number; n: number; algoScore?: number; winRate?: number;
+  }> = {};
   for (const [ch, pnls] of channelPnls) {
     channelScore[ch] = {
       score: +shrinkageExpectancy(pnls, channelK).toFixed(6),
       median: +percentile(pnls, 0.5).toFixed(6),
       n: pnls.length,
       algoScore: algoSignatureOf(channelPosts.get(ch) ?? []).algoScore,
+      // сглаженный winrate (Лаплас) — рантайм-значение prequential-признака
+      // channelWinRate: свежая модель продолжает train-серию канала с этой точки
+      winRate: +((pnls.filter((p) => p > 0).length + 1) / (pnls.length + 2)).toFixed(6),
     };
   }
 
@@ -1524,6 +1546,8 @@ export async function train(
   // данных честно null (вклад 0). Модель, не побившая prior по OOF-Brier,
   // помечается informative=false — рантайм отдаст prior, а не псевдоточность.
   let outcome: OutcomeModel | null = null;
+  // символ-бенчмарк рыночного фона (null = фон выключен, доп. запросов нет)
+  const marketSymbolEff = opts.marketSymbol === null ? null : opts.marketSymbol ?? "BTCUSDT";
   if (opts.outcomeModel ?? true) {
     // hawkes-фича: глобальная таблица (symbol|dir → ts[]) + бинарный поиск якоря
     const globalTbl = buildTable(items as unknown as SignalEvent[]);
@@ -1565,6 +1589,34 @@ export async function train(
       return best >= 0 ? ts - arr[best] : null;
     };
 
+    // РЫНОЧНЫЙ ФОН: momentum бенчмарка (BTCUSDT) перед каждой сделкой — памп в
+    // падающем рынке живёт иначе. Окна перекрываются, но точки старта разные —
+    // memoize по выровненной минуте сигнала (кэш свечей дополнительно дедупит IO).
+    const marketMomCache = new Map<number, Promise<number | null>>();
+    const marketMomOf = (ts: number): Promise<number | null> => {
+      if (marketSymbolEff === null) return Promise.resolve(null);
+      const start = entryStartTs(ts, "1m");
+      const hit = marketMomCache.get(start);
+      if (hit) return hit;
+      const p = (async (): Promise<number | null> => {
+        try {
+          const pre = await fetchCandlesChunked(
+            gcCached, marketSymbolEff, "1m", momentumWindow, start - momentumWindow * 60_000,
+          );
+          const cut = pre.filter((c) => c.timestamp < start);
+          return momentumPct(cut, cut.length, momentumWindow);
+        } catch { return null; } // фон недоступен → честный null (вклад 0)
+      })();
+      marketMomCache.set(start, p);
+      return p;
+    };
+
+    // PREQUENTIAL winrate канала: доля выигрышей ПРЕДЫДУЩИХ сделок канала на
+    // момент сигнала (Лаплас к 0.5; без истории — null). Кампании ботов имеют
+    // жизненный цикл — форма зависимости выучится изотоникой. Без look-ahead:
+    // history отсортирована, счётчик обновляется ПОСЛЕ выдачи признака.
+    const chanStreak = new Map<string, { n: number; w: number }>();
+
     const rows: OutcomeRow[] = [];
     for (const h of history) {
       if (!h.entered) continue;
@@ -1573,6 +1625,8 @@ export async function train(
       const pace = h.independentClusters > 1 && b?.confirmSpanMs !== undefined
         ? b.confirmSpanMs / (h.independentClusters - 1)
         : null;
+      const streak = chanStreak.get(h.channel) ?? { n: 0, w: 0 };
+      const d = new Date(h.ts);
       rows.push({
         y: h.pnl > 0 ? 1 : 0,
         pnl: h.pnl,
@@ -1587,8 +1641,15 @@ export async function train(
           compression: b?.preCompression ?? null,
           zoneOffset: b?.zoneOffsetPct ?? null,
           fatigueGap: gapOf(h.symbol, h.ts),
+          channelWinRate: streak.n > 0 ? (streak.w + 1) / (streak.n + 2) : null,
+          market: await marketMomOf(h.ts),
+          // СЕЗОННОСТЬ (категориальные маржиналы): ботовые сетки ходят по
+          // расписанию, выигрышность по слотам разная. UTC — как ts.
+          hourOfDay: String(d.getUTCHours()),
+          dayOfWeek: String(d.getUTCDay()),
         },
       });
+      chanStreak.set(h.channel, { n: streak.n + 1, w: streak.w + (h.pnl > 0 ? 1 : 0) });
     }
     outcome = fitOutcomeModel(rows, folds);
   }
@@ -1638,6 +1699,7 @@ export async function train(
       },
       calibration,
       refinement: refineRounds > 0 ? refinement : null,
+      marketSymbol: marketSymbolEff ?? undefined,
     },
   };
 

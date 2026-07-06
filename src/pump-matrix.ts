@@ -138,7 +138,9 @@ export class PumpMatrix {
    * score = shrinkage-expectancy (усажен к нулю при малом n). Основа для
    * runtime-фильтра policy.minChannelScore и для ручного аудита каналов.
    */
-  get channelScore(): Record<string, { score: number; median: number; n: number; algoScore?: number }> {
+  get channelScore(): Record<string, {
+    score: number; median: number; n: number; algoScore?: number; winRate?: number;
+  }> {
     return { ...(this.params.channelScore ?? {}) };
   }
 
@@ -336,7 +338,7 @@ export class PumpMatrix {
     const eff = intersectPolicy(this.params.policy, policy);
     const out: TradeSignal[] = [];
     for (const v of this._predict(items).signals) {
-      const s = this.buildSignalLive(v, source[v.symbol] ?? null, eff);
+      const s = this.buildSignalLive(v, source[v.symbol] ?? null, eff, this.marketFromDict(source));
       if (s) out.push(s);
     }
     return out;
@@ -356,6 +358,7 @@ export class PumpMatrix {
       ? (eff.momentumWindowMinutes ?? 1440) + 5 : 0;
     const lookback = Math.max(this.lookbackMinutes, momWin);
     const out: TradeSignal[] = [];
+    const marketMemo = new Map<number, ICandleData[] | null>();
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
       try {
@@ -369,7 +372,10 @@ export class PumpMatrix {
       } catch {
         candles = null; // битый символ → сигнал без свечей, не рушим весь вызов
       }
-      const s = this.buildSignalLive(v, candles, eff);
+      const market = await this.marketViaGetCandles(
+        getCandles, v.ts, eff.momentumWindowMinutes ?? 1440, marketMemo,
+      );
+      const s = this.buildSignalLive(v, candles, eff, market);
       if (s) out.push(s);
     }
     return out;
@@ -397,7 +403,7 @@ export class PumpMatrix {
     const out: BacktestSignal[] = [];
     for (const v of this._predict(items).signals) {
       // зона входа уже в вердикте (протянута из parser-item) → buildSignal её прокинет
-      const s = this.buildSignal(v, source[v.symbol] ?? null, eff);
+      const s = this.buildSignal(v, source[v.symbol] ?? null, eff, this.marketFromDict(source));
       if (s) out.push(s);
     }
     return out;
@@ -418,6 +424,7 @@ export class PumpMatrix {
     const limit = maxLife * 2 + 5 + momWin;
     const step = STEP_MS["1m"];
     const out: BacktestSignal[] = [];
+    const marketMemo = new Map<number, ICandleData[] | null>();
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
       try {
@@ -427,7 +434,10 @@ export class PumpMatrix {
       } catch {
         candles = null;
       }
-      const s = this.buildSignal(v, candles, eff);
+      const market = await this.marketViaGetCandles(
+        getCandles, v.ts, eff.momentumWindowMinutes ?? 1440, marketMemo,
+      );
+      const s = this.buildSignal(v, candles, eff, market);
       if (s) out.push(s);
     }
     return out;
@@ -505,7 +515,10 @@ export class PumpMatrix {
         continue;
       }
       const trace = { rejectedBy: undefined as string | undefined, detail: undefined as string | undefined, values: {} as Record<string, number | string | null> };
-      const sig = this.buildSignalCore(v, candlesBySymbol?.[v.symbol] ?? null, eff, "live", trace);
+      const sig = this.buildSignalCore(
+        v, candlesBySymbol?.[v.symbol] ?? null, eff, "live", trace,
+        candlesBySymbol ? this.marketFromDict(candlesBySymbol) : null,
+      );
       out.push({
         symbol: v.symbol, direction: v.direction, ts: v.ts, channel: v.channel,
         emitted: sig !== null,
@@ -558,6 +571,49 @@ export class PumpMatrix {
     return lines.join("\n");
   }
 
+  /** символ-бенчмарк признака "market" модели исхода (null = фон не обучался/выключен) */
+  get marketSymbol(): string | null {
+    return this.params.meta.marketSymbol ?? null;
+  }
+
+  /** тянуть ли фон в рантайме: маржинал "market" реально ВЫУЧЕН моделью исхода
+   *  (иначе фетч бенчмарка — чистый расход IO с нулевым вкладом в предикт) */
+  private get marketFeatureOn(): boolean {
+    return this.marketSymbol !== null && this.params.outcome?.features?.market !== undefined;
+  }
+
+  /** свечи бенчмарка из словаря пользователя (dict-пути plan/backtest/explain) */
+  private marketFromDict(source: Record<string, ICandleData[]>): ICandleData[] | null {
+    return this.marketSymbol !== null ? source[this.marketSymbol] ?? null : null;
+  }
+
+  /**
+   * Фон-свечи бенчмарка ДО сигнала (getCandles-пути). Тянутся ТОЛЬКО когда
+   * маржинал "market" выучен (marketFeatureOn) — иначе ноль лишнего IO.
+   * memo по выровненной минуте: сигналы одного всплеска не дублируют запрос.
+   * Ошибка/пусто → null (вклад признака 0), вызов не роняется.
+   */
+  private async marketViaGetCandles(
+    getCandles: GetCandles,
+    ts: number,
+    windowMinutes: number,
+    memo: Map<number, ICandleData[] | null>,
+  ): Promise<ICandleData[] | null> {
+    if (!this.marketFeatureOn) return null;
+    const start = entryStartTs(ts, "1m");
+    const hit = memo.get(start);
+    if (hit !== undefined) return hit;
+    let out: ICandleData[] | null = null;
+    try {
+      const c = await fetchCandlesChunked(
+        getCandles, this.marketSymbol!, "1m", windowMinutes, start - windowMinutes * STEP_MS["1m"],
+      );
+      out = c.length ? c : null;
+    } catch { out = null; }
+    memo.set(start, out);
+    return out;
+  }
+
   // ── общий сборщик: predict → buildSignal → отсев null (veto/не разрешено) ──
   // signals() — без свечей. Используем LIVE-сборку: каскад не оценивается (нет свечей),
   // и result не доклеивается — signals() отдаёт чистый TradeSignal, не BacktestSignal.
@@ -598,8 +654,9 @@ export class PumpMatrix {
     v: PumpVerdict,
     candles: ICandleData[] | null,
     policy: SignalPolicy,
+    marketCandles: ICandleData[] | null = null,
   ): BacktestSignal | null {
-    const sig = this.buildSignalCore(v, candles, policy, "backtest");
+    const sig = this.buildSignalCore(v, candles, policy, "backtest", undefined, marketCandles);
     if (!sig) return null;
     return { ...sig, result: this.replayResult(sig, candles) };
   }
@@ -612,8 +669,9 @@ export class PumpMatrix {
     v: PumpVerdict,
     candles: ICandleData[] | null,
     policy: SignalPolicy,
+    marketCandles: ICandleData[] | null = null,
   ): TradeSignal | null {
-    return this.buildSignalCore(v, candles, policy, "live");
+    return this.buildSignalCore(v, candles, policy, "live", undefined, marketCandles);
   }
 
   /**
@@ -673,6 +731,9 @@ export class PumpMatrix {
     mode: "live" | "backtest",
     /** трассировка отказов для explainSignals: причина и значения фич */
     trace?: { rejectedBy?: string; detail?: string; values: Record<string, number | string | null> },
+    /** свечи символа-бенчмарка (meta.marketSymbol) ДО сигнала — признак "market"
+     *  модели исхода; null = фон недоступен (вклад 0) */
+    marketCandles: ICandleData[] | null = null,
   ): TradeSignal | null {
     const ch = v.channel ?? "_matrix";
     const allow = new Set(policy.allow);
@@ -821,6 +882,16 @@ export class PumpMatrix {
       lastPreClose = preEnd > 0 ? candles[preEnd - 1].close : null;
     }
     note("momentum", momentumVal !== null ? +momentumVal.toFixed(4) : null);
+    // рыночный фон: momentum бенчмарка (meta.marketSymbol) по свечам ДО сигнала —
+    // тот же расчёт, что для символа; без свечей фона — честный null (вклад 0)
+    let marketVal: number | null = null;
+    if (marketCandles && marketCandles.length > 0) {
+      const startTs = entryStartTs(v.ts, "1m");
+      let mEnd = marketCandles.findIndex((c) => c.timestamp >= startTs);
+      if (mEnd < 0) mEnd = marketCandles.length;
+      marketVal = momentumPct(marketCandles, mEnd, policy.momentumWindowMinutes ?? 1440);
+    }
+    note("market", marketVal !== null ? +marketVal.toFixed(4) : null);
 
     // ── MOMENTUM-ФИЛЬТР (эдж из habr 1041898): цена уже двигалась не против ──
     // сигнала ДО публикации (приток реального капитала). Momentum считается по
@@ -855,6 +926,14 @@ export class PumpMatrix {
         // channelPlan мог перевернуть торговое направление, но зону ставил автор)
         zoneOffset: zoneOffsetPct(v.entryFromPrice, v.entryToPrice, lastPreClose, v.direction!),
         fatigueGap: v.symbolGapMs ?? null,
+        // prequential winrate канала на конец обучения (сериализован в channelScore)
+        channelWinRate: v.channel !== null
+          ? this.params.channelScore?.[v.channel]?.winRate ?? null
+          : null,
+        market: marketVal,
+        // сезонность — категориальные маржиналы (UTC, как в обучении)
+        hourOfDay: String(new Date(v.ts).getUTCHours()),
+        dayOfWeek: String(new Date(v.ts).getUTCDay()),
       });
       probability = pred;
       note("pWin", pred.pWin);

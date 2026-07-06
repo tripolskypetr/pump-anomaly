@@ -278,12 +278,26 @@ interface IsotonicLLR {
     direction: 1 | -1;
     fn: StepFn;
 }
+/**
+ * КАТЕГОРИАЛЬНЫЙ маржинал — для признаков без порядка (час суток, день недели):
+ * изотоника предполагает монотонность, а «22:00 лучше 10:00» — не монотонная
+ * зависимость. P(win|категория) усажена к prior бета-биномиальным эмпирическим
+ * Байесом: сила усадки s = p̄(1−p̄)/τ̂², где τ̂² — метод моментов по межкатегорной
+ * дисперсии (однородные категории → τ̂²≈0 → всё сплющивается к prior → вклад ≈0:
+ * несуществующая сезонность выучиться НЕ может). Нижняя граница s — Лаплас.
+ */
+interface CategoricalLLR {
+    /** P(win|категория), усажено; категория вне карты на предикте → prior (вклад 0) */
+    probs: Record<string, number>;
+}
 interface OutcomeModel {
     version: 1;
     /** базовая P(win) по всем сделкам */
     prior: number;
     /** маржиналы по именам признаков */
     features: Record<string, IsotonicLLR>;
+    /** категориальные маржиналы (сезонность и т.п.); отсутствует в старых моделях */
+    categoricals?: Record<string, CategoricalLLR>;
     /** калибровка сырого скора (Σ LLR) → вероятность, изотонная по OOF */
     calibration: StepFn;
     /** средний pnl выигрышных / проигрышных сделок (для E[pnl]) */
@@ -301,8 +315,12 @@ interface OutcomeRow {
     y: 0 | 1;
     pnl: number;
     ts: number;
-    /** null = признак недоступен для этой сделки (вклад 0) */
-    features: Record<string, number | null>;
+    /**
+     * null = признак недоступен для этой сделки (вклад 0).
+     * number → изотонный маржинал (монотонная зависимость);
+     * string → категориальный маржинал (час суток, день недели — без порядка).
+     */
+    features: Record<string, number | string | null>;
 }
 /**
  * Обучение модели исхода. null, если данных мало или исход одноклассовый —
@@ -326,7 +344,7 @@ interface OutcomePrediction {
      */
     recommendedRiskFrac: number;
 }
-declare function predictOutcome(model: OutcomeModel, features: Record<string, number | null | undefined>): OutcomePrediction;
+declare function predictOutcome(model: OutcomeModel, features: Record<string, number | string | null | undefined>): OutcomePrediction;
 
 /**
  * Objective для подбора порогов: shrinkage-expectancy.
@@ -1731,6 +1749,15 @@ interface TrainOptions {
      */
     momentumFeature?: boolean;
     /**
+     * РЫНОЧНЫЙ ФОН для модели исхода: символ-бенчмарк, чей momentum перед сигналом
+     * становится признаком "market" (памп в падающем рынке живёт иначе). По
+     * умолчанию "BTCUSDT" (константа среды — базовый актив крипторынка, не ось
+     * оптимизации); null = фон не считать (нет доп. запросов свечей). Окно —
+     * общий momentumWindowMinutes. Символ сериализуется в meta.marketSymbol,
+     * рантайм использует его же.
+     */
+    marketSymbol?: string | null;
+    /**
      * Оценщик графа авторства для matrix-режима: "xcorr" (дефолт, конвейер сита)
      * или "hawkes" (multivariate Hawkes, слой 9). Прошивается в config модели —
      * predict после load() использует его же. Сравнение оценщиков = два walkForward
@@ -1864,6 +1891,9 @@ interface TrainedParams {
         median: number;
         n: number;
         algoScore?: number;
+        /** сглаженный (Лаплас) winrate канала по всей train-истории — рантайм-значение
+         *  prequential-признака channelWinRate модели исхода */
+        winRate?: number;
     }>;
     /**
      * АВТО-ТРИАЖ КАНАЛОВ — неочевидная логика «что делать с каналом» автоматизирована:
@@ -1959,6 +1989,9 @@ interface TrainedParams {
          * переобучений: цепочка cadence-guard/family-wise DSR переживает save()/load().
          */
         ledger?: MetaLedgerState;
+        /** символ-бенчмарк признака "market" модели исхода (рантайм фетчит его же);
+         *  отсутствует = фон не считался */
+        marketSymbol?: string;
     };
 }
 interface TrainResult {
@@ -2057,6 +2090,7 @@ declare class PumpMatrix {
         median: number;
         n: number;
         algoScore?: number;
+        winRate?: number;
     }>;
     /**
      * Авто-триаж каналов, принятый на fit: channel → "drop" (значимо убыточен,
@@ -2220,6 +2254,20 @@ declare class PumpMatrix {
      * превращается в понятную фразу, а в конце — что делать дальше.
      */
     report(): string;
+    /** символ-бенчмарк признака "market" модели исхода (null = фон не обучался/выключен) */
+    get marketSymbol(): string | null;
+    /** тянуть ли фон в рантайме: маржинал "market" реально ВЫУЧЕН моделью исхода
+     *  (иначе фетч бенчмарка — чистый расход IO с нулевым вкладом в предикт) */
+    private get marketFeatureOn();
+    /** свечи бенчмарка из словаря пользователя (dict-пути plan/backtest/explain) */
+    private marketFromDict;
+    /**
+     * Фон-свечи бенчмарка ДО сигнала (getCandles-пути). Тянутся ТОЛЬКО когда
+     * маржинал "market" выучен (marketFeatureOn) — иначе ноль лишнего IO.
+     * memo по выровненной минуте: сигналы одного всплеска не дублируют запрос.
+     * Ошибка/пусто → null (вклад признака 0), вызов не роняется.
+     */
+    private marketViaGetCandles;
     private collect;
     private flatExit;
     /**
@@ -2605,4 +2653,4 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
 export { CASCADE_AGGRESSION, DEFAULT_CANDLE_TIMEOUT_MS, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PaperTrader, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, placeboItems, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, simulateCapital, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, withTimeout, zoneOffsetPct };
-export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, CapitalSimResult, CapitalTrade, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, DriftReport, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, ForwardTrade, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, CapitalSimResult, CapitalTrade, CategoricalLLR, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, DriftReport, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, ForwardTrade, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

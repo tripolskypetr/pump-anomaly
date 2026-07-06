@@ -186,7 +186,7 @@ export { buildTable, buildWindowedTable, windowEvents } from "./core/event-table
 export { selfTuneLag, selfTuneLagDetail } from "./layers/self-tune-lag";
 export type { LagDetail } from "./layers/self-tune-lag";
 export { fitOutcomeModel, predictOutcome } from "./outcome-model";
-export type { OutcomeModel, OutcomeRow, OutcomePrediction, IsotonicLLR } from "./outcome-model";
+export type { OutcomeModel, OutcomeRow, OutcomePrediction, IsotonicLLR, CategoricalLLR } from "./outcome-model";
 export { exitProposalsFromPath } from "./objective";
 export type { PathExitProposals } from "./objective";
 export { jaccardScreen, jaccardPair } from "./layers/jaccard-screen";

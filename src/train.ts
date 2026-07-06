@@ -112,10 +112,16 @@ export interface TrainOptions {
   /**
    * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан,
    * DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам, а не
-   * только текущему. Так сертификат учитывает, что fit гоняли многократно.
-   * Без него (undefined) — поправки нет (одиночный fit, наивный N).
+   * только текущему. Без него (undefined) — поправки нет (одиночный fit, наивный N).
    */
   metaLedger?: MetaLedgerState;
+  /**
+   * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
+   * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
+   * CV-отбор и сертификация считаются под РЕАЛЬНУЮ стоимость сделки, а не под
+   * идеальное исполнение. Типично 0.1–0.3 для тейкера на памп-коинах. Дефолт 0.
+   */
+  roundTripCostPct?: number;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -306,6 +312,7 @@ export async function train(
   for (const it of items) entryIndex.set(`${it.symbol}|${it.direction}|${it.ts}`, it);
 
   // полный список exit-наборов (декартово произведение exit+volume осей)
+  const roundTripCostPct = opts.roundTripCostPct ?? 0;
   const exitSets: ExitParams[] = [];
   for (const tt of grid.trailingTake)
     for (const hs of grid.hardStop)
@@ -323,6 +330,9 @@ export async function train(
                         volZThreshold: vz, squeezePolicy: pol,
                         squeezeThreshold: sqt, volBaselineWindow: bw,
                         cascadeWindowMinutes: cw,
+                        // издержки среды: каждая метка/CV-оценка считается под реальную
+                        // стоимость сделки; попадает в тензор → прод реплеит с ними же
+                        roundTripCostPct,
                       });
 
   // кэш: ключ кластеризации → размеченные всплески.

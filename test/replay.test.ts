@@ -58,14 +58,17 @@ describe("replayExit — все последовательности окна (L
     expect(r.peak).toBeGreaterThan(0); // пик был, но не реализован
   });
 
-  it("trailing take: вырос на +3%, откатил на 1% → выход по пику", () => {
+  it("trailing take: вырос на +3%, откатил на 1% → ЧЕСТНАЯ реализация по close отката", () => {
     const cs = candles([
       [100, 103, 100, 103],      // пик +3%
       [103, 103, 101.5, 101.9],  // откат: close 101.9 = +1.9%, откат от пика 1.1% ≥ trailingTake
     ]);
     const r = replayExit(cs, "long", 99, 101, EXIT({ trailingTake: 1.0, hardStop: 5 }));
     expect(r.reason).toBe("trailing-take");
-    expect(r.pnl).toBeCloseTo(0.03, 2);
+    // прод узнаёт об откате на close и выходит маркетом → реализуется +1.9%, НЕ пик +3%
+    expect(r.pnl).toBeCloseTo(0.019, 9);
+    expect(r.peak).toBeCloseTo(0.03, 9); // пик — отдельно, для диагностики
+    expect(r.exitPrice).toBeCloseTo(101.9, 9);
   });
 
   it("цена НЕ двигается к цели вовсе: болтается у входа → life-cap около нуля", () => {
@@ -80,7 +83,7 @@ describe("replayExit — все последовательности окна (L
     expect(Math.abs(r.pnl)).toBeLessThan(0.005);
   });
 
-  it("peak staleness: достиг +1.2%, дальше плато дольше N минут → выход по пику", () => {
+  it("peak staleness: достиг +1.2%, дальше плато дольше N минут → выход по close плато", () => {
     const rows: Array<[number, number, number, number]> = [[100, 101.2, 100, 101.2]]; // пик +1.2% на минуте 0
     for (let i = 0; i < 6; i++) rows.push([101.0, 101.1, 100.9, 101.0]); // плато, без нового пика
     const cs = candles(rows);
@@ -88,7 +91,9 @@ describe("replayExit — все последовательности окна (L
       stalenessSinceProfit: 1.0, stalenessSinceMinutes: 5, trailingTake: 5, hardStop: 5, staleMinutes: 100,
     }));
     expect(r.reason).toBe("peak-staleness");
-    expect(r.pnl).toBeCloseTo(0.012, 3);
+    // протухание → выход маркетом по close текущей свечи (+1.0%), НЕ по пику +1.2%
+    expect(r.pnl).toBeCloseTo(0.010, 9);
+    expect(r.peak).toBeCloseTo(0.012, 9);
   });
 
   it("мгновенный обвал на первой же свече → hard-stop, ЧЕСТНЫЙ убыток -hardStop%", () => {
@@ -121,14 +126,16 @@ describe("replayExit — SHORT (gravebag, стоп ВЫШЕ входа)", () => 
     expect(r.pnl).toBeCloseTo(-0.01, 9); // честный убыток -hardStop%, не откат к пику
   });
 
-  it("trailing take для short: упало на 3%, откат вверх 1% → выход по пику", () => {
+  it("trailing take для short: упало на 3%, откат вверх 1% → ЧЕСТНАЯ реализация по close", () => {
     const cs = candles([
       [100, 100, 97, 97],        // пик +3% (цена упала до 97)
       [97, 98.6, 97, 98.5],      // откат вверх: close 98.5 = +1.5% short, откат 1.5% ≥ trailingTake
     ]);
     const r = replayExit(cs, "short", 99, 101, EXIT({ trailingTake: 1.0, hardStop: 5 }));
     expect(r.reason).toBe("trailing-take");
-    expect(r.pnl).toBeCloseTo(0.03, 2);
+    // реализуется close отката +1.5%, НЕ пик +3% (симметрия с long)
+    expect(r.pnl).toBeCloseTo(0.015, 9);
+    expect(r.peak).toBeCloseTo(0.03, 9);
   });
 });
 

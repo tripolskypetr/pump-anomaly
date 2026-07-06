@@ -41,6 +41,14 @@ export interface ExitParams {
    * Если не задано — fallback на staleMinutes (обратная совместимость).
    */
   cascadeWindowMinutes?: number;
+  /**
+   * Суммарная стоимость round-trip (комиссии тейкера на вход+выход + проскальзывание),
+   * % от нотионала. Вычитается из реализованного pnl КАЖДОЙ вошедшей сделки —
+   * бэктест без издержек систематически красивее реальности, особенно на
+   * низколиквидных памп-коинах. 0 / не задано = идеальное исполнение (старое поведение).
+   * Это КОНСТАНТА СРЕДЫ (твоя биржа/тариф), не ось оптимизации grid.
+   */
+  roundTripCostPct?: number;
 }
 
 export type ExitReason =
@@ -53,7 +61,11 @@ export type ExitReason =
   | "no-entry";
 
 export interface ReplayResult {
-  /** реализованный PnL% (в долях: 0.05 = +5%). При hard-stop = -hardStop% (честный убыток). */
+  /**
+   * реализованный НЕТТО PnL% (в долях: 0.05 = +5%), за вычетом roundTripCostPct.
+   * hard-stop = -hardStop%; trailing/staleness = close свечи-триггера (НЕ пик —
+   * прод выходит маркетом по close, пик нереализуем); life-cap = close последней свечи.
+   */
   pnl: number;
   reason: ExitReason;
   /** пиковый PnL% за жизнь позиции */
@@ -177,6 +189,9 @@ export function replayExit(
   const hardStopFrac = p.hardStop / 100;
   const trailFrac = (p.trailingTake * tighten) / 100;
   const stalenessProfitFrac = p.stalenessSinceProfit / 100;
+  // издержки исполнения: вычитаются из НЕТТО pnl каждой вошедшей сделки.
+  // exitPrice остаётся ГРОСС-ценой рынка (по ней сверяют путь), pnl — нетто.
+  const costFrac = (p.roundTripCostPct ?? 0) / 100;
 
   let peak = 0;                 // пиковый PnL за жизнь (доли)
   let peakMinute = 0;          // минута достижения пика
@@ -207,7 +222,7 @@ export function replayExit(
       // НИКОГДА не показывал убыток — это завышало pnl и отравляло RR/CV-объектив
       // (оптимизатор не видел риск стопов). peak сохраняется отдельно для диагностики.
       return {
-        pnl: -hardStopFrac,
+        pnl: -hardStopFrac - costFrac,
         reason: "hard-stop",
         peak,
         heldMinutes: minute,
@@ -228,26 +243,34 @@ export function replayExit(
     //    Откат меряем по close свечи (как listenActivePing на закрытии свечи).
     const closePnl = signed(entryPrice, c.close, dir);
     if (closePnl >= 0 && peak - closePnl >= trailFrac && peak > 0) {
+      // ЧЕСТНАЯ реализация: прод узнаёт об откате на CLOSE свечи и выходит маркетом
+      // около этого close — реализуется closePnl, а НЕ пик. Раньше возвращался peak,
+      // что систематически завышало каждую трейлинг-сделку на ≥ trailingTake% и
+      // отравляло CV/RR/сертификацию (оптимизатор выбирал пороги под несуществующий
+      // выход по пику). peak сохраняется отдельно для диагностики.
       return {
-        pnl: peak, // фиксируем по достигнутому пику (последний плюсовой trailingTake)
+        pnl: closePnl - costFrac,
         reason: "trailing-take",
         peak,
         heldMinutes: minute,
         entered: true,
-        entryPrice, exitPrice: exitPriceOf(entryPrice, peak, dir),
+        entryPrice, exitPrice: c.close,
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
 
     // 3) PEAK STALENESS — пик достиг порога прибыли и протух по времени.
+    //    Реализация ЧЕСТНАЯ: выход маркетом по close текущей свечи (closePnl может
+    //    быть и ниже порога, и отрицательным — цена могла отдать весь плюс, не задев
+    //    hard stop). Раньше возвращался peak — та же оптимистичная ложь, что и в trailing.
     if (peak >= stalenessProfitFrac && minute - peakMinute >= p.stalenessSinceMinutes) {
       return {
-        pnl: peak,
+        pnl: closePnl - costFrac,
         reason: "peak-staleness",
         peak,
         heldMinutes: minute,
         entered: true,
-        entryPrice, exitPrice: exitPriceOf(entryPrice, peak, dir),
+        entryPrice, exitPrice: c.close,
         volZ, squeezePressure: sqPressure, volRegime, inverted: false, truncated,
       };
     }
@@ -258,7 +281,7 @@ export function replayExit(
   const lastIdx = entryIdx + lifeCap;
   const finalPnl = signed(entryPrice, candles[lastIdx].close, dir);
   return {
-    pnl: finalPnl,
+    pnl: finalPnl - costFrac,
     reason: "life-cap",
     peak,
     heldMinutes: lifeCap,

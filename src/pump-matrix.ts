@@ -94,7 +94,10 @@ export class PumpMatrix {
 
   /** Политика разрешённых исходов, зашитая в модель (readonly-копия). */
   get policy(): SignalPolicy {
-    return { allow: [...this.params.policy.allow] };
+    // ПОЛНАЯ копия: помимо allow политика несёт RR-фильтр (minRiskReward/rrMetric)
+    // и гейт подтверждения рынком — терять их в геттере нельзя (урезанный аудит).
+    const { allow, minRiskReward, rrMetric, requireVolumeConfirm } = this.params.policy;
+    return { allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm };
   }
 
   /** Надёжна ли модель (хватило ли данных при обучении). */
@@ -158,7 +161,10 @@ export class PumpMatrix {
    */
   get lookbackMinutes(): number {
     const baseWin = this.params.exit.global.volBaselineWindow ?? 20;
-    const casWin = this.params.exit.global.cascadeWindowMinutes ?? 30;
+    // фолбэк тот же, что в buildSignalCore (horizon = cascadeWindowMinutes ?? staleMinutes):
+    // раньше здесь стояло «?? 30», и для моделей без cascadeWindowMinutes live-plan
+    // качал 35 свечей, а каскад считался по окну staleMinutes — молча на урезанной ленте.
+    const casWin = this.params.exit.global.cascadeWindowMinutes ?? this.params.exit.global.staleMinutes;
     return Math.max(baseWin, casWin) + 5;
   }
 
@@ -448,10 +454,20 @@ export class PumpMatrix {
     if (!candles || candles.length === 0) {
       return { entered: false, pnl: 0, peak: 0, reason: "no-candles", heldMinutes: 0, entryPrice: 0, exitPrice: 0, truncated: false };
     }
+    // replay ТОЛЬКО от сигнала вперёд: словарь/planForAt может нести историю ДО
+    // сигнала (она нужна volZ/каскаду), но вход в позицию не может случиться в
+    // прошлом — иначе реплей «входил» на свечах до сигнала и pnl считался по
+    // чужому пути. Срез с первой полностью сформированной свечи после сигнала.
+    const startTs = entryStartTs(sig.ts, "1m");
+    const fromIdx = candles.findIndex((c) => c.timestamp >= startTs);
+    if (fromIdx < 0) {
+      return { entered: false, pnl: 0, peak: 0, reason: "no-candles", heldMinutes: 0, entryPrice: 0, exitPrice: 0, truncated: false };
+    }
+    const fwd = fromIdx === 0 ? candles : candles.slice(fromIdx);
     // зона входа теперь в самом сигнале (протянута из parser-item); нет → open первой свечи.
-    const from = sig.entryFromPrice ?? candles[0].open;
-    const to = sig.entryToPrice ?? candles[0].open;
-    const r = replayExit(candles, sig.direction, from, to, {
+    const from = sig.entryFromPrice ?? fwd[0].open;
+    const to = sig.entryToPrice ?? fwd[0].open;
+    const r = replayExit(fwd, sig.direction, from, to, {
       trailingTake: sig.exit.trailingTake,
       hardStop: sig.exit.hardStop,
       stalenessSinceProfit: sig.exit.stalenessSinceProfit,
@@ -516,6 +532,12 @@ export class PumpMatrix {
         : squeezePressure(candles, entryIdx, dir, horizon);
       volRegime = volRegimeOf(volZ, volZThr);
     }
+
+    // ── ПОДТВЕРЖДЕНИЕ РЫНКОМ: пост без аномального объёма на ленте — не памп ──
+    // Реальному пампу предшествует набор позиции автором → всплеск объёма ДО поста.
+    // calm-лента = пост без рыночной реакции = шум. Нет свечей → подтвердить нечем →
+    // режем консервативно (signals() без свечей с этим флагом всегда пуст — см. policy).
+    if (policy.requireVolumeConfirm && volRegime !== "anomalous") return null;
 
     let resolved = volRegime
       ? resolveExit(this.params.exit, v.source, ch, v.symbol, dir, volRegime)

@@ -59,7 +59,11 @@ export function predict(
 
   // окно стационарности: статистики авторства считаем по последнему окну,
   // заканчивающемуся на самом свежем событии (а не по всей истории).
-  const anchorTs = events.length ? events[events.length - 1].ts : 0;
+  // anchor — из ОТСОРТИРОВАННОЙ таблицы: parser-items приходят в произвольном
+  // порядке, и «последний элемент входа» может быть старым событием — тогда окно
+  // заякорилось бы в прошлом и молча выбросило самые свежие сигналы.
+  const sorted = fullTbl.events;
+  const anchorTs = sorted.length ? sorted[sorted.length - 1].ts : 0;
   const tbl = Number.isFinite(cfg.stationarityWindowMs)
     ? buildWindowedTable(events, anchorTs, cfg.stationarityWindowMs)
     : fullTbl;

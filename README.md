@@ -157,10 +157,11 @@ Training labels on `1m` candles, so your `getCandles` must be able to serve them
 The training label comes from an **exact replay of your prod exit on 1m candles** (`replayExit`), not close-to-close. Ported from your code one-to-one:
 
 - **moonbag** (long) — hard stop below entry; **gravebag** (short) — above.
-- **trailing take** — pullback from peak PnL once `currentProfit ≥ 0`, fixed at the achieved peak.
-- **peak staleness** — peak reached the profit threshold, but went stale for `stalenessSinceMinutes` without a new high (price may never reach the target at all).
+- **trailing take** — pullback from peak PnL once `currentProfit ≥ 0`; **realizes the close of the trigger candle**, not the peak: prod learns about the pullback on candle close and exits at market, the peak is only known in hindsight. (An earlier version credited the peak itself, which silently inflated every trailing trade by ≥ `trailingTake%` — fixed; the peak is kept separately in `peak` for diagnostics.)
+- **peak staleness** — peak reached the profit threshold, but went stale for `stalenessSinceMinutes` without a new high. Also **realizes the current close** (which can be below the threshold or even negative), not the stale peak.
 - **life-cap** (`staleMinutes`) — ceiling on position lifetime = **empirical impact horizon**, tuned by the grid. Exits at the close of the last candle in the window (the realized pnl can be negative).
 - A stop-out realizes the **honest `-hardStop%`** — the actual result of the trade. The peak is kept separately for diagnostics, but the pnl is the loss. (An earlier version rolled the metric back to the last positive peak, which meant a stop-out never showed a loss and silently inflated pnl/RR — fixed.)
+- **Execution costs** — `TrainOptions.roundTripCostPct` (taker fees in+out plus slippage, % of notional; typically 0.1–0.3 on thin pump-coins) is stamped into every exit set: labels, CV selection and certification are all computed net of the real cost of trading, and the trained tensor carries it into prod replays. Default 0 (ideal fills) for backward compatibility — set it to your real costs, an edge that dies from fees is not an edge.
 
 Why this catches stop hunts: a wick into the trap never reaches `trailingTake`, and the pullback hits the hard stop → the label is negative **even if** `close[t+H]` happens to be positive. Path-aware replay sees the whole OHLC path, not just two points, so the optimizer actually sees the risk of stops.
 
@@ -593,6 +594,17 @@ model.signals(items, { minRiskReward: 5.0, rrMetric: "p99" }); // tail P99 >= 5.
 ```
 
 A symbol with no RR statistics is cut conservatively (nothing to confirm it with). `rrMetric`: `mean` (default), `p95`, `p99` — p99 filters by the right tail, keeping symbols with explosive upside. A runtime `minRiskReward` can only *tighten* the baked-in threshold (the max of the two is taken), never loosen it.
+
+### Market confirmation (`requireVolumeConfirm`)
+
+Channel-post correlation alone can't tell a real pump from a coordinated spam wave: the tape can. The physics of a pump is that the author accumulates *before* posting — a real call is preceded by an anomalous volume spike on pre-signal candles. `requireVolumeConfirm` gates every signal on that evidence, strictly look-ahead-free (only candles before the entry minute, via the trained per-cell `volZThreshold`):
+
+```ts
+fit(history, getCandles, { policy: { allow: [...], requireVolumeConfirm: true } }); // baked in
+model.plan(items, getCandles, { requireVolumeConfirm: true });                      // or per-call
+```
+
+A post whose tape stayed calm is dropped — it's a post without a market reaction, not a pump. The flag follows the same tighten-only invariant as `allow`: a runtime call can switch it on, never off. It needs candles to confirm against, so `signals()` (candle-less) returns nothing when the flag is set — use `plan(items, getCandles)`.
 
 ### PnL (outlier-robust)
 

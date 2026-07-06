@@ -133,6 +133,17 @@ export interface SignalPolicy {
   minRiskReward?: number;
   /** какую RR-метрику символа сравнивать с minRiskReward. По умолчанию "mean". */
   rrMetric?: "mean" | "p95" | "p99";
+  /**
+   * Требовать ПОДТВЕРЖДЕНИЕ РЫНКОМ: сигнал отдаётся только если лента до входа
+   * показала аномальный объём (volRegime="anomalous" по обученному volZThreshold).
+   * Физика пампа: автор набирает позицию ДО поста — реальному коллу предшествует
+   * всплеск объёма; пост без реакции ленты — шум, не памп.
+   *
+   * Требует свечей: signals() (без свечей) с этим флагом отдаёт ПУСТО — подтверждение
+   * без ленты невозможно, режем консервативно. Используй plan(items, getCandles).
+   * Тighten-only: запрос может включить, но не выключить вшитый в модель флаг.
+   */
+  requireVolumeConfirm?: boolean;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -165,5 +176,7 @@ export function intersectPolicy(
     allow,
     minRiskReward,
     rrMetric: requested?.rrMetric ?? trained.rrMetric ?? "mean",
+    // tighten-only: включён хотя бы одной стороной → включён; выключить вшитое нельзя
+    requireVolumeConfirm: (trained.requireVolumeConfirm || requested?.requireVolumeConfirm) || undefined,
   };
 }

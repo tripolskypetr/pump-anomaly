@@ -113,10 +113,13 @@ describe("lookbackMinutes — окно истории до сигнала", () =
     expect(reqLim).toBe(m.lookbackMinutes);
   });
 
-  it("дефолты (нет volBaselineWindow/cascadeWindowMinutes) → 30+5=35? нет: max(20,30)+5", () => {
+  it("нет cascadeWindowMinutes → фолбэк staleMinutes (тот же, что у горизонта каскада в plan)", () => {
     const ex: any = { hardStop: 2, stalenessSinceProfit: 1, stalenessSinceMinutes: 240, staleMinutes: 60, trailingTake: 1.0, squeezePolicy: "none" };
-    const p = withWin(20, 30); p.exit.global = ex; // без явных окон → дефолты в геттере (20, 30)
-    expect(PumpMatrix.load(p).lookbackMinutes).toBe(35);
+    const p = withWin(20, 30); p.exit.global = ex; // без явных окон
+    // buildSignalCore меряет каскад по окну cascadeWindowMinutes ?? staleMinutes —
+    // lookback обязан покрывать РЕАЛЬНО используемое окно, а не магические 30
+    // (раньше здесь было max(20,30)+5=35 и live-каскад считался на урезанной ленте)
+    expect(PumpMatrix.load(p).lookbackMinutes).toBe(65); // max(20, 60) + 5
   });
 });
 

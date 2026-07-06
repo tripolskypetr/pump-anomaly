@@ -1196,11 +1196,23 @@ export async function train(
     .filter((b) => b.independentClusters >= top.config.minClusters && passGate(b, top.gate))
     .sort((a, b) => a.ts - b.ts);
 
-  // выбор лучшего exit по подвыборке + опц. фильтру volRegime.
-  // Если regime задан — учитываем только результаты, чей volRegime под данным exit совпал.
-  const pickExit = (subset: Labeled[], regime?: import("./volume").VolRegime): ExitParams | null => {
-    if (subset.length === 0) return null;
-    let best: { ex: ExitParams; score: number } | null = null;
+  // ── ИЕРАРХИЧЕСКИЙ ПУЛИНГ ТЕНЗОРА (эмпирический Байес / James-Stein) ──
+  // Раньше каждая ячейка выбирала exit НЕЗАВИСИМО по своим 2-3 сделкам (шум!), а
+  // пустая проваливалась в родителя ступенькой. Теперь скор каждого exit в ячейке
+  // СМЕШИВАЕТСЯ с родительским, взвешенно по объёму данных:
+  //
+  //   pooled(ex) = (n·score_ячейки + k·score_родителя) / (n + k),  k = shrinkageK
+  //
+  // Ячейка с парой сделок наследует ранжирование родителя (её собственный шум
+  // почти не весит), ячейка с большой выборкой перевешивает родителя своим n.
+  // Цепочка: cell(regime) ← symbol-dir ← global. «Пустых» ячеек больше нет —
+  // есть плавно взвешенные; новых констант нет (k — существующая усадка).
+  type ExitScore = { score: number; n: number; ex: ExitParams };
+  type ExitScores = Map<string, ExitScore>;
+
+  const scoreExits = (subset: Labeled[], regime?: import("./volume").VolRegime): ExitScores => {
+    const out: ExitScores = new Map();
+    if (subset.length === 0) return out;
     for (const ex of exitSets) {
       const ekey = exitKey(ex);
       // ts сохраняем: purged-фолдам нужен вход сделки для эмбарго
@@ -1215,17 +1227,35 @@ export async function train(
         scores.push(shrinkageExpectancy(rows.slice(valLo, valHi).map((x) => x.r.pnl), shrinkageK));
       }
       const avg = scores.length ? scores.reduce((s, x) => s + x, 0) / scores.length : 0;
-      if (!best || avg > best.score) best = { ex, score: avg };
+      out.set(ekey, { score: avg, n: rows.length, ex });
     }
+    return out;
+  };
+  const poolScores = (child: ExitScores, parent: ExitScores): ExitScores => {
+    const out: ExitScores = new Map();
+    for (const [k, p] of parent) {
+      const c = child.get(k);
+      const n = c?.n ?? 0;
+      out.set(k, {
+        score: (n * (c?.score ?? 0) + shrinkageK * p.score) / (n + shrinkageK),
+        n,
+        ex: p.ex,
+      });
+    }
+    for (const [k, c] of child) if (!out.has(k)) out.set(k, c);
+    return out;
+  };
+  const argmaxExit = (scores: ExitScores): ExitParams | null => {
+    let best: ExitScore | null = null;
+    for (const s of scores.values()) if (!best || s.score > best.score) best = s;
     return best?.ex ?? null;
   };
 
   // ЧЕСТНО про уровень byMode: обучение видит данные только ОДНОГО режима (effMode),
   // отдельного «уровня режима» в данных не существует — byMode заполняется global-exit
-  // для обоих режимов. Раньше это маскировалось вторым идентичным вызовом pickExit
-  // (тяжёлый проход по всем exit-наборам ради того же результата), отчего уровень
-  // выглядел самостоятельно обученным. resolveExit(source="mode") = global по данным.
-  const globalExit = pickExit(winSelected) ?? top.exit;
+  // для обоих режимов. resolveExit(source="mode") = global по данным.
+  const globalScores = scoreExits(winSelected);
+  const globalExit = argmaxExit(globalScores) ?? top.exit;
 
   // bySymbolDir: схлопнут volRegime
   const bySymbolDir: Record<string, Partial<Record<"long" | "short", ExitParams>>> = {};
@@ -1249,18 +1279,28 @@ export async function train(
     (groupSD.get(sk) ?? groupSD.set(sk, []).get(sk)!).push(b);
   }
 
-  // symbol-dir уровень (fallback при пустом volRegime)
+  // symbol-dir уровень: скоры ячейки ПУЛЯТСЯ с глобальными (малое n → следует
+  // глобальному ранжированию, большое n → перевешивает). Пулёные скоры сохраняем —
+  // они родитель для cell-уровня (цепочка cell ← symbol-dir ← global).
+  const sdPooled = new Map<string, ExitScores>();
   for (const [sk, subset] of groupSD) {
     const [symbol, direction] = sk.split("\u0001") as [string, "long" | "short"];
-    const ex = pickExit(subset);
+    const own = scoreExits(subset);
+    if (own.size === 0) continue; // ни одной строки — уровень не создаём (resolve уйдёт выше)
+    const pooled = poolScores(own, globalScores);
+    sdPooled.set(sk, pooled);
+    const ex = argmaxExit(pooled);
     if (ex) ((bySymbolDir[symbol] ??= {}) as any)[direction] = ex;
   }
 
-  // cell уровень: отдельный exit на каждый volRegime (calm/anomalous)
+  // cell уровень: отдельный exit на каждый volRegime, родитель — пулёный symbol-dir
   for (const [gk, subset] of group) {
     const [channel, symbol, direction] = gk.split("\u0001") as [string, string, "long" | "short"];
+    const parent = sdPooled.get(`${symbol}\u0001${direction}`) ?? globalScores;
     for (const regime of ["calm", "anomalous"] as const) {
-      const ex = pickExit(subset, regime);
+      const own = scoreExits(subset, regime);
+      if (own.size === 0) continue; // режим не встречался — ячейку не создаём
+      const ex = argmaxExit(poolScores(own, parent));
       if (!ex) continue;
       (((cells[channel] ??= {})[symbol] ??= {})[direction] ??= {})[regime] = ex;
     }

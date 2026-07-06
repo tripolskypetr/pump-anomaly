@@ -14,6 +14,7 @@ import { jaccardScreen } from "./layers/jaccard-screen";
 import { lagXCorr } from "./layers/lag-xcorr";
 import { clusterAuthors } from "./layers/cluster-authors";
 import { authorInfluence } from "./layers/author-influence";
+import { fitHawkesGraph } from "./layers/hawkes-graph";
 import { earlyWarning } from "./layers/early-warning";
 import { singleChannelSignals } from "./layers/single-channel";
 import { assessViability, DEFAULT_VIABILITY } from "./viability";
@@ -105,8 +106,11 @@ export function predict(
       reason: "mode=single задан явно — матрица авторства не оценивалась",
     };
   } else {
-    const screened = jaccardScreen(tbl, window, cfg.jaccardThreshold);
-    const directed = lagXCorr(tbl, screened, cfg.lagPeakThreshold, window);
+    // граф авторства: конвейер xcorr (дефолт) либо multivariate Hawkes (слой 9) —
+    // одна генеративная модель вместо трёх порогов сита
+    const directed = (cfg.authorGraph ?? "xcorr") === "hawkes"
+      ? fitHawkesGraph(tbl, tau).edges
+      : lagXCorr(tbl, jaccardScreen(tbl, window, cfg.jaccardThreshold), cfg.lagPeakThreshold, window);
     authors = clusterAuthors(tbl.channels, directed);
     // слой 7: направление рёбер несёт информацию (лидер vs эхо) — вес всплеска
     influence = authorInfluence(tbl.channels, directed);
@@ -173,6 +177,8 @@ export { earlyWarning } from "./layers/early-warning";
 export { hawkesBurst, hawkesWeight } from "./layers/hawkes-burst";
 export type { HawkesBurst } from "./layers/hawkes-burst";
 export { authorInfluence, leadershipWeight } from "./layers/author-influence";
+export { fitHawkesGraph } from "./layers/hawkes-graph";
+export type { HawkesGraph } from "./layers/hawkes-graph";
 export { algoSignatureOf } from "./layers/algo-signature";
 export type { AlgoSignature } from "./layers/algo-signature";
 export { singleChannelSignals } from "./layers/single-channel";

@@ -142,6 +142,14 @@ export interface DetectorConfig {
    * Infinity (по умолчанию) = вся история.
    */
   stationarityWindowMs: number;
+  /**
+   * Оценщик графа авторства (matrix-режим):
+   *  - "xcorr"  (дефолт) — конвейер jaccard-сито → лаговая кросс-корреляция;
+   *  - "hawkes" — multivariate Hawkes: EM-оценка α-матрицы кросс-возбуждения,
+   *    рёбра по значимости массы потомков против пуассоновского порога. Убирает
+   *    три порога конвейера (jaccard/lagPeak/peakShare), их роль — правдоподобие.
+   */
+  authorGraph?: "xcorr" | "hawkes";
 }
 
 export const DEFAULT_CONFIG: DetectorConfig = {

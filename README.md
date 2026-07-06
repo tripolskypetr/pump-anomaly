@@ -376,6 +376,14 @@ The guarantee is verified: 720 `fit` runs on pure noise produce false naive cert
 
 ## Exit tensor `[mode][channel][symbol][direction][volRegime]`
 
+**Hierarchical pooling (empirical Bayes).** Cells no longer pick exits independently on their 2-3 noisy trades, and the fallback is no longer a cliff. Each exit's CV score in a cell is **blended with its parent's** along the chain cell(regime) ← symbol-dir ← global:
+
+```
+pooled(ex) = (n·score_cell + k·score_parent) / (n + k),   k = shrinkageK
+```
+
+A cell with a couple of trades inherits the parent's ranking (its own noise barely weighs), a cell with a large sample outweighs the parent with its `n`. No new constants — `k` is the existing shrinkage strength.
+
 The model does NOT duplicate the stoploss/targets from the post, and does NOT mix exit math across sources. trailing/hardStop/impact-horizon are trained **separately per cell** of the tensor — every channel moves every symbol differently, a long-trap and a short-trap have different dynamics, and anomalous volume requires a tighter trailing.
 
 Per-signal resolution with hierarchical fallback:
@@ -758,6 +766,7 @@ fit(history, getCandles, { onProgress: (e) => log(`${e.done}/${e.total}`) }); //
 6. **hawkesBurst** — self-excitation of the event stream (Hawkes intensity, exponential kernel with τ from layer 1). A pump is a self-exciting cascade: raw event counts can't tell "5 posts/hour on a ticker that always gets 5 posts/hour" from the same burst on a ticker that posts once a week. `burstScore` = excitation over the Poisson chance bound (`λ₀τ + 2√(λ₀τ)`, same convention as viability); bursts below the bound get their confidence discounted.
 7. **authorInfluence** — leadership from the *direction* of layer-3 edges (previously collapsed by union-find). A burst carried by graph **leaders** and a burst of pure **echo channels** whose leaders stay silent are different events: echo without a leader smells of copy-paste, not independent confirmation. Neutral composition → no change; echo-heavy → discount (conservative: leaders get no bonus). Exposed as `predict().influence` and `verdict.leaderShare`.
 8. **algoSignature** — per-channel bot fingerprint (formalizes the [algorithmic stop-hunt research](https://habr.com/ru/articles/1028592/)): interval-lattice regularity (log-histogram entropy) and cron-like hour-of-day concentration. Serialized as `channelScore[ch].algoScore`; high `algoScore` + negative `score` = inversion candidate, the call is the operator's.
+9. **hawkesGraph** (`config.authorGraph: "hawkes"`, experimental) — a **multivariate Hawkes process** replacing the jaccard→lag-xcorr pipeline with one generative model: `λ_j(t) = μ_j + Σ α_ij·β·e^(−β(t−t_ik))`, α estimated by EM (self-excitation on the diagonal absorbs within-channel streaks so it doesn't pollute cross-α). Edges require the offspring mass to beat the Poisson chance bound (λ+2√λ, same convention as viability) — the three sieve thresholds (`jaccardThreshold`/`lagPeakThreshold`/`peakShare`) dissolve into likelihood. Default stays `"xcorr"`; behavior without the flag is unchanged.
 
 `confidence = dedup × fill × hawkes × leadership`. Layers 1–7 are computed over the stationarity window. In single mode the matrix isn't needed — every post becomes an entry directly (`singleChannelSignals`); layer 8 is computed at `fit` from the raw post stream.
 

@@ -131,6 +131,14 @@ interface DetectorConfig {
      * Infinity (по умолчанию) = вся история.
      */
     stationarityWindowMs: number;
+    /**
+     * Оценщик графа авторства (matrix-режим):
+     *  - "xcorr"  (дефолт) — конвейер jaccard-сито → лаговая кросс-корреляция;
+     *  - "hawkes" — multivariate Hawkes: EM-оценка α-матрицы кросс-возбуждения,
+     *    рёбра по значимости массы потомков против пуассоновского порога. Убирает
+     *    три порога конвейера (jaccard/lagPeak/peakShare), их роль — правдоподобие.
+     */
+    authorGraph?: "xcorr" | "hawkes";
 }
 declare const DEFAULT_CONFIG: DetectorConfig;
 
@@ -539,6 +547,42 @@ declare function leadershipWeight(sliceChannels: Iterable<string>, influence: Ma
     weight: number;
     leaderShare: number;
 };
+
+/**
+ * Слой 9 — MULTIVARIATE HAWKES: одна генеративная модель вместо конвейера
+ * jaccard-сито → медианный лаг → union-find.
+ *
+ * Интенсивность канала j:
+ *
+ *   λ_j(t) = μ_j + Σ_i Σ_{t_ik < t} α_ij · β · exp(−β(t − t_ik)),   β = 1/τ
+ *
+ * α_ij — среднее число «эхо»-событий канала j, порождаемых ОДНИМ событием
+ * канала i. EM-оценка: E-шаг раскладывает каждое событие на «фон» и «потомка
+ * конкретного предка» по ответственностям, M-шаг обновляет α = масса потомков /
+ * число событий предка и μ = фоновая масса / экспозиция. Диагональ α_ii
+ * (самовозбуждение серий постов) оценивается, но в рёбра не идёт — она
+ * впитывает внутриканальные очереди, чтобы те не раздували кросс-α.
+ *
+ * Значимость ребра — та же пуассоновская конвенция, что в viability: масса
+ * потомков m_ij должна превысить ожидание случайных коинциденций λ + 2√λ.
+ * Так исчезают ТРИ независимых порога конвейера (jaccardThreshold,
+ * lagPeakThreshold, peakShare) — их роль берёт на себя правдоподобие.
+ *
+ * Включается config.authorGraph = "hawkes" (по умолчанию "xcorr" — прежний
+ * конвейер, поведение без флага не меняется).
+ */
+interface HawkesGraph {
+    channels: string[];
+    /** α[i][j]: события канала i порождают в среднем α_ij событий канала j */
+    alpha: number[][];
+    /** фоновые интенсивности μ_j, событий/мс */
+    mu: number[];
+    /** β = 1/τ экспоненциального ядра */
+    beta: number;
+    /** значимые направленные рёбра (совместимы со слоями 4/7) */
+    edges: DirectedEdge[];
+}
+declare function fitHawkesGraph(tbl: EventTable, tau: number): HawkesGraph;
 
 /**
  * Слой 8 — АЛГОРИТМИЧЕСКАЯ СИГНАТУРА канала (формализация habr 1028592).
@@ -2145,5 +2189,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
-export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
+export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

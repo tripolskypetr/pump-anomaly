@@ -4,7 +4,9 @@ import {
   ParserItem,
   PredictionResult,
 } from "./types";
-import { GetCandles } from "./candle";
+import { GetCandles, entryStartTs } from "./candle";
+import { fetchCandlesChunked } from "./chunked-candles";
+import { momentumPct } from "./volume";
 import { enumerateBursts, enumeratePosts } from "./enumerate";
 import { buildTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
@@ -69,6 +71,15 @@ export interface TrainGrid {
    * train перебирает варианты и выбирает по CV.
    */
   stationarityWindowMs: number[];
+  /**
+   * ОБУЧАЕМЫЙ momentum-гейт (эдж из habr 1041898): пороги направленного momentum
+   * ДО поста, среди которых CV выбирает. null = без гейта. Кандидат проходит,
+   * если momentum в сторону сигнала ≥ порога (long не ловит нож, short не шортит
+   * ракету). Пост-фильтр кандидатов — перебор почти бесплатный (без новых replay).
+   * Выбранный порог вшивается в policy.minMomentum24hPct (runtime применит сам).
+   * Дефолт [null] — гейт не перебирается (оси добавляет автокалибровка или юзер).
+   */
+  momentumGatePct: Array<number | null>;
 }
 
 export const DEFAULT_GRID: TrainGrid = {
@@ -88,6 +99,9 @@ export const DEFAULT_GRID: TrainGrid = {
   cascadeWindowMinutes: [15, 30, 60], // окно детекции каскада: 15м / 30м / 1ч (быстрое событие)
   // вся история + конечные окна (4 / 8 недель); train выберет по CV
   stationarityWindowMs: [7 * 24 * 3600_000, 14 * 24 * 3600_000, 28 * 24 * 3600_000, 56 * 24 * 3600_000],
+  // [null] = не перебирать гейт при явном гриде (обратная совместимость);
+  // casual-путь получает меню порогов от автокалибровки (масштаб σ за окно momentum)
+  momentumGatePct: [null],
 };
 
 export interface TrainOptions {
@@ -137,6 +151,12 @@ export interface TrainOptions {
    * Итог замеров сериализуется в meta.calibration (полный аудит).
    */
   autoCalibrate?: boolean;
+  /**
+   * Окно momentum-гейта, минуты (по умолчанию 1440 = 24ч, как в исследовании).
+   * Используется и для фичи в разметке, и вшивается в policy.momentumWindowMinutes
+   * при выбранном гейте.
+   */
+  momentumWindowMinutes?: number;
   /**
    * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
    * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -272,6 +292,8 @@ export interface TrainResult {
   reliability: Reliability;
   leaderboard: Array<{
     config: DetectorConfig; exit: ExitParams;
+    /** порог обучаемого momentum-гейта записи (null = без гейта) */
+    momentumGatePct: number | null;
     cvScore: number; cvWinrate: number; cvSupport: number;
   }>;
   /**
@@ -339,6 +361,7 @@ export async function train(
     if (opts.grid?.stalenessSinceProfit == null && a.stalenessSinceProfit) grid.stalenessSinceProfit = a.stalenessSinceProfit;
     if (opts.grid?.staleMinutes == null && a.staleMinutes) grid.staleMinutes = a.staleMinutes;
     if (opts.grid?.stalenessSinceMinutes == null && a.stalenessSinceMinutes) grid.stalenessSinceMinutes = a.stalenessSinceMinutes;
+    if (opts.grid?.momentumGatePct == null && a.momentumGatePct) grid.momentumGatePct = a.momentumGatePct;
   }
 
   const folds = opts.folds ?? 4;
@@ -416,9 +439,44 @@ export async function train(
     independentClusters: number;
     id?: string; ids?: string[];
     byExit: Map<string, ExitRec>;
+    /** направленно-нейтральный momentum ДО сигнала, % (null = не измерился/не нужен) */
+    momentum24hPct: number | null;
   };
   const labeledCache = new Map<string, Labeled[]>();
   const seenCluster = new Set<string>();
+
+  // ── пре-сигнальная фича для ОБУЧАЕМОГО momentum-гейта ──
+  // Считается только если ось гейта реально перебирается (иначе ни одного фетча).
+  // Кэш по (symbol|ts): один кандидат встречается во многих проходах грида.
+  const momentumWindow = opts.momentumWindowMinutes ?? 1440;
+  const momentumAxis: Array<number | null> =
+    grid.momentumGatePct.length ? grid.momentumGatePct : [null];
+  const needMomentum = momentumAxis.some((g) => g !== null);
+  const preMomCache = new Map<string, number | null>();
+  const preMomentumOf = async (symbol: string, ts: number): Promise<number | null> => {
+    if (!needMomentum) return null;
+    const key = `${symbol}|${ts}`;
+    if (preMomCache.has(key)) return preMomCache.get(key)!;
+    let m: number | null = null;
+    try {
+      const start = entryStartTs(ts, "1m");
+      const pre = await fetchCandlesChunked(
+        getCandles, symbol, "1m", momentumWindow, start - momentumWindow * 60_000,
+      );
+      // только свечи СТРОГО до сигнала (обрезаем возможный хвост от щедрого адаптера)
+      const cut = pre.filter((c) => c.timestamp < start);
+      m = momentumPct(cut, cut.length, momentumWindow);
+    } catch { m = null; }
+    preMomCache.set(key, m);
+    return m;
+  };
+  /** проходит ли кандидат гейт: null-гейт пропускает всех; null-фича — fail-closed */
+  const passGate = (b: Labeled, gate: number | null): boolean => {
+    if (gate === null) return true;
+    if (b.momentum24hPct === null) return false;
+    const directional = b.direction === "long" ? b.momentum24hPct : -b.momentum24hPct;
+    return directional >= gate;
+  };
   // диагностика разметки: исход каждого УНИКАЛЬНОГО всплеска. dedup по (symbol|dir|ts):
   // один всплеск перечисляется в нескольких проходах грида — считаем исход раз, иначе
   // счётчики раздуты числом конфигов. Пустой fit перестаёт быть немым: тэлли скажет,
@@ -465,6 +523,7 @@ export async function train(
         independentClusters: b.independentClusters,
         id: b.id, ids: b.ids,
         byExit,
+        momentum24hPct: await preMomentumOf(b.symbol, b.ts),
       });
     }
     return labeled;
@@ -575,6 +634,8 @@ export async function train(
 
   type Entry = {
     config: DetectorConfig; exit: ExitParams;
+    /** порог обучаемого momentum-гейта этой записи (null = гейт выключен) */
+    gate: number | null;
     cvScore: number; cvWinrate: number; cvSupport: number;
     /** fold-скоры нужны 1-SE и PBO; тяжёлые массивы ретёрнов в записях НЕ храним */
     _foldScores: number[];
@@ -582,15 +643,15 @@ export async function train(
   };
   const board: Entry[] = [];
 
-  // полные fold-данные одного (config, exit) — НА ЗАПРОС (победитель, пул SPA,
+  // полные fold-данные одного (config, exit, gate) — НА ЗАПРОС (победитель, пул SPA,
   // reliability), вместо материализации массивов ретёрнов во всех записях board.
   type EvalDetail = {
     foldScores: number[]; foldMeans: number[]; foldSizes: number[];
     returns: number[]; wins: number[];
   };
-  const evalSelection = (labeled: Labeled[], ekey: string, minC: number): EvalDetail => {
+  const evalSelection = (labeled: Labeled[], ekey: string, minC: number, gate: number | null): EvalDetail => {
     const selected = labeled
-      .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
+      .filter((b) => b.independentClusters >= minC && passGate(b, gate) && b.byExit.has(ekey))
       .sort((a, b) => a.ts - b.ts);
     const d: EvalDetail = { foldScores: [], foldMeans: [], foldSizes: [], returns: [], wins: [] };
     if (selected.length === 0) return d;
@@ -604,11 +665,11 @@ export async function train(
     }
     return d;
   };
-  const detailFor = (cfg: DetectorConfig, ex: ExitParams, keep: (ts: number) => boolean): EvalDetail =>
+  const detailFor = (cfg: DetectorConfig, ex: ExitParams, gate: number | null, keep: (ts: number) => boolean): EvalDetail =>
     evalSelection(
       labeledFor({ wK: cfg.windowK, jac: cfg.jaccardThreshold, lag: cfg.lagPeakThreshold, sw: cfg.stationarityWindowMs })
         .filter((b) => keep(b.ts)),
-      exitKey(ex), cfg.minClusters,
+      exitKey(ex), cfg.minClusters, gate,
     );
 
   // total для фазы score = число детекторных комбо (тик на каждое)
@@ -616,6 +677,7 @@ export async function train(
 
   // буримая функция скоринга: строит board по всем УНИКАЛЬНЫМ конфигам, учитывая
   // только те размеченные всплески, что проходят keep(ts). keep=()=>true → весь board.
+  // Ось momentum-гейта — пост-фильтр кандидатов: новых replay не порождает.
   const buildBoard = (
     keep: (ts: number) => boolean,
     onTick?: (label: string) => void,
@@ -624,24 +686,25 @@ export async function train(
     for (const d of detCombos) {
       const labeled = labeledFor(d).filter((b) => keep(b.ts));
       for (const minC of minClusterAxis)
-        for (const ex of scoringExits) {
-          const cfg = cfgFor(d, minC);
-          const ev = evalSelection(labeled, exitKey(ex), minC);
-          if (ev.foldScores.length === 0) {
-            out.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0, _foldScores: [], _sharpe: 0, _n: 0 });
-            continue;
+        for (const gate of momentumAxis)
+          for (const ex of scoringExits) {
+            const cfg = cfgFor(d, minC);
+            const ev = evalSelection(labeled, exitKey(ex), minC, gate);
+            if (ev.foldScores.length === 0) {
+              out.push({ config: cfg, exit: ex, gate, cvScore: 0, cvWinrate: 0, cvSupport: 0, _foldScores: [], _sharpe: 0, _n: 0 });
+              continue;
+            }
+            const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
+            out.push({
+              config: cfg, exit: ex, gate,
+              cvScore: +avg(ev.foldScores).toFixed(6),
+              cvWinrate: +avg(ev.wins).toFixed(6),
+              cvSupport: +avg(ev.foldSizes).toFixed(2),
+              _foldScores: ev.foldScores,
+              _sharpe: sharpe(ev.returns),
+              _n: ev.returns.length,
+            });
           }
-          const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
-          out.push({
-            config: cfg, exit: ex,
-            cvScore: +avg(ev.foldScores).toFixed(6),
-            cvWinrate: +avg(ev.wins).toFixed(6),
-            cvSupport: +avg(ev.foldSizes).toFixed(2),
-            _foldScores: ev.foldScores,
-            _sharpe: sharpe(ev.returns),
-            _n: ev.returns.length,
-          });
-        }
       onTick?.(`${d.wK}|${d.jac}|${d.lag}|${d.sw === Infinity ? "all" : d.sw}`);
     }
     return out;
@@ -710,6 +773,7 @@ export async function train(
           const testBoard = buildBoard(inTest);
           const match = testBoard.find((e) =>
             exitKey(e.exit) === exitKey(trainTop.exit) &&
+            e.gate === trainTop.gate &&
             e.config.windowK === trainTop.config.windowK &&
             e.config.minClusters === trainTop.config.minClusters &&
             e.config.jaccardThreshold === trainTop.config.jaccardThreshold &&
@@ -726,7 +790,7 @@ export async function train(
   }
 
   // полные fold-данные победителя — один пересчёт по кэшу меток
-  const topDetail = detailFor(top.config, top.exit, () => true);
+  const topDetail = detailFor(top.config, top.exit, top.gate, () => true);
 
   const reliability = computeReliability(
     { foldMeans: topDetail.foldMeans, foldSizes: topDetail.foldSizes, allReturns: topDetail.returns },
@@ -744,7 +808,7 @@ export async function train(
   const candPool = board
     .filter((e) => e._n > 0)
     .slice(0, 50)
-    .map((e) => detailFor(e.config, e.exit, () => true).returns);
+    .map((e) => detailFor(e.config, e.exit, e.gate, () => true).returns);
   // perf-матрица для PBO: топ-конфиги × их fold-scores (нужно чётное число фолдов)
   const perfRows = board
     .filter((e) => e._foldScores.length >= 2)
@@ -780,8 +844,10 @@ export async function train(
   const winLabeled = effMode === "single"
     ? labeledCache.get(`single|${top.config.windowK}`)!
     : labeledCache.get(`${top.config.windowK}|${top.config.jaccardThreshold}|${top.config.lagPeakThreshold}|${top.config.stationarityWindowMs}`)!;
+  // winner-гейт применяется и здесь: тензор/история/RR должны отражать РОВНО тот
+  // набор кандидатов, который прод будет торговать (policy отфильтрует те же посты)
   const winSelected = winLabeled
-    .filter((b) => b.independentClusters >= top.config.minClusters)
+    .filter((b) => b.independentClusters >= top.config.minClusters && passGate(b, top.gate))
     .sort((a, b) => a.ts - b.ts);
 
   // выбор лучшего exit по подвыборке + опц. фильтру volRegime.
@@ -920,11 +986,23 @@ export async function train(
   }
   const pnlGlobal = pnlStats(pnlsGlobal);
 
+  // ── ОБУЧЕННЫЙ momentum-гейт → policy ──
+  // Выбранный CV порог вшивается в сериализуемую политику: runtime (signals/plan/
+  // backtest) применит его сам, без ручной передачи. Пользовательский порог из
+  // opts.policy не ослабляется (max = tighten-only, как в intersectPolicy).
+  const basePolicy = { ...(opts.policy ?? DEFAULT_POLICY) };
+  if (top.gate !== null) {
+    basePolicy.minMomentum24hPct = basePolicy.minMomentum24hPct !== undefined
+      ? Math.max(basePolicy.minMomentum24hPct, top.gate)
+      : top.gate;
+    basePolicy.momentumWindowMinutes = basePolicy.momentumWindowMinutes ?? momentumWindow;
+  }
+
   const params: TrainedParams = {
     version: 3,
     config: top.config,
     exit: tensor,
-    policy: opts.policy ?? DEFAULT_POLICY,
+    policy: basePolicy,
     riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
     pnl: { bySymbol: pnlBySymbol, global: pnlGlobal },
     history,
@@ -952,8 +1030,8 @@ export async function train(
   };
 
   const leaderboard = board.slice(0, 20).map(
-    ({ config, exit, cvScore, cvWinrate, cvSupport }) =>
-      ({ config, exit, cvScore, cvWinrate, cvSupport }),
+    ({ config, exit, gate, cvScore, cvWinrate, cvSupport }) =>
+      ({ config, exit, momentumGatePct: gate, cvScore, cvWinrate, cvSupport }),
   );
 
   // реестр С ЭТОЙ попыткой: цепочка учёта переобучений стартует даже без входного

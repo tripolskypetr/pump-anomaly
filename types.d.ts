@@ -1065,6 +1065,8 @@ interface CalibrationAxes {
     stalenessSinceProfit?: number[];
     staleMinutes?: number[];
     stalenessSinceMinutes?: number[];
+    /** меню порогов обучаемого momentum-гейта (null = без гейта — всегда в меню) */
+    momentumGatePct?: Array<number | null>;
 }
 interface Calibration {
     /** медианный |1m-ретёрн| в %, масштаб шума данных; null = свечи не удалось получить */
@@ -1158,6 +1160,15 @@ interface TrainGrid {
      * train перебирает варианты и выбирает по CV.
      */
     stationarityWindowMs: number[];
+    /**
+     * ОБУЧАЕМЫЙ momentum-гейт (эдж из habr 1041898): пороги направленного momentum
+     * ДО поста, среди которых CV выбирает. null = без гейта. Кандидат проходит,
+     * если momentum в сторону сигнала ≥ порога (long не ловит нож, short не шортит
+     * ракету). Пост-фильтр кандидатов — перебор почти бесплатный (без новых replay).
+     * Выбранный порог вшивается в policy.minMomentum24hPct (runtime применит сам).
+     * Дефолт [null] — гейт не перебирается (оси добавляет автокалибровка или юзер).
+     */
+    momentumGatePct: Array<number | null>;
 }
 declare const DEFAULT_GRID: TrainGrid;
 interface TrainOptions {
@@ -1207,6 +1218,12 @@ interface TrainOptions {
      * Итог замеров сериализуется в meta.calibration (полный аудит).
      */
     autoCalibrate?: boolean;
+    /**
+     * Окно momentum-гейта, минуты (по умолчанию 1440 = 24ч, как в исследовании).
+     * Используется и для фичи в разметке, и вшивается в policy.momentumWindowMinutes
+     * при выбранном гейте.
+     */
+    momentumWindowMinutes?: number;
     /**
      * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
      * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -1337,6 +1354,8 @@ interface TrainResult {
     leaderboard: Array<{
         config: DetectorConfig;
         exit: ExitParams;
+        /** порог обучаемого momentum-гейта записи (null = без гейта) */
+        momentumGatePct: number | null;
         cvScore: number;
         cvWinrate: number;
         cvSupport: number;
@@ -1570,6 +1589,65 @@ declare class PumpMatrix {
 }
 
 /**
+ * WALK-FORWARD — единственный честный ответ на «будет ли это зарабатывать».
+ *
+ * Nested CV оценивает конфиг на перестановках ОДНОЙ выборки; walk-forward
+ * воспроизводит реальную жизнь: обучились на прошлом → торговали следующий блок →
+ * сдвинулись → переобучились. Ни один тест-сигнал не виден обучению (модель среза
+ * строится строго из items с ts ≤ границы), а результат — хронологическая цепочка
+ * out-of-sample сделок: кривая капитала, просадка, и отдельный срез «торговали бы
+ * только когда сертификат зелёный» — режим, в котором систему и предполагается
+ * эксплуатировать.
+ */
+interface WalkForwardSlice {
+    /** граница обучения: модель видела только items с ts ≤ trainUntil */
+    trainUntil: number;
+    /** тестовый блок (trainUntil, testTo] */
+    testTo: number;
+    /** сколько items в обучении / в тесте */
+    nTrain: number;
+    nTest: number;
+    /** сертифицировала ли себя модель этого среза (на своём train-прошлом) */
+    certifiedOnTrain: boolean;
+    /** confidence/reliable модели среза */
+    confidenceOnTrain: number;
+    /** OOS-сделки блока: реализованные pnl (доли), хронологически */
+    pnls: number[];
+    /** сигналов выдано / вошло */
+    signals: number;
+    entered: number;
+}
+interface WalkForwardResult {
+    slices: WalkForwardSlice[];
+    /** все OOS-pnl хронологически (вошедшие сделки всех блоков) */
+    oosPnls: number[];
+    /** кумулятивная кривая капитала (аддитивно по долям pnl) */
+    equity: number[];
+    stats: PnlStats;
+    sharpe: number;
+    /** максимальная просадка кривой капитала, в долях суммарного pnl-пути */
+    maxDrawdown: number;
+    /** то же, но сделки берутся ТОЛЬКО из блоков с certifiedOnTrain=true */
+    certifiedOnly: {
+        oosPnls: number[];
+        stats: PnlStats;
+        sharpe: number;
+        maxDrawdown: number;
+        /** сколько блоков были «зелёными» */
+        slicesUsed: number;
+    };
+}
+interface WalkForwardOptions {
+    /** число тестовых блоков (история делится на slices+1 частей; первая — только обучение) */
+    slices?: number;
+    /** опции обучения каждого среза (grid/mode/costs/…); cadence-guard обходится автоматически */
+    trainOptions?: TrainOptions;
+    /** политика бэктеста тестовых блоков (сужает обученную, как в проде) */
+    policy?: Partial<SignalPolicy>;
+}
+declare function walkForward(items: ParserItem[], getCandles: GetCandles, opts?: WalkForwardOptions): Promise<WalkForwardResult>;
+
+/**
  * Чёрная коробка. Единственная точка входа.
  *
  *   predict(parserItems) -> PredictionResult
@@ -1585,5 +1663,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate };
+export type { AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

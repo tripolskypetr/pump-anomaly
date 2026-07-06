@@ -202,3 +202,5 @@ export * from "./statistics";
 export * from "./meta-ledger";
 export { calibrateGrid } from "./calibrate";
 export type { Calibration, CalibrationAxes } from "./calibrate";
+export { walkForward } from "./walk-forward";
+export type { WalkForwardResult, WalkForwardSlice, WalkForwardOptions } from "./walk-forward";

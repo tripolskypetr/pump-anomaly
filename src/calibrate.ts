@@ -30,6 +30,8 @@ export interface CalibrationAxes {
   stalenessSinceProfit?: number[];
   staleMinutes?: number[];
   stalenessSinceMinutes?: number[];
+  /** меню порогов обучаемого momentum-гейта (null = без гейта — всегда в меню) */
+  momentumGatePct?: Array<number | null>;
 }
 
 export interface Calibration {
@@ -57,6 +59,14 @@ const STALE_PROFIT_NOISE_MULT = [10, 20];
 const HARDSTOP_CLAMP: [number, number] = [0.5, 12];
 const TRAIL_CLAMP: [number, number] = [0.3, 6];
 const STALE_PROFIT_CLAMP: [number, number] = [0.3, 4];
+/**
+ * Меню порогов momentum-гейта в единицах σ ЗА ОКНО ГЕЙТА: σ_окна ≈ шум·√N_минут
+ * (случайное блуждание). Пороги ±0.5σ и 0 воспроизводят «−1%/24ч» исследования
+ * на активе с шумом ~0.056% (0.5·0.056·√1440 ≈ 1.07%). null = «без гейта» —
+ * всегда в меню: CV сам решает, помогает ли фильтр на этих данных.
+ */
+const MOMENTUM_GATE_SIGMA_MULT = [-0.5, 0, 0.5];
+const MOMENTUM_WINDOW_FOR_MENU = 1440;
 /** горизонт годен, если покрытие p25 закрывает его с запасом (вход бывает не первой свечой) */
 const COVERAGE_SAFETY = 0.9;
 
@@ -144,7 +154,13 @@ export async function calibrateGrid(
     axes.hardStop = scale(HARDSTOP_NOISE_MULT, HARDSTOP_CLAMP);
     axes.trailingTake = scale(TRAIL_NOISE_MULT, TRAIL_CLAMP);
     axes.stalenessSinceProfit = scale(STALE_PROFIT_NOISE_MULT, STALE_PROFIT_CLAMP);
-    notes.push(`шум 1m = ${noisePct.toFixed(4)}% → hardStop [${axes.hardStop}], trailing [${axes.trailingTake}]`);
+    // меню обучаемого momentum-гейта: пороги в масштабе σ за окно гейта + «без гейта»
+    const sigmaWindow = noisePct * Math.sqrt(MOMENTUM_WINDOW_FOR_MENU);
+    axes.momentumGatePct = [
+      null,
+      ...MOMENTUM_GATE_SIGMA_MULT.map((k) => +(k * sigmaWindow).toFixed(2)),
+    ];
+    notes.push(`шум 1m = ${noisePct.toFixed(4)}% → hardStop [${axes.hardStop}], trailing [${axes.trailingTake}], momentum-гейт [${axes.momentumGatePct}]`);
   } else {
     notes.push("шум не измерился (нет свечей до событий) — %-оси остаются дефолтными");
   }

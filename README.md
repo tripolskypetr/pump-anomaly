@@ -634,6 +634,19 @@ model.backtest(items, getCandles, { minMomentum24hPct: -1 }); // тянет пр
 
 Same rules as the other gates: tighten-only (`max(trained, requested)`), candles required (no tape → cut conservatively), and a threshold that survived a 20-trade backtest is a hypothesis, not a law — verify on your full history.
 
+**The gate is trainable.** `TrainGrid.momentumGatePct` (e.g. `[null, -1, 0]`; `null` = no gate) makes the threshold a CV axis: labeling measures pre-signal momentum once per candidate (a cheap post-filter — no extra replays), CV + 1-SE + the certificate decide whether filtering helps *on your data*, and the chosen threshold is baked into `params.policy.minMomentum24hPct` — the runtime enforces it automatically after `load()`. The exit tensor, history and RR stats are built from the gated candidate set, so they describe exactly the flow prod will trade. In casual mode the calibration derives the threshold menu from the measured noise (±0.5σ of the gate window) instead of hardcoding "−1". Note: with a trained gate, candle-less `signals()` returns nothing (nothing to confirm against) — use `plan(items, getCandles)`.
+
+### Walk-forward — the honest money question
+
+`walkForward(items, getCandles, { slices, trainOptions, policy })` replays real life: fit on the past only → backtest the next time block out-of-sample → roll forward and refit. No test signal is ever visible to the training that trades it. The result is a chronological OOS trade chain — `stats` (median/percentiles), `sharpe`, `equity`, `maxDrawdown` — plus the slice you'd actually run in production: `certifiedOnly`, counting only blocks whose model certified itself on its own past. Nested CV estimates a config on shuffled folds; walk-forward answers "would this have made money, trading it the way I intend to".
+
+```ts
+const wf = await walkForward(history, getCandles, { slices: 6, trainOptions: { roundTripCostPct: 0.15 } });
+wf.stats.median;                 // OOS-медиана на сделку, net
+wf.maxDrawdown;                  // просадка OOS-кривой
+wf.certifiedOnly.stats;          // режим «торгуем только при certified=true»
+```
+
 ### PnL (outlier-robust)
 
 Realized-pnl statistics complement the mean with the median and percentiles, so a single bad (or single fat) trade doesn't define the system's edge:

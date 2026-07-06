@@ -49,6 +49,16 @@ export interface ExitParams {
    * Это КОНСТАНТА СРЕДЫ (твоя биржа/тариф), не ось оптимизации grid.
    */
   roundTripCostPct?: number;
+  /**
+   * STATE-DEPENDENT проскальзывание: доля ДИАПАЗОНА свечи-исполнения, приложенная
+   * против позиции на входе И на выходе. Константная издержка занижает боль ровно
+   * там, где она максимальна: на сигнальной свече пампа и на свече каскада спред
+   * взрывается вместе с range. slip = k·(high−low)/entry на каждой из двух свечей
+   * исполнения — стоп в обвале автоматически дороже стопа в тишине.
+   * Аппроксимация вычетом из pnl (уровни триггеров не сдвигаются). 0 = выкл.
+   * КОНСТАНТА СРЕДЫ (глубина твоего размера в стакане), не ось grid.
+   */
+  slippageRangeFrac?: number;
 }
 
 export type ExitReason =
@@ -192,6 +202,12 @@ export function replayExit(
   // издержки исполнения: вычитаются из НЕТТО pnl каждой вошедшей сделки.
   // exitPrice остаётся ГРОСС-ценой рынка (по ней сверяют путь), pnl — нетто.
   const costFrac = (p.roundTripCostPct ?? 0) / 100;
+  // state-dependent slippage: доля диапазона свечи ИСПОЛНЕНИЯ против позиции;
+  // вход платит по своей свече сразу, выход — по свече-триггеру.
+  const slipK = p.slippageRangeFrac ?? 0;
+  const slipOf = (c: ICandleData): number =>
+    slipK > 0 && entryPrice > 0 ? (slipK * (c.high - c.low)) / entryPrice : 0;
+  const entrySlip = slipOf(candles[entryIdx]);
 
   let peak = 0;                 // пиковый PnL за жизнь (доли)
   let peakMinute = 0;          // минута достижения пика
@@ -222,7 +238,7 @@ export function replayExit(
       // НИКОГДА не показывал убыток — это завышало pnl и отравляло RR/CV-объектив
       // (оптимизатор не видел риск стопов). peak сохраняется отдельно для диагностики.
       return {
-        pnl: -hardStopFrac - costFrac,
+        pnl: -hardStopFrac - costFrac - entrySlip - slipOf(c),
         reason: "hard-stop",
         peak,
         heldMinutes: minute,
@@ -249,7 +265,7 @@ export function replayExit(
       // отравляло CV/RR/сертификацию (оптимизатор выбирал пороги под несуществующий
       // выход по пику). peak сохраняется отдельно для диагностики.
       return {
-        pnl: closePnl - costFrac,
+        pnl: closePnl - costFrac - entrySlip - slipOf(c),
         reason: "trailing-take",
         peak,
         heldMinutes: minute,
@@ -265,7 +281,7 @@ export function replayExit(
     //    hard stop). Раньше возвращался peak — та же оптимистичная ложь, что и в trailing.
     if (peak >= stalenessProfitFrac && minute - peakMinute >= p.stalenessSinceMinutes) {
       return {
-        pnl: closePnl - costFrac,
+        pnl: closePnl - costFrac - entrySlip - slipOf(c),
         reason: "peak-staleness",
         peak,
         heldMinutes: minute,
@@ -281,7 +297,7 @@ export function replayExit(
   const lastIdx = entryIdx + lifeCap;
   const finalPnl = signed(entryPrice, candles[lastIdx].close, dir);
   return {
-    pnl: finalPnl - costFrac,
+    pnl: finalPnl - costFrac - entrySlip - slipOf(candles[lastIdx]),
     reason: "life-cap",
     peak,
     heldMinutes: lifeCap,

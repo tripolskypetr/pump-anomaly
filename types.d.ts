@@ -370,6 +370,16 @@ interface ExitParams {
      * Это КОНСТАНТА СРЕДЫ (твоя биржа/тариф), не ось оптимизации grid.
      */
     roundTripCostPct?: number;
+    /**
+     * STATE-DEPENDENT проскальзывание: доля ДИАПАЗОНА свечи-исполнения, приложенная
+     * против позиции на входе И на выходе. Константная издержка занижает боль ровно
+     * там, где она максимальна: на сигнальной свече пампа и на свече каскада спред
+     * взрывается вместе с range. slip = k·(high−low)/entry на каждой из двух свечей
+     * исполнения — стоп в обвале автоматически дороже стопа в тишине.
+     * Аппроксимация вычетом из pnl (уровни триггеров не сдвигаются). 0 = выкл.
+     * КОНСТАНТА СРЕДЫ (глубина твоего размера в стакане), не ось grid.
+     */
+    slippageRangeFrac?: number;
 }
 type ExitReason = "trailing-take" | "hard-stop" | "peak-staleness" | "life-cap" | "cascade-veto" | "invert" | "no-entry";
 interface ReplayResult {
@@ -748,6 +758,12 @@ interface SignalOrigin {
     id?: string;
     /** id всех parser-item, вошедших в сигнал */
     ids?: string[];
+    /**
+     * ADVISORY-ёмкость: медианный минутный оборот в котируемой валюте по свечам
+     * ДО сигнала (median(volume)·close). Твой ордер, сопоставимый с этой величиной,
+     * сам станет пампом — эджа на таком размере нет. null = свечей не было.
+     */
+    liquidityQuote?: number | null;
 }
 /** Единый исполняемый сигнал. Прод читает плоскую часть, origin — для аудита. */
 interface TradeSignal {
@@ -844,6 +860,15 @@ interface SignalPolicy {
     minMomentum24hPct?: number;
     /** окно momentum-фильтра в минутах (по умолчанию 1440 = 24ч, как в статье) */
     momentumWindowMinutes?: number;
+    /**
+     * ФИЛЬТР КАЧЕСТВА АВТОРА: сигнал single-канала допускается, только если его
+     * channelScore (shrinkage-expectancy по бэктест-истории канала) ≥ порога.
+     * Эдж неравномерен по каналам: один автор стабильно двигает рынок, другой —
+     * стабильно сливает подписчиков. Matrix-сигналы (channel=null, межканальное
+     * подтверждение) проходят всегда. Канал без статистики режется консервативно.
+     * Тighten-only: max(trained, requested). undefined = выкл.
+     */
+    minChannelScore?: number;
 }
 declare const DEFAULT_POLICY: SignalPolicy;
 /**
@@ -1243,6 +1268,13 @@ interface TrainOptions {
      * идеальное исполнение. Типично 0.1–0.3 для тейкера на памп-коинах. Дефолт 0.
      */
     roundTripCostPct?: number;
+    /**
+     * STATE-DEPENDENT проскальзывание: доля диапазона свечи-исполнения против позиции
+     * на входе и на выходе (см. ExitParams.slippageRangeFrac). Константная издержка
+     * недооценивает боль ровно на свече пампа/каскада, где спред взрывается вместе
+     * с range. Типично 0.05–0.2 в зависимости от твоего размера. Дефолт 0.
+     */
+    slippageRangeFrac?: number;
 }
 /**
  * Запись истории одного сигнала для внешней аналитики (dump()).
@@ -1302,6 +1334,18 @@ interface TrainedParams {
         bySymbol: Record<string, PnlStats>;
         global: PnlStats;
     };
+    /**
+     * КАЧЕСТВО АВТОРОВ: per-channel скор по вошедшим сделкам истории.
+     * score = shrinkage-expectancy (mean·n/(n+k)) — канал с 2 удачными постами не
+     * обгонит канал с 30 стабильными: малое n усаживается к нулю. median/n — для
+     * аудита. Runtime-фильтр policy.minChannelScore режет сигналы каналов ниже
+     * порога (matrix-сигналы межканальные — проходят всегда). Сериализуется.
+     */
+    channelScore?: Record<string, {
+        score: number;
+        median: number;
+        n: number;
+    }>;
     /**
      * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
      * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -1449,6 +1493,16 @@ declare class PumpMatrix {
     get exit(): ExitTensor;
     /** Политика разрешённых исходов, зашитая в модель (readonly-копия). */
     get policy(): SignalPolicy;
+    /**
+     * Скор авторов по бэктест-истории: channel → { score, median, n }.
+     * score = shrinkage-expectancy (усажен к нулю при малом n). Основа для
+     * runtime-фильтра policy.minChannelScore и для ручного аудита каналов.
+     */
+    get channelScore(): Record<string, {
+        score: number;
+        median: number;
+        n: number;
+    }>;
     /** Надёжна ли модель (хватило ли данных при обучении). */
     get reliable(): boolean;
     /** Доверие к модели 0..1. */

@@ -26,7 +26,9 @@ const items: ParserItem[] = [{ channel: "yoda", symbol: "SOLUSDT", direction: "l
 describe("plan(getCandles) — перегрузка: свечи через getCandles, без словаря", () => {
   it("даёт ТОТ ЖЕ результат, что plan(словарь) на тех же свечах", async () => {
     const m = PumpMatrix.load(model());
-    const dict = { SOLUSDT: await gc("SOLUSDT", "1m", 240, alignTs(t0, "1m")) };
+    // те же свечи = ровно то окно ДО сигнала, которое тянет live-путь (lookbackMinutes)
+    const lookback = m.lookbackMinutes;
+    const dict = { SOLUSDT: await gc("SOLUSDT", "1m", lookback, alignTs(t0, "1m") - lookback * MIN) };
     const viaDict = m.plan(items, dict);
     const viaLive = await m.plan(items, gc);
     expect(JSON.stringify(viaLive)).toBe(JSON.stringify(viaDict));

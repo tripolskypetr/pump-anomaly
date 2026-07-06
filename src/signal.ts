@@ -56,6 +56,12 @@ export interface SignalOrigin {
   id?: string;
   /** id всех parser-item, вошедших в сигнал */
   ids?: string[];
+  /**
+   * ADVISORY-ёмкость: медианный минутный оборот в котируемой валюте по свечам
+   * ДО сигнала (median(volume)·close). Твой ордер, сопоставимый с этой величиной,
+   * сам станет пампом — эджа на таком размере нет. null = свечей не было.
+   */
+  liquidityQuote?: number | null;
 }
 
 /** Единый исполняемый сигнал. Прод читает плоскую часть, origin — для аудита. */
@@ -157,6 +163,15 @@ export interface SignalPolicy {
   minMomentum24hPct?: number;
   /** окно momentum-фильтра в минутах (по умолчанию 1440 = 24ч, как в статье) */
   momentumWindowMinutes?: number;
+  /**
+   * ФИЛЬТР КАЧЕСТВА АВТОРА: сигнал single-канала допускается, только если его
+   * channelScore (shrinkage-expectancy по бэктест-истории канала) ≥ порога.
+   * Эдж неравномерен по каналам: один автор стабильно двигает рынок, другой —
+   * стабильно сливает подписчиков. Matrix-сигналы (channel=null, межканальное
+   * подтверждение) проходят всегда. Канал без статистики режется консервативно.
+   * Тighten-only: max(trained, requested). undefined = выкл.
+   */
+  minChannelScore?: number;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -185,20 +200,17 @@ export function intersectPolicy(
   } else {
     minRiskReward = requested?.minRiskReward ?? trained.minRiskReward;
   }
-  // momentum-порог: только ужесточение (выше порог = строже отбор), как minRiskReward
-  let minMomentum24hPct: number | undefined;
-  if (trained.minMomentum24hPct !== undefined && requested?.minMomentum24hPct !== undefined) {
-    minMomentum24hPct = Math.max(trained.minMomentum24hPct, requested.minMomentum24hPct);
-  } else {
-    minMomentum24hPct = requested?.minMomentum24hPct ?? trained.minMomentum24hPct;
-  }
+  // числовые пороги: только ужесточение (выше = строже), как minRiskReward
+  const tightenMax = (a?: number, b?: number): number | undefined =>
+    a !== undefined && b !== undefined ? Math.max(a, b) : (b ?? a);
   return {
     allow,
     minRiskReward,
     rrMetric: requested?.rrMetric ?? trained.rrMetric ?? "mean",
     // tighten-only: включён хотя бы одной стороной → включён; выключить вшитое нельзя
     requireVolumeConfirm: (trained.requireVolumeConfirm || requested?.requireVolumeConfirm) || undefined,
-    minMomentum24hPct,
+    minMomentum24hPct: tightenMax(trained.minMomentum24hPct, requested?.minMomentum24hPct),
     momentumWindowMinutes: requested?.momentumWindowMinutes ?? trained.momentumWindowMinutes,
+    minChannelScore: tightenMax(trained.minChannelScore, requested?.minChannelScore),
   };
 }

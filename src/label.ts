@@ -40,7 +40,7 @@ export interface LabelResult {
 export const exitKey = (p: ExitParams): string =>
   `tt${p.trailingTake}|hs${p.hardStop}|sp${p.stalenessSinceProfit}|sm${p.stalenessSinceMinutes}|life${p.staleMinutes}` +
   `|vz${p.volZThreshold ?? "_"}|pol${p.squeezePolicy ?? "none"}|sqt${p.squeezeThreshold ?? "_"}|bw${p.volBaselineWindow ?? "_"}|cw${p.cascadeWindowMinutes ?? "_"}` +
-  `|tf${p.tightenFactor ?? "_"}|rc${p.roundTripCostPct ?? "_"}`; // tightenFactor/roundTripCostPct меняют replay — без них разные exit коллизируют в одном ключе
+  `|tf${p.tightenFactor ?? "_"}|rc${p.roundTripCostPct ?? "_"}|sl${p.slippageRangeFrac ?? "_"}`; // tightenFactor/издержки меняют replay — без них разные exit коллизируют в одном ключе
 
 /**
  * Достаёт 1m-свечи от события вперёд на покрытие максимального life-cap и
@@ -95,7 +95,7 @@ export async function labelBurst(
     const pol = inertPol(p.squeezePolicy) ? "inert" : p.squeezePolicy;
     const sqt = pol === "inert" ? "_" : (p.squeezeThreshold ?? "_");
     return `${p.trailingTake}|${p.hardStop}|${p.stalenessSinceProfit}|${p.stalenessSinceMinutes}|${p.staleMinutes}` +
-      `|${p.volBaselineWindow ?? "_"}|${p.cascadeWindowMinutes ?? "_"}|${p.tightenFactor ?? "_"}|${p.roundTripCostPct ?? "_"}|${pol}|${sqt}`;
+      `|${p.volBaselineWindow ?? "_"}|${p.cascadeWindowMinutes ?? "_"}|${p.tightenFactor ?? "_"}|${p.roundTripCostPct ?? "_"}|${p.slippageRangeFrac ?? "_"}|${pol}|${sqt}`;
   };
   const memo = new Map<string, ReplayResult>();
   const byExit = new Map<string, ReplayResult>();

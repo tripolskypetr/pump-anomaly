@@ -20,7 +20,7 @@ import { labelBurst, exitKey, LabelOutcome } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats, percentile } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
 import {
   MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
@@ -176,6 +176,13 @@ export interface TrainOptions {
    * идеальное исполнение. Типично 0.1–0.3 для тейкера на памп-коинах. Дефолт 0.
    */
   roundTripCostPct?: number;
+  /**
+   * STATE-DEPENDENT проскальзывание: доля диапазона свечи-исполнения против позиции
+   * на входе и на выходе (см. ExitParams.slippageRangeFrac). Константная издержка
+   * недооценивает боль ровно на свече пампа/каскада, где спред взрывается вместе
+   * с range. Типично 0.05–0.2 в зависимости от твоего размера. Дефолт 0.
+   */
+  slippageRangeFrac?: number;
 }
 
 // ─────────────────── сериализуемый результат обучения ─────────────────────────
@@ -239,6 +246,14 @@ export interface TrainedParams {
     bySymbol: Record<string, PnlStats>;
     global: PnlStats;
   };
+  /**
+   * КАЧЕСТВО АВТОРОВ: per-channel скор по вошедшим сделкам истории.
+   * score = shrinkage-expectancy (mean·n/(n+k)) — канал с 2 удачными постами не
+   * обгонит канал с 30 стабильными: малое n усаживается к нулю. median/n — для
+   * аудита. Runtime-фильтр policy.minChannelScore режет сигналы каналов ниже
+   * порога (matrix-сигналы межканальные — проходят всегда). Сериализуется.
+   */
+  channelScore?: Record<string, { score: number; median: number; n: number }>;
   /**
    * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
    * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -443,6 +458,7 @@ export async function train(
 
   // полный список exit-наборов (декартово произведение exit+volume осей)
   const roundTripCostPct = opts.roundTripCostPct ?? 0;
+  const slippageRangeFrac = opts.slippageRangeFrac ?? 0;
   const exitSets: ExitParams[] = [];
   for (const tt of grid.trailingTake)
     for (const hs of grid.hardStop)
@@ -463,6 +479,7 @@ export async function train(
                         // издержки среды: каждая метка/CV-оценка считается под реальную
                         // стоимость сделки; попадает в тензор → прод реплеит с ними же
                         roundTripCostPct,
+                        slippageRangeFrac,
                       });
 
   // кэш: ключ кластеризации → размеченные всплески.
@@ -630,7 +647,7 @@ export async function train(
   // память под массивы ретёрнов в каждой записи делала полный грид неисполнимым.
   const inertPol = (p?: string) => p == null || p === "none" || p === "ignore";
   const pnlKeyOf = (e: ExitParams): string => {
-    const base = `${e.trailingTake}|${e.hardStop}|${e.stalenessSinceProfit}|${e.stalenessSinceMinutes}|${e.staleMinutes}|${e.tightenFactor ?? "_"}|${e.roundTripCostPct ?? "_"}`;
+    const base = `${e.trailingTake}|${e.hardStop}|${e.stalenessSinceProfit}|${e.stalenessSinceMinutes}|${e.staleMinutes}|${e.tightenFactor ?? "_"}|${e.roundTripCostPct ?? "_"}|${e.slippageRangeFrac ?? "_"}`;
     return inertPol(e.squeezePolicy)
       ? `${base}|inert`
       : `${base}|${e.squeezePolicy}|${e.squeezeThreshold ?? "_"}|${e.cascadeWindowMinutes ?? "_"}`;
@@ -1195,6 +1212,23 @@ export async function train(
   }
   const pnlGlobal = pnlStats(pnlsGlobal);
 
+  // ── скор авторов: shrinkage-expectancy по вошедшим сделкам каждого канала ──
+  // Усадка n/(n+k) не даёт каналу с парой удачных постов обогнать канал с
+  // длинной стабильной историей; малое n честно тянет скор к нулю.
+  const channelPnls = new Map<string, number[]>();
+  for (const h of history) {
+    if (!h.entered) continue;
+    (channelPnls.get(h.channel) ?? channelPnls.set(h.channel, []).get(h.channel)!).push(h.pnl);
+  }
+  const channelScore: Record<string, { score: number; median: number; n: number }> = {};
+  for (const [ch, pnls] of channelPnls) {
+    channelScore[ch] = {
+      score: +shrinkageExpectancy(pnls, shrinkageK).toFixed(6),
+      median: +percentile(pnls, 0.5).toFixed(6),
+      n: pnls.length,
+    };
+  }
+
   // ── ОБУЧЕННЫЙ momentum-гейт → policy ──
   // Выбранный CV порог вшивается в сериализуемую политику: runtime (signals/plan/
   // backtest) применит его сам, без ручной передачи. Пользовательский порог из
@@ -1214,6 +1248,7 @@ export async function train(
     policy: basePolicy,
     riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
     pnl: { bySymbol: pnlBySymbol, global: pnlGlobal },
+    channelScore,
     history,
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,

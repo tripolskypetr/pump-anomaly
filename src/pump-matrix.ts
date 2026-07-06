@@ -69,6 +69,7 @@ export class PumpMatrix {
     if (!params.policy) params.policy = DEFAULT_POLICY; // обратная совместимость
     if (!params.riskReward) params.riskReward = { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } };
     if (!params.pnl) params.pnl = { bySymbol: {}, global: { mean: 0, median: 0, p5: 0, p95: 0, p99: 0, n: 0 } };
+    if (!params.channelScore) params.channelScore = {}; // обратная совместимость
     return new PumpMatrix(params, loadPredict(params));
   }
 
@@ -108,15 +109,24 @@ export class PumpMatrix {
   /** Политика разрешённых исходов, зашитая в модель (readonly-копия). */
   get policy(): SignalPolicy {
     // ПОЛНАЯ копия: помимо allow политика несёт RR-фильтр (minRiskReward/rrMetric),
-    // гейт объёма и momentum-фильтр — терять их в геттере нельзя (урезанный аудит).
+    // гейт объёма, momentum-фильтр и порог качества автора — терять их нельзя.
     const {
       allow, minRiskReward, rrMetric, requireVolumeConfirm,
-      minMomentum24hPct, momentumWindowMinutes,
+      minMomentum24hPct, momentumWindowMinutes, minChannelScore,
     } = this.params.policy;
     return {
       allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm,
-      minMomentum24hPct, momentumWindowMinutes,
+      minMomentum24hPct, momentumWindowMinutes, minChannelScore,
     };
+  }
+
+  /**
+   * Скор авторов по бэктест-истории: channel → { score, median, n }.
+   * score = shrinkage-expectancy (усажен к нулю при малом n). Основа для
+   * runtime-фильтра policy.minChannelScore и для ручного аудита каналов.
+   */
+  get channelScore(): Record<string, { score: number; median: number; n: number }> {
+    return { ...(this.params.channelScore ?? {}) };
   }
 
   /** Надёжна ли модель (хватило ли данных при обучении). */
@@ -548,6 +558,15 @@ export class PumpMatrix {
       if (!rr || rr[metric] < policy.minRiskReward) return null;
     }
 
+    // ── фильтр КАЧЕСТВА АВТОРА: single-каналы ниже порога скора режутся ──
+    // matrix-сигнал межканальный (channel=null) — его качество уже подтверждено
+    // независимостью кластеров, фильтр не применяется. Канал без статистики —
+    // консервативно режем (нечем подтвердить).
+    if (policy.minChannelScore !== undefined && v.channel !== null) {
+      const cs = this.params.channelScore?.[v.channel];
+      if (!cs || cs.score < policy.minChannelScore) return null;
+    }
+
     let volRegime: VolRegime | null = null;
 
     const probe = resolveExit(this.params.exit, v.source, ch, v.symbol, dir, "calm");
@@ -556,6 +575,7 @@ export class PumpMatrix {
     const horizon = probe.exit.cascadeWindowMinutes ?? probe.exit.staleMinutes;
 
     let sqPressure: number | null = null;
+    let liquidityQuote: number | null = null;
     if (candles && candles.length > 0) {
       // первая свеча, ОТКРЫВШАЯСЯ не раньше сигнальной минуты (без look-ahead в
       // формирующуюся свечу сигнала). entryStartTs гарантирует полностью сформированную.
@@ -568,6 +588,14 @@ export class PumpMatrix {
         ? squeezePressureBefore(candles, entryIdx, dir, horizon)
         : squeezePressure(candles, entryIdx, dir, horizon);
       volRegime = volRegimeOf(volZ, volZThr);
+      // advisory-ёмкость: медианный минутный оборот до сигнала (котируемая валюта).
+      // Прод сравнивает со своим размером сам — фильтровать за него нельзя (не знаем ордер).
+      const pre = candles.slice(Math.max(0, entryIdx - 60), entryIdx);
+      if (pre.length >= 5) {
+        const vols = pre.map((c) => c.volume).sort((a, b) => a - b);
+        const medVol = vols[Math.floor(vols.length / 2)];
+        liquidityQuote = +(medVol * pre[pre.length - 1].close).toFixed(2);
+      }
     }
 
     // ── ПОДТВЕРЖДЕНИЕ РЫНКОМ: пост без аномального объёма на ленте — не памп ──
@@ -646,6 +674,7 @@ export class PumpMatrix {
       modelReliable: this.params.meta.reliable,
       id: v.id,
       ids: v.ids,
+      liquidityQuote,
     };
 
     return {

@@ -191,6 +191,7 @@ The training label comes from an **exact replay of your prod exit on 1m candles*
 - **life-cap** (`staleMinutes`) — ceiling on position lifetime = **empirical impact horizon**, tuned by the grid. Exits at the close of the last candle in the window (the realized pnl can be negative).
 - A stop-out realizes the **honest `-hardStop%`** — the actual result of the trade. The peak is kept separately for diagnostics, but the pnl is the loss. (An earlier version rolled the metric back to the last positive peak, which meant a stop-out never showed a loss and silently inflated pnl/RR — fixed.)
 - **Execution costs** — `TrainOptions.roundTripCostPct` (taker fees in+out plus slippage, % of notional; typically 0.1–0.3 on thin pump-coins) is stamped into every exit set: labels, CV selection and certification are all computed net of the real cost of trading, and the trained tensor carries it into prod replays. Default 0 (ideal fills) for backward compatibility — set it to your real costs, an edge that dies from fees is not an edge.
+- **State-dependent slippage** — `TrainOptions.slippageRangeFrac`: a fraction of the *execution candle's range* charged against the position at entry and at exit. A constant cost underestimates pain exactly where it peaks: on the pump's signal candle and on the cascade candle the spread blows out together with the range, so a stop in a crash is automatically more expensive than a stop in quiet tape. Approximated as a pnl deduction (trigger levels unchanged); typically 0.05–0.2 depending on your size. Default 0.
 
 Why this catches stop hunts: a wick into the trap never reaches `trailingTake`, and the pullback hits the hard stop → the label is negative **even if** `close[t+H]` happens to be positive. Path-aware replay sees the whole OHLC path, not just two points, so the optimizer actually sees the risk of stops.
 
@@ -639,6 +640,22 @@ model.backtest(items, getCandles, { minMomentum24hPct: -1 }); // тянет пр
 Same rules as the other gates: tighten-only (`max(trained, requested)`), candles required (no tape → cut conservatively), and a threshold that survived a 20-trade backtest is a hypothesis, not a law — verify on your full history.
 
 **The gate is trainable.** `TrainGrid.momentumGatePct` (e.g. `[null, -1, 0]`; `null` = no gate) makes the threshold a CV axis: labeling measures pre-signal momentum once per candidate (a cheap post-filter — no extra replays), CV + 1-SE + the certificate decide whether filtering helps *on your data*, and the chosen threshold is baked into `params.policy.minMomentum24hPct` — the runtime enforces it automatically after `load()`. The exit tensor, history and RR stats are built from the gated candidate set, so they describe exactly the flow prod will trade. In casual mode the calibration derives the threshold menu from the measured noise (±0.5σ of the gate window) instead of hardcoding "−1". Note: with a trained gate, candle-less `signals()` returns nothing (nothing to confirm against) — use `plan(items, getCandles)`.
+
+### Author quality (`channelScore` / `minChannelScore`)
+
+The edge is not uniform across channels: one author consistently moves the market, another consistently dumps on subscribers. `fit` scores every channel from the backtest history — `score` = shrinkage-expectancy (`mean·n/(n+k)`), so two lucky posts never outrank thirty steady ones — and serializes `channelScore: { [channel]: { score, median, n } }`. The runtime filter follows the familiar tighten-only pattern:
+
+```ts
+model.channelScore;                                  // аудит авторов
+model.signals(items, { minChannelScore: 0 });        // только каналы с неотрицательным скором
+fit(history, gc, { policy: { allow: [...], minChannelScore: 0.002 } }); // вшить порог
+```
+
+Matrix signals (`channel: null`, cross-channel confirmation) always pass; a channel with no statistics is cut conservatively.
+
+### Capacity advisory (`origin.liquidityQuote`)
+
+Every signal built with candles carries the **median per-minute quote turnover before the signal** (`median(volume)·close`). An order comparable to this number *is* the pump — there is no edge at that size. The library can't filter for you (it doesn't know your order), so it's advisory: compare `origin.liquidityQuote` with your intended notional and skip or downsize when they're within an order of magnitude.
 
 ### Walk-forward — the honest money question
 

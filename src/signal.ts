@@ -144,6 +144,19 @@ export interface SignalPolicy {
    * Тighten-only: запрос может включить, но не выключить вшитый в модель флаг.
    */
   requireVolumeConfirm?: boolean;
+  /**
+   * MOMENTUM-ФИЛЬТР (эдж из habr 1041898): сигнал допускается, только если за
+   * momentumWindowMinutes ДО поста направленный momentum ≥ порога:
+   *   long:  momentum ≥ minMomentum24hPct (не ловим падающий нож),
+   *   short: −momentum ≥ minMomentum24hPct (не шортим взлетающую ракету).
+   * В статье порог −1 (%): сырые посты ≈ нулевая сумма, но с этим фильтром
+   * winrate вырос 68% → 100% на выборке — эдж в притоке капитала ДО публикации.
+   * Требует свечей до сигнала (без них сигнал режется консервативно).
+   * Тighten-only: эффективный порог = max(trained, requested). undefined = выкл.
+   */
+  minMomentum24hPct?: number;
+  /** окно momentum-фильтра в минутах (по умолчанию 1440 = 24ч, как в статье) */
+  momentumWindowMinutes?: number;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -172,11 +185,20 @@ export function intersectPolicy(
   } else {
     minRiskReward = requested?.minRiskReward ?? trained.minRiskReward;
   }
+  // momentum-порог: только ужесточение (выше порог = строже отбор), как minRiskReward
+  let minMomentum24hPct: number | undefined;
+  if (trained.minMomentum24hPct !== undefined && requested?.minMomentum24hPct !== undefined) {
+    minMomentum24hPct = Math.max(trained.minMomentum24hPct, requested.minMomentum24hPct);
+  } else {
+    minMomentum24hPct = requested?.minMomentum24hPct ?? trained.minMomentum24hPct;
+  }
   return {
     allow,
     minRiskReward,
     rrMetric: requested?.rrMetric ?? trained.rrMetric ?? "mean",
     // tighten-only: включён хотя бы одной стороной → включён; выключить вшитое нельзя
     requireVolumeConfirm: (trained.requireVolumeConfirm || requested?.requireVolumeConfirm) || undefined,
+    minMomentum24hPct,
+    momentumWindowMinutes: requested?.momentumWindowMinutes ?? trained.momentumWindowMinutes,
   };
 }

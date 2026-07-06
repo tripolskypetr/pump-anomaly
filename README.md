@@ -623,6 +623,17 @@ model.plan(items, getCandles, { requireVolumeConfirm: true });                  
 
 A post whose tape stayed calm is dropped — it's a post without a market reaction, not a pump. The flag follows the same tighten-only invariant as `allow`: a runtime call can switch it on, never off. It needs candles to confirm against, so `signals()` (candle-less) returns nothing when the flag is set — use `plan(items, getCandles)`.
 
+### Momentum gate (`minMomentum24hPct`)
+
+The second market filter, from the [pre-publication momentum research](https://habr.com/ru/articles/1041898/): raw channel posts are near zero-sum after fees, and the edge concentrates in posts where price was **already moving with the signal before publication** (real capital inflow, not just the author's paint). The gate admits a signal only if the directional pre-signal momentum over `momentumWindowMinutes` (default 1440 = 24h) clears the threshold: longs don't catch falling knives, shorts don't fade a rocket — strictly on pre-signal candles, no look-ahead:
+
+```ts
+model.plan(items, getCandles, { minMomentum24hPct: -1 });  // порог из статьи: не против сигнала сильнее 1%
+model.backtest(items, getCandles, { minMomentum24hPct: -1 }); // тянет пре-окно сам; replay всё равно от сигнала
+```
+
+Same rules as the other gates: tighten-only (`max(trained, requested)`), candles required (no tape → cut conservatively), and a threshold that survived a 20-trade backtest is a hypothesis, not a law — verify on your full history.
+
 ### PnL (outlier-robust)
 
 Realized-pnl statistics complement the mean with the median and percentiles, so a single bad (or single fat) trade doesn't define the system's edge:

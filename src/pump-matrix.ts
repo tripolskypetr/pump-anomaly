@@ -2,7 +2,7 @@ import { ParserItem, PumpVerdict, Direction } from "./types";
 import { GetCandles, ICandleData, entryStartTs, STEP_MS } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { resolveExit, resolveExitNoRegime, ExitTensor } from "./exit-tensor";
-import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, VolRegime } from "./volume";
+import { volumeZScore, squeezePressure, squeezePressureBefore, volRegimeOf, momentumPct, VolRegime } from "./volume";
 import { replayExit } from "./replay";
 import { RiskRewardStats, PnlStats } from "./objective";
 import { DEFAULT_VIABILITY } from "./viability";
@@ -107,10 +107,16 @@ export class PumpMatrix {
 
   /** Политика разрешённых исходов, зашитая в модель (readonly-копия). */
   get policy(): SignalPolicy {
-    // ПОЛНАЯ копия: помимо allow политика несёт RR-фильтр (minRiskReward/rrMetric)
-    // и гейт подтверждения рынком — терять их в геттере нельзя (урезанный аудит).
-    const { allow, minRiskReward, rrMetric, requireVolumeConfirm } = this.params.policy;
-    return { allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm };
+    // ПОЛНАЯ копия: помимо allow политика несёт RR-фильтр (minRiskReward/rrMetric),
+    // гейт объёма и momentum-фильтр — терять их в геттере нельзя (урезанный аудит).
+    const {
+      allow, minRiskReward, rrMetric, requireVolumeConfirm,
+      minMomentum24hPct, momentumWindowMinutes,
+    } = this.params.policy;
+    return {
+      allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm,
+      minMomentum24hPct, momentumWindowMinutes,
+    };
   }
 
   /** Надёжна ли модель (хватило ли данных при обучении). */
@@ -288,8 +294,11 @@ export class PumpMatrix {
   ): Promise<TradeSignal[]> {
     const eff = intersectPolicy(this.params.policy, policy);
     // окно ДО сигнала (единый источник — геттер lookbackMinutes): базлайн объёма +
-    // горизонт каскада, всё в прошлом, без forward.
-    const lookback = this.lookbackMinutes;
+    // горизонт каскада, всё в прошлом, без forward. Momentum-фильтр требует своё
+    // окно (по умолчанию 24ч) — расширяем lookback, иначе гейту нечего мерить.
+    const momWin = eff.minMomentum24hPct !== undefined
+      ? (eff.momentumWindowMinutes ?? 1440) + 5 : 0;
+    const lookback = Math.max(this.lookbackMinutes, momWin);
     const out: TradeSignal[] = [];
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
@@ -345,12 +354,17 @@ export class PumpMatrix {
   ): Promise<BacktestSignal[]> {
     const eff = intersectPolicy(this.params.policy, policy);
     const maxLife = this.params.exit.global.staleMinutes;
-    const limit = maxLife * 2 + 5;
+    // momentum-фильтр меряется по свечам ДО сигнала — тянем окно и в бэктесте.
+    // replay при этом всё равно стартует от сигнала (replayResult срезает прошлое).
+    const momWin = eff.minMomentum24hPct !== undefined
+      ? (eff.momentumWindowMinutes ?? 1440) : 0;
+    const limit = maxLife * 2 + 5 + momWin;
+    const step = STEP_MS["1m"];
     const out: BacktestSignal[] = [];
     for (const v of this._predict(items).signals) {
       let candles: ICandleData[] | null = null;
       try {
-        const since = entryStartTs(v.ts, "1m");
+        const since = entryStartTs(v.ts, "1m") - momWin * step;
         candles = await fetchCandlesChunked(getCandles, v.symbol, "1m", limit, since);
         if (!candles.length) candles = null;
       } catch {
@@ -561,6 +575,21 @@ export class PumpMatrix {
     // calm-лента = пост без рыночной реакции = шум. Нет свечей → подтвердить нечем →
     // режем консервативно (signals() без свечей с этим флагом всегда пуст — см. policy).
     if (policy.requireVolumeConfirm && volRegime !== "anomalous") return null;
+
+    // ── MOMENTUM-ФИЛЬТР (эдж из habr 1041898): цена уже двигалась не против ──
+    // сигнала ДО публикации (приток реального капитала). Momentum считается по
+    // свечам СТРОГО до сигнальной минуты — без look-ahead. Нет свечей/окна →
+    // подтвердить нечем → режем консервативно.
+    if (policy.minMomentum24hPct !== undefined) {
+      if (!candles || candles.length === 0) return null;
+      const startTs = entryStartTs(v.ts, "1m");
+      let preEnd = candles.findIndex((c) => c.timestamp >= startTs);
+      if (preEnd < 0) preEnd = candles.length; // вся серия до сигнала
+      const m = momentumPct(candles, preEnd, policy.momentumWindowMinutes ?? 1440);
+      if (m === null) return null;
+      const directional = dir === "long" ? m : -m;
+      if (directional < policy.minMomentum24hPct) return null;
+    }
 
     let resolved = volRegime
       ? resolveExit(this.params.exit, v.source, ch, v.symbol, dir, volRegime)

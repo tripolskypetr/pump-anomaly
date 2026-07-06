@@ -112,6 +112,29 @@ export function squeezePressureBefore(
   return againstVol / totalVol;
 }
 
+/**
+ * Momentum цены ДО входа, %: (close_последней / close_первой − 1)·100 по окну
+ * [entryIdx − windowMinutes, entryIdx) СТРОГО до сигнальной свечи (без look-ahead).
+ *
+ * Это ключевой фильтр эджа (habr 1041898): сырые посты ≈ нулевая сумма после
+ * комиссий, но посты, перед которыми цена УЖЕ двигалась не против сигнала
+ * (приток реального капитала до публикации), статистически отрабатывают.
+ * null = данных мало (окно < 2 свечей) — вызывающий решает консервативно.
+ */
+export function momentumPct(
+  candles: ICandleData[],
+  entryIdx: number,
+  windowMinutes: number,
+): number | null {
+  const end = Math.min(Math.max(entryIdx, 0), candles.length);
+  const start = Math.max(0, end - windowMinutes);
+  if (end - start < 2) return null;
+  const first = candles[start].close;
+  const last = candles[end - 1].close;
+  if (!(first > 0) || !Number.isFinite(last)) return null;
+  return (last / first - 1) * 100;
+}
+
 /** Считает оба признака разом для входа на entryIdx. */
 export function volumeFeatures(
   candles: ICandleData[],

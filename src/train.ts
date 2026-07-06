@@ -20,7 +20,7 @@ import { labelBurst, exitKey, LabelOutcome } from "./label";
 import { ExitParams } from "./replay";
 import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
-import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, pnlStats, PnlStats } from "./objective";
+import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, standardError, pnlStats, PnlStats } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
 import {
   MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
@@ -158,6 +158,18 @@ export interface TrainOptions {
    */
   momentumWindowMinutes?: number;
   /**
+   * Раунды УТОЧНЯЮЩЕГО брутфорса (coarse-to-fine) вокруг победителя грубой сетки.
+   * Грубый шаг (×2–×4 между узлами) может целиком спрятать узкую прибыльную
+   * область — истинный оптимум между узлами невидим, и fit ложно скажет «эджа
+   * нет». Каждый раунд пробует середины интервалов вокруг победителя по всем
+   * непрерывным exit-осям (+порог momentum-гейта); шаг ополовинивается сам.
+   * Против оверфита на мелком шаге: переезд только при улучшении БОЛЬШЕ SE
+   * победителя, и каждый вариант — честное испытание (входит в innerTrials/DSR).
+   * nestedScore считается по грубой сетке (уточнение в nested не повторяется).
+   * Дефолт: 2 в casual-режиме (grid не передан), 0 при явном гриде.
+   */
+  refineRounds?: number;
+  /**
    * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
    * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
    * CV-отбор и сертификация считаются под РЕАЛЬНУЮ стоимость сделки, а не под
@@ -283,6 +295,12 @@ export interface TrainedParams {
      * калибровка не запускалась (передан явный grid без autoCalibrate).
      */
     calibration?: Calibration | null;
+    /**
+     * Аудит уточняющего брутфорса (coarse-to-fine): сколько раундов пройдено,
+     * сколько вариантов оценено (все они учтены в innerTrials) и сколько
+     * переездов принято по правилу «улучшение > SE». null = уточнение выключено.
+     */
+    refinement?: { rounds: number; evaluated: number; accepted: number } | null;
   };
 }
 
@@ -402,6 +420,27 @@ export async function train(
   const entryIndex = new Map<string, ParserItem>();
   for (const it of items) entryIndex.set(`${it.symbol}|${it.direction}|${it.ts}`, it);
 
+  // ── кэш свечей НА ВРЕМЯ fit ──
+  // Одни и те же окна запрашиваются многократно: single-режим размечает кандидатов
+  // по разу на каждый windowK, refinement-раунды переразмечают победившую
+  // кластеризацию. Без кэша это повторный IO к бирже за теми же свечами.
+  // FIFO-кап держит память (~30МБ worst-case при 1445-свечных окнах).
+  const candleCache = new Map<string, import("./candle").ICandleData[]>();
+  const CANDLE_CACHE_CAP = 256;
+  const gcCached: GetCandles = async (symbol, interval, limit, sDate, eDate) => {
+    if (eDate !== undefined) return getCandles(symbol, interval, limit, sDate, eDate);
+    const key = `${symbol}|${interval}|${limit}|${sDate}`;
+    const hit = candleCache.get(key);
+    if (hit) return hit;
+    const res = await getCandles(symbol, interval, limit, sDate);
+    if (candleCache.size >= CANDLE_CACHE_CAP) {
+      const first = candleCache.keys().next().value;
+      if (first !== undefined) candleCache.delete(first);
+    }
+    candleCache.set(key, res);
+    return res;
+  };
+
   // полный список exit-наборов (декартово произведение exit+volume осей)
   const roundTripCostPct = opts.roundTripCostPct ?? 0;
   const exitSets: ExitParams[] = [];
@@ -461,7 +500,7 @@ export async function train(
     try {
       const start = entryStartTs(ts, "1m");
       const pre = await fetchCandlesChunked(
-        getCandles, symbol, "1m", momentumWindow, start - momentumWindow * 60_000,
+        gcCached, symbol, "1m", momentumWindow, start - momentumWindow * 60_000,
       );
       // только свечи СТРОГО до сигнала (обрезаем возможный хвост от щедрого адаптера)
       const cut = pre.filter((c) => c.timestamp < start);
@@ -494,7 +533,7 @@ export async function train(
     for (const b of cands) {
       const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
       const { outcome, burst, error } = await labelBurst(
-        getCandles, b.symbol, b.direction, b.ts, exitSets,
+        gcCached, b.symbol, b.direction, b.ts, exitSets,
         src?.entryFromPrice, src?.entryToPrice,
       );
       onTick?.(b.symbol);
@@ -725,13 +764,183 @@ export async function train(
   // чей score в пределах SE от максимума. Это убирает переобучение на шум grid:
   // разница внутри SE статистически незначима, поэтому robustness > удача.
   // Порядок консервативности и пороги — в selection.ts, без магических литералов.
-  const top = oneStandardErrorSelect(
+  let top = oneStandardErrorSelect(
     board,
     (e) => e.cvScore,
     (e) => e._foldScores,
     (a, b) => isMoreConservative(a, b),
     selection.seMultiplier,
   )!;
+
+  // ── УТОЧНЯЮЩИЙ БРУТФОРС (coarse-to-fine): шаг сетки не должен прятать эдж ──
+  // Грубая сетка (×2–×4 между узлами) может целиком промахнуться мимо узкой
+  // прибыльной области: оптимум trailingTake=1.0 между узлами [0.5, 2] невидим,
+  // и fit ложно скажет «эджа нет». Каждый раунд пробуем СЕРЕДИНЫ интервалов
+  // вокруг победителя по каждой непрерывной exit-оси (+порог гейта), по одной оси
+  // за раз; брекеты ополовиниваются → шаг сходится геометрически. Анти-оверфит:
+  //  (1) переезд только при улучшении > SE победителя (значимость, не шум);
+  //  (2) каждый вариант попадает в board → innerTrials/DSR/SPA видят ВЕСЬ перебор.
+  // Новые replay дёшевы: ~16 вариантов/раунд × кандидаты победившей кластеризации,
+  // свечи из кэша fit'а.
+  const refineRounds = Math.max(0, opts.refineRounds ?? (opts.grid == null ? 2 : 0));
+  const refinement = { rounds: 0, evaluated: 0, accepted: 0 };
+  if (refineRounds > 0) {
+    const labeledWin = labeledFor({
+      wK: top.config.windowK, jac: top.config.jaccardThreshold,
+      lag: top.config.lagPeakThreshold, sw: top.config.stationarityWindowMs,
+    });
+    const minC = top.config.minClusters;
+    const avgOf = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
+
+    // непрерывные exit-оси; int-оси округляются до минут ≥ 1
+    const numAxes: Array<{ k: keyof ExitParams & string; int?: boolean }> = [
+      { k: "trailingTake" }, { k: "hardStop" }, { k: "stalenessSinceProfit" },
+      { k: "stalenessSinceMinutes", int: true }, { k: "staleMinutes", int: true },
+      { k: "volZThreshold" }, { k: "squeezeThreshold" }, { k: "cascadeWindowMinutes", int: true },
+    ];
+    const gridAxisOf: Record<string, number[]> = {
+      trailingTake: grid.trailingTake, hardStop: grid.hardStop,
+      stalenessSinceProfit: grid.stalenessSinceProfit,
+      stalenessSinceMinutes: grid.stalenessSinceMinutes, staleMinutes: grid.staleMinutes,
+      volZThreshold: grid.volZThreshold, squeezeThreshold: grid.squeezeThreshold,
+      cascadeWindowMinutes: grid.cascadeWindowMinutes,
+    };
+    // начальный брекет оси = соседние узлы сетки; на краю/одиночной оси — ±50%
+    const bracketOf = (axis: number[], v: number): { lo: number; hi: number } => {
+      const s = [...new Set(axis)].sort((x, y) => x - y);
+      const i = s.indexOf(v);
+      return {
+        lo: i > 0 ? s[i - 1] : v / 1.5,
+        hi: i >= 0 && i < s.length - 1 ? s[i + 1] : v * 1.5,
+      };
+    };
+    const brackets = new Map<string, { lo: number; hi: number }>();
+    for (const a of numAxes) {
+      const v = (top.exit as unknown as Record<string, unknown>)[a.k];
+      if (typeof v === "number" && v > 0) brackets.set(a.k, bracketOf(gridAxisOf[a.k] ?? [v], v));
+    }
+    // гейт: арифметические середины (порог может быть ≤ 0)
+    const gateVals = momentumAxis.filter((g): g is number => g !== null).sort((x, y) => x - y);
+    let gateBracket: { lo: number; hi: number } | null = null;
+    if (top.gate !== null) {
+      const i = gateVals.indexOf(top.gate);
+      gateBracket = {
+        lo: i > 0 ? gateVals[i - 1] : top.gate - 1,
+        hi: i >= 0 && i < gateVals.length - 1 ? gateVals[i + 1] : top.gate + 1,
+      };
+    }
+
+    let curExit = top.exit;
+    let curGate = top.gate;
+    let curScore = top.cvScore;
+    let curFolds = top._foldScores;
+    let curEval: EvalDetail | null = null;
+
+    for (let r = 0; r < refineRounds; r++) {
+      refinement.rounds++;
+      // варианты раунда: по одной оси за раз, середины к краям брекета
+      const variants: Array<{ exit: ExitParams; gate: number | null }> = [];
+      for (const a of numAxes) {
+        const cur = (curExit as unknown as Record<string, unknown>)[a.k];
+        const br = brackets.get(a.k);
+        if (typeof cur !== "number" || !br) continue;
+        for (const edge of [br.lo, br.hi]) {
+          if (!(edge > 0)) continue;
+          let mid = Math.sqrt(cur * edge); // геосередина: %-оси мультипликативны
+          if (a.int) mid = Math.max(1, Math.round(mid));
+          mid = +mid.toFixed(4);
+          if (mid !== cur) variants.push({ exit: { ...curExit, [a.k]: mid } as ExitParams, gate: curGate });
+        }
+      }
+      if (curGate !== null && gateBracket) {
+        for (const edge of [gateBracket.lo, gateBracket.hi]) {
+          const mid: number = +(((curGate as number) + edge) / 2).toFixed(4);
+          if (mid !== curGate) variants.push({ exit: curExit, gate: mid });
+        }
+      }
+      if (!variants.length) break;
+
+      // доразметка НЕДОСТАЮЩИХ exit-наборов по кандидатам победившей кластеризации
+      const missing: ExitParams[] = [];
+      const seenNew = new Set<string>();
+      for (const vr of variants) {
+        const k = exitKey(vr.exit);
+        if (seenNew.has(k)) continue;
+        seenNew.add(k);
+        if (!labeledWin.some((b) => b.byExit.has(k))) missing.push(vr.exit);
+      }
+      if (missing.length) {
+        let done = 0;
+        for (const b of labeledWin) {
+          const src = entryIndex.get(`${b.symbol}|${b.direction}|${b.ts}`);
+          const { burst } = await labelBurst(
+            gcCached, b.symbol, b.direction, b.ts, missing,
+            src?.entryFromPrice, src?.entryToPrice,
+          );
+          if (burst) {
+            for (const [k, rr] of burst.byExit) {
+              if (!b.byExit.has(k)) {
+                b.byExit.set(k, {
+                  pnl: rr.pnl, volRegime: rr.volRegime, entered: rr.entered,
+                  entryPrice: rr.entryPrice, exitPrice: rr.exitPrice, reason: rr.reason,
+                  heldMinutes: rr.heldMinutes, peak: rr.peak, inverted: rr.inverted,
+                });
+              }
+            }
+          }
+          done++;
+          progress({ done, total: labeledWin.length, phase: "refine", label: `${b.symbol} r${r + 1}` });
+        }
+        // pickExit/tensor должны видеть уточнённые наборы наравне с сеточными
+        for (const ex of missing) exitSets.push(ex);
+      }
+
+      // оценка вариантов; каждый — честное испытание (в board → innerTrials/DSR)
+      let bestVar: { exit: ExitParams; gate: number | null; score: number; ev: EvalDetail } | null = null;
+      for (const vr of variants) {
+        const ev = evalSelection(labeledWin, exitKey(vr.exit), minC, vr.gate);
+        const score = +avgOf(ev.foldScores).toFixed(6);
+        board.push({
+          config: top.config, exit: vr.exit, gate: vr.gate,
+          cvScore: score, cvWinrate: +avgOf(ev.wins).toFixed(6), cvSupport: +avgOf(ev.foldSizes).toFixed(2),
+          _foldScores: ev.foldScores, _sharpe: sharpe(ev.returns), _n: ev.returns.length,
+        });
+        refinement.evaluated++;
+        if (!bestVar || score > bestVar.score) bestVar = { exit: vr.exit, gate: vr.gate, score, ev };
+      }
+      // переезд только при ЗНАЧИМОМ улучшении: больше SE текущего победителя
+      const guard = standardError(curFolds) * selection.seMultiplier;
+      if (bestVar && bestVar.score > curScore + guard) {
+        curExit = bestVar.exit;
+        curGate = bestVar.gate;
+        curScore = bestVar.score;
+        curFolds = bestVar.ev.foldScores;
+        curEval = bestVar.ev;
+        refinement.accepted++;
+      }
+      // ополовинить брекеты вокруг текущего значения — шаг сходится сам
+      for (const a of numAxes) {
+        const cur = (curExit as unknown as Record<string, unknown>)[a.k];
+        const br = brackets.get(a.k);
+        if (typeof cur !== "number" || !br || !(br.lo > 0)) continue;
+        brackets.set(a.k, { lo: Math.sqrt(cur * br.lo), hi: Math.sqrt(cur * br.hi) });
+      }
+      if (curGate !== null && gateBracket) {
+        gateBracket = { lo: (curGate + gateBracket.lo) / 2, hi: (curGate + gateBracket.hi) / 2 };
+      }
+    }
+
+    if (refinement.accepted > 0 && curEval) {
+      top = {
+        config: top.config, exit: curExit, gate: curGate,
+        cvScore: curScore,
+        cvWinrate: +avgOf(curEval.wins).toFixed(6),
+        cvSupport: +avgOf(curEval.foldSizes).toFixed(2),
+        _foldScores: curFolds, _sharpe: sharpe(curEval.returns), _n: curEval.returns.length,
+      };
+    }
+  }
+
   // board всё равно сортируем по score — для отчёта/аудита (gridSize, диагностика)
   board.sort((a, b) => b.cvScore - a.cvScore);
 
@@ -1026,6 +1235,7 @@ export async function train(
         errors: Object.fromEntries(errorTally),
       },
       calibration,
+      refinement: refineRounds > 0 ? refinement : null,
     },
   };
 

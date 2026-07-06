@@ -111,6 +111,10 @@ Hand-written per-asset grids are the expert path. The casual path is `PumpMatrix
 
 What deliberately **stays** constant: the certificate's α-levels (DSR 0.95 / PBO 0.10 / SPA 0.05 — statistical conventions; "tuning" the judge is how you overfit past it), the sanity clamps, and the dimensionless noise multipliers themselves. Constants don't disappear — they move up one level, from dimensional (percent, minutes) to scale-free, and the data supplies the scale.
 
+### Coarse-to-fine — the grid step must not hide the edge
+
+A coarse grid (×2–×4 between nodes) can miss a narrow profitable region entirely: if the true optimal `trailingTake` is 1.0 and the grid has [0.5, 2], `fit` honestly reports "no edge" while the edge sits *between the nodes*. `refineRounds` (default **2** in casual mode, 0 with an explicit grid) runs an iterative zoom after the coarse winner: geometric midpoints toward the neighboring nodes on every continuous exit axis (+ the momentum-gate threshold), one axis at a time, with brackets halving each round. Two guards keep the finer step from becoming an overfitting machine: a move is accepted only when the improvement **exceeds the winner's SE** (significance, not noise), and every evaluated variant is a real trial — it enters the board, so `innerTrials`/DSR/SPA see the *entire* search, including the zoom. The audit is serialized in `meta.refinement` (`{ rounds, evaluated, accepted }`); `nestedScore` is computed on the coarse grid only. Candles are cached for the whole `fit`, so refinement rounds re-label the winning clustering without re-hitting the exchange.
+
 Everything measured is serialized for audit:
 
 ```ts

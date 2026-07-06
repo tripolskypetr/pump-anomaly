@@ -19,8 +19,8 @@ export interface ProgressEvent {
   done: number;
   /** всего единиц в текущей фазе */
   total: number;
-  /** метка фазы: "label" (разметка свечами) | "score" (grid-скоринг) */
-  phase: "label" | "score" | "nested";
+  /** метка фазы: "label" (разметка) | "score" (grid) | "nested" (CV) | "refine" (уточнение шага) */
+  phase: "label" | "score" | "nested" | "refine";
   /** что сейчас обрабатывается (символ/ключ кластеризации) — для контекста */
   label: string;
 }

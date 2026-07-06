@@ -315,6 +315,16 @@ interface OutcomePrediction {
     /** E[pnl|x] = pWin·meanWin + (1−pWin)·meanLoss, доли */
     expectedPnl: number;
     informative: boolean;
+    /**
+     * РАЗМЕР ПОЗИЦИИ: рекомендуемая доля банкролла (0..1), четверть-Келли.
+     * Полный Келли f* = p/|meanLoss| − (1−p)/meanWin оптимален только при ТОЧНЫХ
+     * параметрах; оценки из ~100 сделок шумные, а перебор Келли наказывается
+     * экспоненциально (2×Келли = нулевой рост). Четверть — стандартная конвенция
+     * защиты от ошибки оценивания (как 1.96 для 95%), не подгоночный параметр.
+     * Кап 1.0 = «не больше банкролла» (советов с плечом не даём). 0 при E[pnl] ≤ 0.
+     * Раньше sizing был магической константой НА СТОРОНЕ пользователя.
+     */
+    recommendedRiskFrac: number;
 }
 declare function predictOutcome(model: OutcomeModel, features: Record<string, number | null | undefined>): OutcomePrediction;
 
@@ -1168,11 +1178,14 @@ interface TradeSignal {
      * ПРОГНОЗ модели исхода: калиброванная P(win) и ожидаемый pnl (доли, нетто).
      * informative=false = модель не побила prior по OOF-Brier — pWin равен prior,
      * не притворяясь точнее данных. null = модель не обучалась (мало сделок).
+     * recommendedRiskFrac — доля банкролла под позицию (четверть-Келли, 0..1;
+     * 0 при E[pnl] ≤ 0): sizing перестаёт быть магической константой пользователя.
      */
     probability?: {
         pWin: number;
         expectedPnl: number;
         informative: boolean;
+        recommendedRiskFrac: number;
     } | null;
     /** происхождение (аудит), не для ветвления */
     origin: SignalOrigin;
@@ -2242,6 +2255,54 @@ declare class PumpMatrix {
 }
 
 /**
+ * КАПИТАЛЬНАЯ ОДНОВРЕМЕННОСТЬ — последняя крупная нечестность бэктеста.
+ *
+ * Σpnl всех сделок предполагает бесконечный капитал: пампы кластеризуются во
+ * времени (каскады библиотека сама детектит), и в плотный час может открыться
+ * 5 сигналов при капитале на 1–2 позиции. Реальный доход — pnl сделок, которые
+ * УСПЕЛИ взять, а не всех подряд.
+ *
+ * Симуляция ЧЕСТНАЯ (жадная хронологическая): позиция занимает слот от входа до
+ * выхода; сигнал при заполненных слотах пропускается — открытую позицию нельзя
+ * вытеснить задним числом. Единственное место, где уместен выбор, — несколько
+ * сигналов В ОДИН момент на меньшее число слотов: там ранжируем по priority
+ * (E[pnl] модели исхода — прогноз вероятности впервые ЗАРАБАТЫВАЕТ, а не только
+ * фильтрует). Знать будущее (какая из позиций окажется лучше) симуляция не может.
+ */
+interface CapitalTrade {
+    /** время входа, мс */
+    ts: number;
+    /** длительность позиции, минут (слот занят [ts, ts + heldMinutes·60000)) */
+    heldMinutes: number;
+    /** реализованный pnl, доли */
+    pnl: number;
+    /** приоритет при одновременном прибытии (E[pnl] модели исхода); null = нет прогноза */
+    priority?: number | null;
+}
+interface CapitalSimResult {
+    /** лимит слотов, под который считалось (null = без ограничения, чистый замер спроса) */
+    maxConcurrentPositions: number | null;
+    /** пиковый СПРОС на слоты: сколько позиций было бы открыто одновременно без лимита */
+    demandPeak: number;
+    /** взято сделок / пропущено из-за занятых слотов */
+    taken: number;
+    skipped: number;
+    /** pnl взятых сделок, хронологически */
+    pnls: number[];
+    stats: PnlStats;
+    sharpe: number;
+    /** Σpnl без ограничения (бумажная сумма «бесконечного капитала») */
+    sumUnconstrained: number;
+    /** Σpnl взятых сделок (что реально снимет капитал с этим лимитом) */
+    sumConstrained: number;
+}
+/**
+ * Жадная симуляция очереди слотов. trades в любом порядке — сортируются по ts;
+ * при равном ts первым берётся больший priority (модель исхода ранжирует).
+ */
+declare function simulateCapital(trades: CapitalTrade[], maxConcurrentPositions?: number | null): CapitalSimResult;
+
+/**
  * WALK-FORWARD — единственный честный ответ на «будет ли это зарабатывать».
  *
  * Nested CV оценивает конфиг на перестановках ОДНОЙ выборки; walk-forward
@@ -2291,6 +2352,16 @@ interface WalkForwardResult {
         /** сколько блоков были «зелёными» */
         slicesUsed: number;
     };
+    /**
+     * КАПИТАЛЬНАЯ ОДНОВРЕМЕННОСТЬ: Σpnl выше предполагает бесконечный капитал —
+     * пампы кластеризуются, и в плотный час открылось бы больше позиций, чем есть
+     * слотов. Здесь та же OOS-цепочка прогнана через жадную очередь слотов
+     * (opts.maxConcurrentPositions; без опции лимит=∞ — тогда это чистый замер
+     * СПРОСА: demandPeak говорит, сколько параллельных позиций подразумевает Σpnl).
+     * sumUnconstrained − sumConstrained = сколько бумажного дохода недоступно
+     * при твоём капитале.
+     */
+    capital: CapitalSimResult;
 }
 interface WalkForwardOptions {
     /** число тестовых блоков (история делится на slices+1 частей; первая — только обучение) */
@@ -2308,6 +2379,14 @@ interface WalkForwardOptions {
      * По умолчанию = max(staleMinutes грида) — горизонт жизни самой долгой сделки.
      */
     embargoMinutes?: number;
+    /**
+     * Сколько позиций твой капитал держит ОДНОВРЕМЕННО. Включает честную симуляцию
+     * очереди слотов (result.capital): сигнал при заполненных слотах пропускается,
+     * при одновременном прибытии первым берётся больший E[pnl] модели исхода.
+     * Не задано = ∞ (старое поведение Σpnl), но result.capital.demandPeak всё равно
+     * покажет, сколько параллельных позиций эта сумма молча предполагает.
+     */
+    maxConcurrentPositions?: number;
 }
 declare function walkForward(items: ParserItem[], getCandles: GetCandles, opts?: WalkForwardOptions): Promise<WalkForwardResult>;
 
@@ -2347,12 +2426,33 @@ interface EdgeAssessment {
     summary: string;
     /** конкретные следующие действия, по одному на строку */
     nextSteps: string[];
+    /**
+     * ПЛАЦЕБО-КОНТРОЛЬ (opts.placebo: true): тот же walk-forward, но время постов
+     * каждого канала сдвинуто назад на детерминированный лаг — информация постов
+     * уничтожена, свойства рынка сохранены. Если плацебо не хуже реального прогона,
+     * «эдж» объясняется рынком, не постами: вердикт "trade" понижается до "paper".
+     * null = контроль не запускался.
+     */
+    placebo?: {
+        stats: PnlStats;
+        sharpe: number;
+        trades: number;
+        /** true = реальный прогон ЗНАЧИМО лучше плацебо (эдж именно в постах) */
+        beatsPlacebo: boolean;
+        note: string;
+    } | null;
 }
 interface AssessOptions {
     /** опции обучения (grid/costs/mode/…) — общие для срезов walk-forward и финального fit */
     trainOptions?: TrainOptions;
     /** опции walk-forward (slices/policy/embargo/…) */
     walkForward?: Omit<WalkForwardOptions, "trainOptions">;
+    /**
+     * Прогнать плацебо-контроль (сдвинутые ts постов, см. placeboItems). Удваивает
+     * время оценки, но отвечает на вопрос, который DSR/PBO не закрывают: эдж в
+     * ПОСТАХ или в рынке. При placebo ≥ реального вердикт "trade" не выдаётся.
+     */
+    placebo?: boolean;
 }
 declare function assessEdge(items: ParserItem[], getCandles: GetCandles, opts?: AssessOptions): Promise<EdgeAssessment>;
 
@@ -2399,6 +2499,90 @@ interface ItemsReport {
 declare function inspectItems(items: ParserItem[]): ItemsReport;
 
 /**
+ * PAPER TRADER — замыкание петли «прогноз → реальность».
+ *
+ * Сертификат говорит про прошлое; каналы умирают, боты меняют расписание, и
+ * модель протухает МОЛЧА — форвард-результаты медленно расходятся с обученным
+ * распределением, а глазами это видно только после серии убытков. Этот модуль
+ * копит форвардные сделки (бумага или реальные) и непрерывно сравнивает их с
+ * baseline-распределением pnl из обучения (params.history — реализованные
+ * сделки выбранной конфигурации, сериализуются в model.json):
+ *
+ *  1. CUSUM на стандартизованном pnl — детектор СДВИГА СРЕДНЕЙ вниз. Замечает
+ *     деградацию задолго до того, как она видна в скользящей средней: каждая
+ *     сделка хуже ожидания добавляет в кумулятивную сумму, серия слабых сделок
+ *     пробивает порог. Константы k=0.5σ (allowance) и h=5σ (порог) — СТАНДАРТ
+ *     SPC-теста (ARL₀ ≈ 465 сделок между ложными тревогами), конвенция уровня
+ *     «1.96 для 95%», не подгоночный параметр.
+ *  2. Двухвыборочный тест Колмогорова–Смирнова: форвард-распределение против
+ *     train-распределения ЦЕЛИКОМ (не только средняя — хвосты, дисперсия,
+ *     асимметрия). p < 0.05 = «рынок уже не тот, на котором обучались».
+ *
+ * Это же замыкает cadence-гарду петлёй: не «прошло N дней — переобучись», а
+ * «дрейф обнаружен — переобучись СЕЙЧАС» / «дрейфа нет — модель живёт».
+ */
+interface ForwardTrade {
+    /** время сделки, мс */
+    ts: number;
+    /** реализованный НЕТТО pnl, доли (как в бэктесте: издержки вычтены) */
+    pnl: number;
+    symbol?: string;
+    channel?: string;
+}
+interface DriftReport {
+    /** форвардных сделок записано */
+    n: number;
+    /** сделок в baseline (история обучения) */
+    baselineN: number;
+    /** сработал хотя бы один детектор — модель торговать нельзя, переобучение */
+    alarm: boolean;
+    reasons: string[];
+    /** CUSUM сдвига средней вниз: stat в σ-единицах, порог h=5σ */
+    cusum: {
+        stat: number;
+        threshold: number;
+        fired: boolean;
+    };
+    /** KS форвард vs baseline; null = форварда мало для теста */
+    ks: {
+        stat: number;
+        pValue: number;
+        fired: boolean;
+    } | null;
+    meanForward: number;
+    meanBaseline: number;
+    /** сколько ещё сделок нужно до статистической значимости форвард-цепочки
+     *  (minTRL по самой форвард-цепочке); 0 = уже достаточно; null = SR ≤ 0 */
+    tradesToSignificance: number | null;
+    /** что делать — человеческим языком */
+    recommendation: string;
+}
+declare class PaperTrader {
+    private readonly baseline;
+    private forward;
+    /**
+     * @param baseline модель (PumpMatrix/TrainedParams — возьмётся history вошедших
+     *   сделок) или готовый массив pnl (доли) train-распределения
+     */
+    constructor(baseline: number[] | TrainedParams | PumpMatrix);
+    /** записать форвардную сделку (бумага или реальная), pnl НЕТТО в долях */
+    record(trade: ForwardTrade): void;
+    get trades(): ForwardTrade[];
+    /** сериализация форвард-журнала (baseline живёт в model.json, его не дублируем) */
+    save(): string;
+    static load(json: string, baseline: number[] | TrainedParams | PumpMatrix): PaperTrader;
+    /** текущий вердикт дрейфа: CUSUM (сдвиг средней) + KS (форма распределения) */
+    status(): DriftReport;
+}
+
+/**
+ * Плацебо-версия parser-items: ts каждого канала сдвинут назад на его
+ * детерминированный лаг (3–14 дней, с точностью до минуты). Остальные поля
+ * (symbol, direction, зоны входа) не трогаются.
+ */
+declare function placeboItems(items: ParserItem[]): ParserItem[];
+
+/**
  * Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор
  * (null-строки, нечисловой ts, невалидное направление). Используется и predict,
  * и train: битая запись не должна молча искажать кластеризацию/разметку.
@@ -2420,5 +2604,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CANDLE_TIMEOUT_MS, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, withTimeout, zoneOffsetPct };
-export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CANDLE_TIMEOUT_MS, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PaperTrader, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, empiricalPoolK, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, exitProposalsFromPath, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, fitHawkesGraph, fitOutcomeModel, hawkesBurst, hawkesWeight, inspectItems, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, momentumPct, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, placeboItems, pnlStats, predict, predictOutcome, probabilityOfBacktestOverfitting, rangeFeatures, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, selfTuneLagDetail, sharpe, shrinkageExpectancy, silentProgress, simulateCapital, singleChannelSignals, skewness, squeezePressure, squeezePressureBefore, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, validateGetCandles, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache, withTimeout, zoneOffsetPct };
+export type { AdapterCheck, AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, CapitalSimResult, CapitalTrade, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, DriftReport, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, ForwardTrade, GetCandles, HawkesBurst, HawkesGraph, ICandleData, IsotonicLLR, ItemsReport, LabeledBurst, LagDetail, MetaLedgerState, MetaPolicy, OutcomeModel, OutcomePrediction, OutcomeRow, ParserItem, PathExitProposals, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalExplanation, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

@@ -728,6 +728,60 @@ wf.maxDrawdown;                  // просадка OOS-кривой
 wf.certifiedOnly.stats;          // режим «торгуем только при certified=true»
 ```
 
+### Capital concurrency — the last big backtest lie
+
+`Σpnl` of all trades silently assumes infinite capital. Pumps **cluster in time** (the library detects the cascades itself), so a dense hour can open 5 positions when your capital holds 1–2. Real income is the pnl of the trades you *managed to take*:
+
+```ts
+const wf = await walkForward(history, getCandles, { slices: 6, maxConcurrentPositions: 2 });
+wf.capital.demandPeak;        // сколько параллельных позиций молча предполагал Σpnl
+wf.capital.skipped;           // сигналов пропущено из-за занятых слотов
+wf.capital.sumConstrained;    // что реально снимет капитал с этим лимитом
+wf.capital.sumUnconstrained;  // бумажная сумма бесконечного капитала
+```
+
+The simulation is honest-greedy: a position occupies a slot from entry to exit and can't be evicted in hindsight; the only choice point is several signals arriving **at the same moment** onto fewer slots — there they're ranked by the outcome model's `E[pnl]` (the probability forecast finally *earns*, not just filters). Without the option the limit is ∞ (old `Σpnl` behavior), but `capital.demandPeak` still reports how many parallel positions that sum assumes. `assessEdge` surfaces both in its summary. Standalone: `simulateCapital(trades, maxConcurrent)`.
+
+### Placebo control — is the edge in the posts, or in the market?
+
+DSR/PBO/SPA protect against config-mining, but not against "do the posts matter at all": on a rising market any random-long generator "earns". `assessEdge(items, gc, { placebo: true })` runs the **same pipeline on the same candles with post-time information destroyed**: each channel's timestamps are shifted back by its own deterministic 3–14-day lag (intra-channel intervals preserved — the algo layers see the same posting mechanics; cross-channel co-occurrence broken — the matrix edge is placebo'd too; backward only — no look-ahead; no `Math.random` — reproducible).
+
+```ts
+const a = await assessEdge(history, getCandles, { placebo: true }); // 2× runtime
+a.placebo.beatsPlacebo;  // true = реальный прогон лучше и по медиане, и по Sharpe
+a.placebo.note;          // сравнение числами, человеческим языком
+```
+
+The rule is parameter-free: the placebo that isn't worse **is** the threshold. If it isn't beaten, the `"trade"` verdict is impossible — the "edge" is market drift, not information. Standalone: `placeboItems(items)`.
+
+### PaperTrader — the model rots silently, this hears it
+
+The certificate speaks about the past; channels die and bots change schedules. `PaperTrader` accumulates forward trades (paper or real) and continuously compares them with the trained pnl distribution (`params.history`, already serialized in model.json):
+
+```ts
+const pt = new PaperTrader(model);                    // baseline из history модели
+pt.record({ ts: Date.now(), pnl: -0.004, symbol });   // каждая форвардная сделка
+const s = pt.status();
+s.alarm;            // true = не торговать, переобучаться СЕЙЧАС
+s.cusum;            // сдвиг средней вниз (стандарт SPC: k=0.5σ, h=5σ, ARL₀≈465)
+s.ks;               // Колмогоров–Смирнов: форма распределения «не тот рынок»
+s.tradesToSignificance; // сколько сделок осталось копить до значимости форварда
+s.recommendation;   // что делать, человеческим языком
+localStorage.setItem("pt", pt.save());                // журнал переживает сессию
+```
+
+CUSUM catches a **mean downshift** long before it's visible by eye (a series of below-expectation trades accumulates); KS catches a **shape change** (fatter tails, different variance) even with the mean intact. This closes the cadence-guard loop: not "N days passed — refit" but "drift detected — refit now" / "no drift — the model lives". The CUSUM constants are SPC test conventions (like 1.96 for 95%), not tuning knobs.
+
+### Position sizing — quarter-Kelly in every signal
+
+Sizing used to be a magic constant *on the user's side*. Now every signal with an outcome model carries it:
+
+```ts
+signal.probability.recommendedRiskFrac; // доля банкролла под позицию, 0..1
+```
+
+Full Kelly `f* = p/|meanLoss| − (1−p)/meanWin` is optimal only under exact parameters; estimates from ~100 trades are noisy, and over-betting Kelly is punished exponentially (2× Kelly = zero growth). Quarter-Kelly is the standard estimation-error discount (a convention, like 1.96). Capped at 1.0 — no leverage advice; `0` when `E[pnl] ≤ 0`.
+
 ### PnL (outlier-robust)
 
 Realized-pnl statistics complement the mean with the median and percentiles, so a single bad (or single fat) trade doesn't define the system's edge:

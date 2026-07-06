@@ -2,6 +2,7 @@ import { Direction } from "./types";
 import { GetCandles, entryStartTs, ICandleData } from "./candle";
 import { fetchCandlesChunked } from "./chunked-candles";
 import { ExitParams, replayExit, ReplayResult } from "./replay";
+import { volRegimeOf } from "./volume";
 
 /**
  * Размеченный всплеск: реализованный PnL по prod-выходу для каждого набора
@@ -83,9 +84,32 @@ export async function labelBurst(
   const from = entryFromPrice ?? candles[0].open;
   const to = entryToPrice ?? candles[0].open;
 
+  // ── МЕМОИЗАЦИЯ replay: grid перемножает оси, не влияющие на путь сделки ──
+  // volZThreshold влияет ТОЛЬКО на метку volRegime = volRegimeOf(volZ, vz) — она
+  // выводится из уже посчитанного volZ без повторного replay. Для inert-политик
+  // (none/ignore, каскад не читается) squeezeThreshold не используется вовсе, а
+  // none и ignore ведут себя идентично. Без мемо каждый такой дубль гонял полный
+  // проход по ~1500 свечам заново — кратный CPU без единого нового бита информации.
+  const inertPol = (p?: string) => p == null || p === "none" || p === "ignore";
+  const pathKey = (p: ExitParams): string => {
+    const pol = inertPol(p.squeezePolicy) ? "inert" : p.squeezePolicy;
+    const sqt = pol === "inert" ? "_" : (p.squeezeThreshold ?? "_");
+    return `${p.trailingTake}|${p.hardStop}|${p.stalenessSinceProfit}|${p.stalenessSinceMinutes}|${p.staleMinutes}` +
+      `|${p.volBaselineWindow ?? "_"}|${p.cascadeWindowMinutes ?? "_"}|${p.tightenFactor ?? "_"}|${p.roundTripCostPct ?? "_"}|${pol}|${sqt}`;
+  };
+  const memo = new Map<string, ReplayResult>();
   const byExit = new Map<string, ReplayResult>();
   for (const ex of exitSets) {
-    const r = replayExit(candles, direction, from, to, ex);
+    const mk = pathKey(ex);
+    let base = memo.get(mk);
+    if (!base) {
+      base = replayExit(candles, direction, from, to, ex);
+      memo.set(mk, base);
+    }
+    // volRegime зависит от volZThreshold данного набора — выводим из общего volZ
+    // (та же формула, что внутри replayExit; результат побитово эквивалентен).
+    const regime = volRegimeOf(base.volZ, ex.volZThreshold ?? 2.0);
+    const r = regime === base.volRegime ? base : { ...base, volRegime: regime };
     // отбрасываем метку с НЕПОЛНЫМ горизонтом: в боковике вход случился поздно,
     // и после него не хватило свечей на полный life-cap. Иначе 24ч-горизонт
     // сравнивался бы с 1ч-горизонтом по обрезанному до пары часов пути — это

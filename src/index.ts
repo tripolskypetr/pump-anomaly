@@ -1,9 +1,12 @@
 import {
+  AuthorMap,
   DEFAULT_CONFIG,
   DetectorConfig,
   ParserItem,
   PredictionResult,
+  PumpVerdict,
   SignalEvent,
+  ViabilityReport,
 } from "./types";
 import { buildTable, buildWindowedTable } from "./core/event-table";
 import { selfTuneLag } from "./layers/self-tune-lag";
@@ -71,17 +74,38 @@ export function predict(
   const tau = selfTuneLag(tbl);
   const window = Math.min(cfg.windowK * tau, cfg.maxBurstWindowMs);
 
-  const screened = jaccardScreen(tbl, window, cfg.jaccardThreshold);
-  const directed = lagXCorr(tbl, screened, cfg.lagPeakThreshold, window);
-  const authors = clusterAuthors(tbl.channels, directed);
-  const matrixVerdicts = earlyWarning(tbl, authors, cfg, tau);
+  // В ФОРС-single матричный конвейер НЕ гоняем: jaccardScreen O(C²·events) +
+  // lagXCorr + кластеризация считались и выбрасывались на каждом live-вызове
+  // (обученная single-модель платила за мёртвую корреляцию). Авторы — тривиально
+  // независимые каналы; viability — честная заглушка «не оценивалась», а не
+  // результат вычисления, которое никто не читает.
+  let authors: AuthorMap;
+  let matrixVerdicts: PumpVerdict[];
+  let viability: ViabilityReport;
+  if (cfg.mode === "single") {
+    authors = new Map(tbl.channels.map((c, i) => [c, i]));
+    matrixVerdicts = [];
+    viability = {
+      viable: false,
+      channels: tbl.channels.length,
+      maxSharedEvents: 0,
+      strongEdges: 0,
+      multiChannelClusters: 0,
+      clusterCount: tbl.channels.length,
+      reason: "mode=single задан явно — матрица авторства не оценивалась",
+    };
+  } else {
+    const screened = jaccardScreen(tbl, window, cfg.jaccardThreshold);
+    const directed = lagXCorr(tbl, screened, cfg.lagPeakThreshold, window);
+    authors = clusterAuthors(tbl.channels, directed);
+    matrixVerdicts = earlyWarning(tbl, authors, cfg, tau);
+    // оценка жизнеспособности матрицы (строгий критерий: явные кластеры + перекрытие)
+    viability = assessViability(tbl, directed, authors, {
+      ...DEFAULT_VIABILITY,
+      ...cfg.viability,
+    });
+  }
   const matrixOpens = matrixVerdicts.filter((v) => v.action === "open");
-
-  // оценка жизнеспособности матрицы (строгий критерий: явные кластеры + перекрытие)
-  const viability = assessViability(tbl, directed, authors, {
-    ...DEFAULT_VIABILITY,
-    ...cfg.viability,
-  });
 
   // ── разрешение режима ──
   let usedMode: "matrix" | "single";

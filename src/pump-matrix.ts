@@ -19,6 +19,7 @@ import {
   TrainResult,
 } from "./train";
 import { Certification } from "./statistics";
+import { MetaLedgerState } from "./meta-ledger";
 
 /**
  * Casual-фасад с ЕДИНЫМ стабильным контрактом ввода-вывода.
@@ -38,6 +39,7 @@ export class PumpMatrix {
   private constructor(
     private readonly params: TrainedParams,
     private readonly _predict: (items: ParserItem[]) => ReturnType<TrainResult["predict"]>,
+    private readonly _ledger: MetaLedgerState | null = null,
   ) {}
 
   /** Обучить модель на истории сигналов. */
@@ -47,7 +49,17 @@ export class PumpMatrix {
     opts?: TrainOptions,
   ): Promise<PumpMatrix> {
     const res = await train(history, getCandles, opts);
-    return new PumpMatrix(res.params, res.predict);
+    return new PumpMatrix(res.params, res.predict, res.ledger);
+  }
+
+  /**
+   * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей (null у моделей из load() —
+   * они не результат обучения). Сохрани его и передай в opts.metaLedger следующего
+   * fit: тогда cadence-guard реально запрещает частый refit, а DSR дефлируется по
+   * всей цепочке попыток, а не только по текущему гриду.
+   */
+  get ledgerAfterFit(): MetaLedgerState | null {
+    return this._ledger;
   }
 
   /** Восстановить модель из сохранённого JSON (в проде, без обучения). */

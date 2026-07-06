@@ -20,7 +20,10 @@ import { ExitTensor } from "./exit-tensor";
 import { SignalPolicy, DEFAULT_POLICY } from "./signal";
 import { shrinkageExpectancy, winrate, riskRewardStats, RiskRewardStats, oneStandardErrorSelect, pnlStats, PnlStats } from "./objective";
 import { certifyStrategy, Certification, sharpe, variance } from "./statistics";
-import { MetaLedgerState, effectiveTrials, fitAttemptCount } from "./meta-ledger";
+import {
+  MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
+  canRefit, recordAttempt, emptyLedger,
+} from "./meta-ledger";
 import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
@@ -110,11 +113,20 @@ export interface TrainOptions {
   /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
   selection?: Partial<SelectionConfig>;
   /**
-   * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан,
-   * DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам, а не
-   * только текущему. Без него (undefined) — поправки нет (одиночный fit, наивный N).
+   * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан:
+   *  1) CADENCE-GUARD ПРИМЕНЯЕТСЯ: train БРОСАЕТ, если с последней попытки прошло
+   *     меньше metaPolicy.minRefitMs (частый refit = размножение испытаний).
+   *     Раньше guard существовал только как экспорт — библиотека его не вызывала,
+   *     и «защита» работала лишь у тех, кто вручную собрал обвязку.
+   *  2) DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам.
+   * Обновлённый реестр (с записанной ЭТОЙ попыткой) возвращается в TrainResult.ledger —
+   * сохрани его и передай в следующий fit, иначе цепочка попыток рвётся.
    */
   metaLedger?: MetaLedgerState;
+  /** политика cadence-guard (интервал между fit). По умолчанию DEFAULT_META_POLICY (7 дней). */
+  metaPolicy?: MetaPolicy;
+  /** явное отключение cadence-guard (осознанный обход, например в тестах/ресёрче) */
+  ignoreCadence?: boolean;
   /**
    * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
    * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -246,6 +258,12 @@ export interface TrainResult {
     config: DetectorConfig; exit: ExitParams;
     cvScore: number; cvWinrate: number; cvSupport: number;
   }>;
+  /**
+   * Мета-реестр С ЗАПИСАННОЙ этой попыткой (цепочка стартует и без входного ledger).
+   * Сохрани и передай в opts.metaLedger следующего fit — иначе family-wise поправка
+   * DSR и cadence-guard не видят историю переобучений (мета-winner's-curse).
+   */
+  ledger: MetaLedgerState;
 }
 
 // ─────────────────────────── time-series K-fold ──────────────────────────────
@@ -274,6 +292,17 @@ export async function train(
   getCandles: GetCandles,
   opts: TrainOptions = {},
 ): Promise<TrainResult> {
+  // ── CADENCE-GUARD: реестр передан → правило «fit не чаще minRefitMs» ПРИМЕНЯЕТСЯ ──
+  // (а не просто экспортируется). Частое переобучение = размножение испытаний по
+  // времени; каждый «удачный» из сотен fit — кандидат в выброс. Осознанный обход —
+  // opts.ignoreCadence: true.
+  if (opts.metaLedger && !opts.ignoreCadence) {
+    const gate = canRefit(opts.metaLedger, Date.now(), opts.metaPolicy);
+    if (!gate.allowed) {
+      throw new Error(`cadence-guard: ${gate.reason} (nextAllowedTs=${gate.nextAllowedTs}; обойти: ignoreCadence)`);
+    }
+  }
+
   const grid: TrainGrid = { ...DEFAULT_GRID, ...opts.grid };
   const folds = opts.folds ?? 4;
   const shrinkageK = opts.shrinkageK ?? 5;
@@ -454,67 +483,128 @@ export async function train(
   // grid: детектор × exit, CV-score под K-fold
   // в single-режиме minClusters не применяется (всегда 1) — кандидаты уже все посты
   const minClusterAxis = effMode === "single" ? [1] : grid.minClusters;
+
+  // ── ДЕДУПЛИКАЦИЯ ИСПЫТАНИЙ: board хранит только различимые по результату конфиги ──
+  // Оси volZThreshold/volBaselineWindow не влияют на pnl replay (только на метку
+  // volRegime), а для inert-политик (none/ignore) squeezeThreshold/cascadeWindowMinutes
+  // не читаются вовсе. Раньше board хранил ПОЛНОЕ декартово произведение: на дефолтном
+  // гриде ~1.1М записей, большинство — буквальные копии. innerTrials лгал в DSR
+  // (поправка на перебор от фиктивного N), SPA/PBO/varSR считались по дублям, а
+  // память под массивы ретёрнов в каждой записи делала полный грид неисполнимым.
+  const inertPol = (p?: string) => p == null || p === "none" || p === "ignore";
+  const pnlKeyOf = (e: ExitParams): string => {
+    const base = `${e.trailingTake}|${e.hardStop}|${e.stalenessSinceProfit}|${e.stalenessSinceMinutes}|${e.staleMinutes}|${e.tightenFactor ?? "_"}|${e.roundTripCostPct ?? "_"}`;
+    return inertPol(e.squeezePolicy)
+      ? `${base}|inert`
+      : `${base}|${e.squeezePolicy}|${e.squeezeThreshold ?? "_"}|${e.cascadeWindowMinutes ?? "_"}`;
+  };
+  const scoringExits: ExitParams[] = [];
+  {
+    const seenPnl = new Set<string>();
+    for (const ex of exitSets) {
+      const k = pnlKeyOf(ex);
+      if (seenPnl.has(k)) continue;
+      seenPnl.add(k);
+      scoringExits.push(ex);
+    }
+  }
+  // детекторные комбо: в single-режиме jaccard/lag/stationarity не меняют labeled set
+  // (кэш один на wK) — канонические значения вместо перемножения дублей ×(jac·lag)
+  type DetCombo = { wK: number; jac: number; lag: number; sw: number };
+  const detCombos: DetCombo[] = [];
+  if (effMode === "single") {
+    for (const wK of grid.windowK)
+      detCombos.push({ wK, jac: grid.jaccardThreshold[0], lag: grid.lagPeakThreshold[0], sw: Infinity });
+  } else {
+    for (const wK of grid.windowK)
+      for (const jac of grid.jaccardThreshold)
+        for (const lag of grid.lagPeakThreshold)
+          for (const sw of swAxis) detCombos.push({ wK, jac, lag, sw });
+  }
+  const labeledFor = (d: DetCombo): Labeled[] =>
+    effMode === "single"
+      ? labeledCache.get(`single|${d.wK}`)!
+      : labeledCache.get(`${d.wK}|${d.jac}|${d.lag}|${d.sw}`)!;
+  // config-объекты интернируем: один на (комбо×minC), а не на каждую запись board
+  const cfgCache = new Map<string, DetectorConfig>();
+  const cfgFor = (d: DetCombo, minC: number): DetectorConfig => {
+    const k = `${d.wK}|${d.jac}|${d.lag}|${d.sw}|${minC}`;
+    let c = cfgCache.get(k);
+    if (!c) cfgCache.set(k, (c = cfgOf(d.wK, minC, d.jac, d.lag, maxBurstWindowMs, effMode, d.sw)));
+    return c;
+  };
+
   type Entry = {
     config: DetectorConfig; exit: ExitParams;
     cvScore: number; cvWinrate: number; cvSupport: number;
-    _foldMeans: number[]; _foldSizes: number[]; _returns: number[]; _foldScores: number[];
+    /** fold-скоры нужны 1-SE и PBO; тяжёлые массивы ретёрнов в записях НЕ храним */
+    _foldScores: number[];
+    _sharpe: number; _n: number;
   };
   const board: Entry[] = [];
 
-  // total для фазы score = число (wK×jac×lag×sw) комбинаций (тик на каждую)
-  const scoreTotal = grid.windowK.length * grid.jaccardThreshold.length
-    * grid.lagPeakThreshold.length * swAxis.length;
+  // полные fold-данные одного (config, exit) — НА ЗАПРОС (победитель, пул SPA,
+  // reliability), вместо материализации массивов ретёрнов во всех записях board.
+  type EvalDetail = {
+    foldScores: number[]; foldMeans: number[]; foldSizes: number[];
+    returns: number[]; wins: number[];
+  };
+  const evalSelection = (labeled: Labeled[], ekey: string, minC: number): EvalDetail => {
+    const selected = labeled
+      .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
+      .sort((a, b) => a.ts - b.ts);
+    const d: EvalDetail = { foldScores: [], foldMeans: [], foldSizes: [], returns: [], wins: [] };
+    if (selected.length === 0) return d;
+    for (const { valLo, valHi } of timeSeriesFolds(selected.length, folds)) {
+      const valRet = selected.slice(valLo, valHi).map((b) => b.byExit.get(ekey)!.pnl);
+      d.foldScores.push(shrinkageExpectancy(valRet, shrinkageK));
+      d.foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
+      d.wins.push(winrate(valRet));
+      d.foldSizes.push(valRet.length);
+      for (const r of valRet) d.returns.push(r);
+    }
+    return d;
+  };
+  const detailFor = (cfg: DetectorConfig, ex: ExitParams, keep: (ts: number) => boolean): EvalDetail =>
+    evalSelection(
+      labeledFor({ wK: cfg.windowK, jac: cfg.jaccardThreshold, lag: cfg.lagPeakThreshold, sw: cfg.stationarityWindowMs })
+        .filter((b) => keep(b.ts)),
+      exitKey(ex), cfg.minClusters,
+    );
 
-  // буримая функция скоринга: строит board по всем конфигам, учитывая только те
-  // размеченные всплески, что проходят keep(ts). keep=()=>true → весь board.
-  // onTick(label) вызывается после каждой (wK×jac×lag×sw)-комбинации (для прогресса).
+  // total для фазы score = число детекторных комбо (тик на каждое)
+  const scoreTotal = detCombos.length;
+
+  // буримая функция скоринга: строит board по всем УНИКАЛЬНЫМ конфигам, учитывая
+  // только те размеченные всплески, что проходят keep(ts). keep=()=>true → весь board.
   const buildBoard = (
     keep: (ts: number) => boolean,
     onTick?: (label: string) => void,
   ): Entry[] => {
     const out: Entry[] = [];
-    for (const wK of grid.windowK)
-      for (const jac of grid.jaccardThreshold)
-        for (const lag of grid.lagPeakThreshold)
-          for (const sw of swAxis) {
-            const labeled = (effMode === "single"
-              ? labeledCache.get(`single|${wK}`)!
-              : labeledCache.get(`${wK}|${jac}|${lag}|${sw}`)!
-            ).filter((b) => keep(b.ts));
-            for (const minC of minClusterAxis)
-              for (const ex of exitSets) {
-                const ekey = exitKey(ex);
-                const selected = labeled
-                  .filter((b) => b.independentClusters >= minC && b.byExit.has(ekey))
-                  .sort((a, b) => a.ts - b.ts);
-                const cfg = cfgOf(wK, minC, jac, lag, maxBurstWindowMs, effMode, sw);
-                if (selected.length === 0) {
-                  out.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0,
-                    _foldMeans: [], _foldSizes: [], _returns: [], _foldScores: [] });
-                  continue;
-                }
-                const foldSpecs = timeSeriesFolds(selected.length, folds);
-                const foldScores: number[] = [], foldMeans: number[] = [],
-                  foldWins: number[] = [], foldSupp: number[] = [], allRet: number[] = [];
-                for (const { valLo, valHi } of foldSpecs) {
-                  const valRet = selected.slice(valLo, valHi).map((b) => b.byExit.get(ekey)!.pnl);
-                  foldScores.push(shrinkageExpectancy(valRet, shrinkageK));
-                  foldMeans.push(valRet.length ? valRet.reduce((s, x) => s + x, 0) / valRet.length : 0);
-                  foldWins.push(winrate(valRet));
-                  foldSupp.push(valRet.length);
-                  for (const r of valRet) allRet.push(r);
-                }
-                const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
-                out.push({
-                  config: cfg, exit: ex,
-                  cvScore: +avg(foldScores).toFixed(6),
-                  cvWinrate: +avg(foldWins).toFixed(6),
-                  cvSupport: +avg(foldSupp).toFixed(2),
-                  _foldMeans: foldMeans, _foldSizes: foldSupp, _returns: allRet, _foldScores: foldScores,
-                });
-              }
-            onTick?.(`${wK}|${jac}|${lag}|${sw === Infinity ? "all" : sw}`);
+    for (const d of detCombos) {
+      const labeled = labeledFor(d).filter((b) => keep(b.ts));
+      for (const minC of minClusterAxis)
+        for (const ex of scoringExits) {
+          const cfg = cfgFor(d, minC);
+          const ev = evalSelection(labeled, exitKey(ex), minC);
+          if (ev.foldScores.length === 0) {
+            out.push({ config: cfg, exit: ex, cvScore: 0, cvWinrate: 0, cvSupport: 0, _foldScores: [], _sharpe: 0, _n: 0 });
+            continue;
           }
+          const avg = (a: number[]) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : 0);
+          out.push({
+            config: cfg, exit: ex,
+            cvScore: +avg(ev.foldScores).toFixed(6),
+            cvWinrate: +avg(ev.wins).toFixed(6),
+            cvSupport: +avg(ev.foldSizes).toFixed(2),
+            _foldScores: ev.foldScores,
+            _sharpe: sharpe(ev.returns),
+            _n: ev.returns.length,
+          });
+        }
+      onTick?.(`${d.wK}|${d.jac}|${d.lag}|${d.sw === Infinity ? "all" : d.sw}`);
+    }
     return out;
   };
 
@@ -596,44 +686,52 @@ export async function train(
     }
   }
 
+  // полные fold-данные победителя — один пересчёт по кэшу меток
+  const topDetail = detailFor(top.config, top.exit, () => true);
+
   const reliability = computeReliability(
-    { foldMeans: top._foldMeans, foldSizes: top._foldSizes, allReturns: top._returns },
+    { foldMeans: topDetail.foldMeans, foldSizes: topDetail.foldSizes, allReturns: topDetail.returns },
     { ...DEFAULT_RELIABILITY, ...opts.reliability },
   );
 
   // ── СЕРТИФИКАТ: математически доказуемый эдж, а не argmax по шуму ──
   // DSR (поправка на N испытаний) + PBO (CSCV-оверфит) + SPA (data-snooping) +
   // minTRL (достаточность выборки) + nested OOS. certified=true только если эдж
-  // переживает ВСЕ барьеры. Это и отличает реальный эдж от выброса.
+  // переживает ВСЕ барьеры. board дедуплицирован → пулы SPA/PBO и varSR считаются
+  // по УНИКАЛЬНЫМ конфигам, а не по копиям одного и того же (копии сужали
+  // бутстрэп-нулл SPA и занижали varSR → сертификат был оптимистичнее заявленного).
+  // Кап top-50/top-30 остаётся: полный пул вычислительно неподъёмен для бутстрэпа —
+  // это задокументированное приближение, а не тайное.
   const candPool = board
-    .filter((e) => e._returns.length > 0)
+    .filter((e) => e._n > 0)
     .slice(0, 50)
-    .map((e) => e._returns);
+    .map((e) => detailFor(e.config, e.exit, () => true).returns);
   // perf-матрица для PBO: топ-конфиги × их fold-scores (нужно чётное число фолдов)
   const perfRows = board
     .filter((e) => e._foldScores.length >= 2)
     .slice(0, 30)
     .map((e) => e._foldScores.slice(0, e._foldScores.length - (e._foldScores.length % 2)));
   const evenFolds = perfRows.length && perfRows.every((r) => r.length === perfRows[0].length && r.length >= 2);
-  // дисперсия Sharpe ПО испытаниям (планка случайности для DSR)
+  // дисперсия Sharpe ПО испытаниям (планка случайности для DSR) — по уникальным
   const trialSharpes = board
-    .filter((e) => e._returns.length >= 2)
-    .map((e) => sharpe(e._returns));
+    .filter((e) => e._n >= 2)
+    .map((e) => e._sharpe);
   const varSR = variance(trialSharpes);
 
-  // эффективное число испытаний: family-wise по ВСЕМ fit-попыткам (мета-curse),
-  // а не только текущему гриду. Без metaLedger — наивный board.length (одиночный fit).
+  // эффективное число испытаний: family-wise по ВСЕМ fit-попыткам (мета-curse).
+  // board.length теперь = числу РАЗЛИЧИМЫХ конфигов (дубликаты осей, не влияющих
+  // на pnl, не считаются испытаниями — они не добавляют шанса поймать шум).
   const innerTrials = Math.max(board.length, 1);
   const nTrialsEff = opts.metaLedger
     ? effectiveTrials(opts.metaLedger, innerTrials)
     : innerTrials;
 
   const certification = certifyStrategy({
-    selectedReturns: top._returns,
+    selectedReturns: topDetail.returns,
     nTrials: nTrialsEff,
     varSRAcrossTrials: varSR,
     perfMatrix: evenFolds ? perfRows : [],
-    candidateReturns: candPool.length ? candPool : [top._returns],
+    candidateReturns: candPool.length ? candPool : [topDetail.returns],
     nestedScore,
   });
 
@@ -670,8 +768,12 @@ export async function train(
     return best?.ex ?? null;
   };
 
+  // ЧЕСТНО про уровень byMode: обучение видит данные только ОДНОГО режима (effMode),
+  // отдельного «уровня режима» в данных не существует — byMode заполняется global-exit
+  // для обоих режимов. Раньше это маскировалось вторым идентичным вызовом pickExit
+  // (тяжёлый проход по всем exit-наборам ради того же результата), отчего уровень
+  // выглядел самостоятельно обученным. resolveExit(source="mode") = global по данным.
   const globalExit = pickExit(winSelected) ?? top.exit;
-  const modeExit = pickExit(winSelected) ?? globalExit;
 
   // bySymbolDir: схлопнут volRegime
   const bySymbolDir: Record<string, Partial<Record<"long" | "short", ExitParams>>> = {};
@@ -723,7 +825,7 @@ export async function train(
       matrix: effMode === "matrix" ? bySymbolDir : emptySD,
       single: effMode === "single" ? bySymbolDir : emptySD,
     },
-    byMode: { matrix: modeExit, single: modeExit },
+    byMode: { matrix: globalExit, single: globalExit },
     global: globalExit,
   };
 
@@ -813,7 +915,16 @@ export async function train(
     ({ config, exit, cvScore, cvWinrate, cvSupport }) =>
       ({ config, exit, cvScore, cvWinrate, cvSupport }),
   );
-  return { predict: loadPredict(params), params, reliability, leaderboard };
+
+  // реестр С ЭТОЙ попыткой: цепочка учёта переобучений стартует даже без входного
+  // ledger — вызывающему остаётся сохранить и передать в следующий fit.
+  const ledger = recordAttempt(opts.metaLedger ?? emptyLedger(), {
+    ts: params.meta.trainedAt,
+    innerTrials,
+    certifiedNaive: certification.certified,
+  });
+
+  return { predict: loadPredict(params), params, reliability, leaderboard, ledger };
 }
 
 function cfgOf(

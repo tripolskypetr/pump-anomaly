@@ -1109,11 +1109,20 @@ interface TrainOptions {
     /** настройка выбора конфигурации: SE-коридор + nested-CV (см. selection.ts) */
     selection?: Partial<SelectionConfig>;
     /**
-     * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан,
-     * DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам, а не
-     * только текущему. Без него (undefined) — поправки нет (одиночный fit, наивный N).
+     * Мета-реестр прошлых fit-попыток (против МЕТА-winner's-curse). Если передан:
+     *  1) CADENCE-GUARD ПРИМЕНЯЕТСЯ: train БРОСАЕТ, если с последней попытки прошло
+     *     меньше metaPolicy.minRefitMs (частый refit = размножение испытаний).
+     *     Раньше guard существовал только как экспорт — библиотека его не вызывала,
+     *     и «защита» работала лишь у тех, кто вручную собрал обвязку.
+     *  2) DSR использует эффективное число испытаний = Σ конфигов по ВСЕМ fit-ам.
+     * Обновлённый реестр (с записанной ЭТОЙ попыткой) возвращается в TrainResult.ledger —
+     * сохрани его и передай в следующий fit, иначе цепочка попыток рвётся.
      */
     metaLedger?: MetaLedgerState;
+    /** политика cadence-guard (интервал между fit). По умолчанию DEFAULT_META_POLICY (7 дней). */
+    metaPolicy?: MetaPolicy;
+    /** явное отключение cadence-guard (осознанный обход, например в тестах/ресёрче) */
+    ignoreCadence?: boolean;
     /**
      * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
      * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -1242,6 +1251,12 @@ interface TrainResult {
         cvWinrate: number;
         cvSupport: number;
     }>;
+    /**
+     * Мета-реестр С ЗАПИСАННОЙ этой попыткой (цепочка стартует и без входного ledger).
+     * Сохрани и передай в opts.metaLedger следующего fit — иначе family-wise поправка
+     * DSR и cadence-guard не видят историю переобучений (мета-winner's-curse).
+     */
+    ledger: MetaLedgerState;
 }
 /**
  * Обучает пороги детектора И параметры prod-выхода на исторических данных.
@@ -1269,9 +1284,17 @@ declare function loadPredict(params: TrainedParams): (items: ParserItem[]) => Pr
 declare class PumpMatrix {
     private readonly params;
     private readonly _predict;
+    private readonly _ledger;
     private constructor();
     /** Обучить модель на истории сигналов. */
     static fit(history: ParserItem[], getCandles: GetCandles, opts?: TrainOptions): Promise<PumpMatrix>;
+    /**
+     * Мета-реестр попыток fit С ЗАПИСАННОЙ текущей (null у моделей из load() —
+     * они не результат обучения). Сохрани его и передай в opts.metaLedger следующего
+     * fit: тогда cadence-guard реально запрещает частый refit, а DSR дефлируется по
+     * всей цепочке попыток, а не только по текущему гриду.
+     */
+    get ledgerAfterFit(): MetaLedgerState | null;
     /** Восстановить модель из сохранённого JSON (в проде, без обучения). */
     static load(json: string | TrainedParams): PumpMatrix;
     /** Сериализовать модель в JSON-строку (включая policy). */

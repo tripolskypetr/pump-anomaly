@@ -323,25 +323,17 @@ Two invariants keep this honest rather than dangerous:
 
 ### Meta-overfitting guard (`meta-ledger.ts`)
 
-Invariant 2 is **enforced in code**, not left to operator discipline. A serializable `MetaLedgerState` records *every* `fit` attempt (the loop's state between ticks), and two mechanisms close the meta-curse:
+Invariant 2 is **enforced in code**, not left to operator discipline. A serializable `MetaLedgerState` records *every* `fit` attempt (the loop's state between ticks), and two mechanisms close the meta-curse — both are **wired into `fit` itself** (an earlier version merely exported the guard functions and hoped the caller assembled the loop correctly; the default path had no protection at all):
 
-- **Cadence guard** — `canRefit(ledger, now, policy?)` refuses a `fit` that comes too soon after the last one (`minRefitMs`, default **1 week**). Frequent re-fitting *is* trial multiplication, so it is simply disallowed, with a human-readable `reason` and `nextAllowedTs`.
-- **Family-wise correction** — pass `metaLedger` to `fit` and DSR's N becomes `effectiveTrials` = Σ configs across **all** past attempts, not just the current grid. The denominator is honest only because **every** attempt is logged (`recordAttempt` stores `certifiedNaive: false` runs too) — logging only the successes would understate N and make the correction lie.
+- **Cadence guard** — pass `metaLedger` and `fit` **throws** if it comes sooner than `minRefitMs` after the last attempt (default **1 week**; `metaPolicy` to tune, `ignoreCadence: true` for a deliberate research override). Frequent re-fitting *is* trial multiplication, so it is simply disallowed.
+- **Family-wise correction** — with `metaLedger`, DSR's N becomes `effectiveTrials` = Σ configs across **all** past attempts, not just the current grid. The attempt (certified or not) is recorded automatically: `train()` returns the updated ledger in `TrainResult.ledger`, and `PumpMatrix.fit` exposes it as `model.ledgerAfterFit` — persist it and pass it to the next `fit`, that's the whole loop.
 
 ```ts
-import { emptyLedger, recordAttempt, canRefit, effectiveTrials } from "pump-anomaly";
-
-let ledger = emptyLedger();                       // persist between ticks (loop state)
-const gate = canRefit(ledger, Date.now());        // too-frequent refit? → { allowed, reason, nextAllowedTs }
-if (gate.allowed) {
-  const model = await PumpMatrix.fit(history, getCandles, { metaLedger: ledger });
-  ledger = recordAttempt(ledger, {                // log EVERY attempt, certified or not
-    ts: Date.now(),
-    innerTrials: model.innerTrials,          // grid size of this fit
-    certifiedNaive: model.certification.certified,
-  });
-  // model.effectiveTrials / model.fitAttempts expose the meta-trial count for audit
-}
+let ledger = loadLedgerFromDisk() ?? undefined;   // persist between ticks (loop state)
+const model = await PumpMatrix.fit(history, getCandles, { metaLedger: ledger });
+// ^ throws "cadence-guard: …" if the refit comes too soon — that's the point
+saveLedgerToDisk(model.ledgerAfterFit!);          // this attempt is already recorded
+// model.effectiveTrials / model.fitAttempts expose the meta-trial count for audit
 ```
 
 The guarantee is verified: 720 `fit` runs on pure noise produce false naive certificates, and the family-wise correction drops them to **0** — while a genuine 0.75σ edge survives the same correction (`meta-ledger.test.ts`). So the loop *cannot* "click" its way to a certificate by re-running, and the engine becomes safe-by-construction rather than safe-by-discipline.
@@ -505,7 +497,7 @@ model.reliable;              // did training have enough data
 model.confidence;            // 0..1 trust in the model
 model.certification;         // five-barrier edge certificate (DSR/PBO/SPA/minTRL/nested)
 model.effectiveTrials;       // family-wise meta-trial count (Σ configs over all fit attempts)
-model.innerTrials;           // grid size of this fit
+model.innerTrials;           // DISTINCT trials of this fit (grid axes that can't change the outcome — e.g. volZThreshold for pnl, squeezeThreshold under policy "none" — are deduplicated, so DSR's N counts real hypotheses, not cartesian copies)
 model.fitAttempts;           // how many times fit has run in the chain
 model.labeling;              // labeling diagnostics — WHY a fit came out empty
 model.impactHorizonMinutes;  // empirical post impact horizon (global level)

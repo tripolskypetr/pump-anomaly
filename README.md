@@ -41,8 +41,10 @@ The honest casual path starts with the verdict, not with signals:
 import { assessEdge, PumpMatrix } from "pump-anomaly";
 import * as fs from "fs";
 
-// 1) один вызов = fit + walk-forward + сертификат + решение
-const a = await assessEdge(history, getCandles, { trainOptions: { roundTripCostPct: 0.15 } });
+// 1) один вызов = fit + walk-forward + сертификат + решение; издержки — АВТО:
+//    спред измеряется из свечей (Корвин-Шульц), комиссия — табличный тейкер
+//    0.05%/сторона (свой тариф: trainOptions.takerFeePct)
+const a = await assessEdge(history, getCandles);
 console.log(a.verdict, a.reasons); // "trade" | "paper" | "no-edge" + почему
 
 if (a.verdict !== "no-edge") fs.writeFileSync("model.json", a.model.save());
@@ -134,7 +136,7 @@ model.calibration;
 //   reason: "шум 1m = 0.19% → hardStop [...]; покрытие p25 = 460м → staleMinutes [60, 240]" }
 ```
 
-A partial grid is expert mode: your axes always win, and calibration only fills the ones you left out if you pass `autoCalibrate: true` (with a full explicit grid nothing is calibrated — old behavior). The one number the data cannot know is your execution cost: pass `roundTripCostPct` yourself.
+A partial grid is expert mode: your axes always win, and calibration only fills the ones you left out if you pass `autoCalibrate: true` (with a full explicit grid nothing is calibrated — old behavior). Execution costs are auto too: the spread component is measured from the same sampled candles (Corwin-Schultz, `calibration.spreadPct`), and the only number the data truly cannot know — your commission — is a **table fact of your account**, not a tunable: `takerFeePct` (default 0.05%/side).
 
 ---
 
@@ -199,7 +201,7 @@ The training label comes from an **exact replay of your prod exit on 1m candles*
 - **peak staleness** — peak reached the profit threshold, but went stale for `stalenessSinceMinutes` without a new high. Also **realizes the current close** (which can be below the threshold or even negative), not the stale peak.
 - **life-cap** (`staleMinutes`) — ceiling on position lifetime = **empirical impact horizon**, tuned by the grid. Exits at the close of the last candle in the window (the realized pnl can be negative).
 - A stop-out realizes the **honest `-hardStop%`** — the actual result of the trade. The peak is kept separately for diagnostics, but the pnl is the loss. (An earlier version rolled the metric back to the last positive peak, which meant a stop-out never showed a loss and silently inflated pnl/RR — fixed.)
-- **Execution costs** — `TrainOptions.roundTripCostPct` (taker fees in+out plus slippage, % of notional; typically 0.1–0.3 on thin pump-coins) is stamped into every exit set: labels, CV selection and certification are all computed net of the real cost of trading, and the trained tensor carries it into prod replays. Default 0 (ideal fills) for backward compatibility — set it to your real costs, an edge that dies from fees is not an edge.
+- **Execution costs** — `TrainOptions.roundTripCostPct` is stamped into every exit set: labels, CV selection and certification are all computed net of the real cost of trading, and the trained tensor carries it into prod replays. **Not passed → derived automatically** (when calibration runs): `2×takerFeePct + spread`, where the effective spread is measured from your own candles by the Corwin-Schultz high/low estimator and the fee is your exchange's table number (`takerFeePct`, default 0.05%/side — perp taker on major venues). The old default 0 was the worst possible magic constant: ideal fills, systematic optimism. An explicit value always wins; explicit grid without `autoCalibrate` keeps the legacy 0.
 - **State-dependent slippage** — `TrainOptions.slippageRangeFrac`: a fraction of the *execution candle's range* charged against the position at entry and at exit. A constant cost underestimates pain exactly where it peaks: on the pump's signal candle and on the cascade candle the spread blows out together with the range, so a stop in a crash is automatically more expensive than a stop in quiet tape. Approximated as a pnl deduction (trigger levels unchanged); typically 0.05–0.2 depending on your size. Default 0.
 
 Why this catches stop hunts: a wick into the trap never reaches `trailingTake`, and the pullback hits the hard stop → the label is negative **even if** `close[t+H]` happens to be positive. Path-aware replay sees the whole OHLC path, not just two points, so the optimizer actually sees the risk of stops.

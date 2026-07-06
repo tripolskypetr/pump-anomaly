@@ -208,10 +208,19 @@ export interface TrainOptions {
   /**
    * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
    * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
-   * CV-отбор и сертификация считаются под РЕАЛЬНУЮ стоимость сделки, а не под
-   * идеальное исполнение. Типично 0.1–0.3 для тейкера на памп-коинах. Дефолт 0.
+   * CV-отбор и сертификация считаются под РЕАЛЬНУЮ стоимость сделки.
+   * НЕ ЗАДАНО + калибровка активна → АВТО: 2×takerFeePct + спред, измеренный из
+   * данных (Корвин-Шульц). Явное значение всегда главнее. Без калибровки — 0
+   * (старое поведение для явных гридов).
    */
   roundTripCostPct?: number;
+  /**
+   * Комиссия тейкера ЗА СТОРОНУ, % (тариф твоей биржи — табличное число, не
+   * подгонка). Используется АВТО-издержками: если roundTripCostPct не задан и
+   * калибровка измерила спред, round-trip = 2×takerFeePct + спред(Корвин-Шульц).
+   * Дефолт 0.05 (перпы Binance/Bybit/OKX, базовый тейкер). Спот-тариф — задай свой.
+   */
+  takerFeePct?: number;
   /**
    * STATE-DEPENDENT проскальзывание: доля диапазона свечи-исполнения против позиции
    * на входе и на выходе (см. ExitParams.slippageRangeFrac). Константная издержка
@@ -541,8 +550,18 @@ export async function train(
   // withCandleCache снаружи (walkForward) — двойная обёртка безвредна.
   const gcCached: GetCandles = withCandleCache(getCandles, 256);
 
+  // ── АВТО-ИЗДЕРЖКИ: спред из данных + табличная комиссия ──
+  // Дефолт «0» был худшей магической константой (идеальное исполнение,
+  // систематический оптимизм). Спред выводится из OHLC (Корвин-Шульц, замерен
+  // калибровкой на тех же свечах — ноль лишнего IO); комиссия из данных не
+  // выводима — это тариф аккаунта (takerFeePct, табличное число биржи).
+  const DEFAULT_TAKER_FEE_PCT = 0.05; // перпы Binance/Bybit/OKX, базовый тейкер, %/сторона
+  const takerFeePct = opts.takerFeePct ?? DEFAULT_TAKER_FEE_PCT;
+  const autoCostPct = calibration?.spreadPct != null
+    ? +(2 * takerFeePct + calibration.spreadPct).toFixed(4)
+    : null;
   // полный список exit-наборов (декартово произведение exit+volume осей)
-  const roundTripCostPct = opts.roundTripCostPct ?? 0;
+  const roundTripCostPct = opts.roundTripCostPct ?? autoCostPct ?? 0;
   const slippageRangeFrac = opts.slippageRangeFrac ?? 0;
   const exitSets: ExitParams[] = [];
   for (const tt of grid.trailingTake)

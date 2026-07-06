@@ -39,6 +39,12 @@ export interface Calibration {
   noisePct: number | null;
   /** p25 доступного форвард-покрытия от событий, минут; null = не измерено */
   forwardCoverageMinutes: number | null;
+  /**
+   * Эффективный СПРЕД, % (эстиматор Корвина-Шульца по high/low соседних свечей —
+   * классика микроструктуры для случая «тиков нет, есть OHLC»). Компонента
+   * авто-издержек: round-trip платит полный спред. null = не измерился.
+   */
+  spreadPct: number | null;
   /** сколько (symbol, ts)-точек реально просэмплировано */
   sampledEvents: number;
   /** какие оси заменены и на что (только заменённые) */
@@ -83,6 +89,34 @@ const percentile25 = (xs: number[]): number | null => {
   return s[Math.floor((s.length - 1) * 0.25)];
 };
 
+/**
+ * Эффективный спред по Корвину-Шульцу (2012): из high/low ДВУХ соседних свечей.
+ * Идея: диапазон одной свечи несёт и волатильность, и спред; диапазон объединения
+ * двух свечей — ту же волатильность (×2 времени), но тот же один спред. Разность
+ * решается аналитически:
+ *   β = ln²(H₁/L₁) + ln²(H₂/L₂),  γ = ln²(H₁₂/L₁₂)
+ *   α = (√(2β) − √β)/(3 − 2√2) − √(γ/(3 − 2√2)),  spread = 2(eᵅ−1)/(1+eᵅ)
+ * Отрицательные оценки клипятся в 0 (стандарт), итог — медиана по парам:
+ * на минутках одиночная пара шумна, медиана устойчива.
+ */
+function corwinSchultzSpreadPct(candles: import("./candle").ICandleData[]): number | null {
+  const vals: number[] = [];
+  const denom = 3 - 2 * Math.SQRT2;
+  for (let i = 1; i < candles.length; i++) {
+    const a = candles[i - 1];
+    const b = candles[i];
+    if (!(a.low > 0 && b.low > 0 && a.high >= a.low && b.high >= b.low)) continue;
+    const beta = Math.log(a.high / a.low) ** 2 + Math.log(b.high / b.low) ** 2;
+    const gamma = Math.log(Math.max(a.high, b.high) / Math.min(a.low, b.low)) ** 2;
+    const alpha = (Math.sqrt(2 * beta) - Math.sqrt(beta)) / denom - Math.sqrt(gamma / denom);
+    const sp = (2 * (Math.exp(alpha) - 1)) / (1 + Math.exp(alpha));
+    vals.push(Math.max(sp, 0));
+  }
+  if (vals.length < 30) return null;
+  vals.sort((x, y) => x - y);
+  return +(vals[Math.floor(vals.length / 2)] * 100).toFixed(6);
+}
+
 /** равномерная выборка событий по истории, с приоритетом разных символов */
 function sampleEvents(items: ParserItem[]): Array<{ symbol: string; ts: number }> {
   const valid = items
@@ -120,6 +154,7 @@ export async function calibrateGrid(
   const forwardProbe = Math.ceil(maxLife * 1.1) + 5;
 
   const perEventNoise: number[] = [];
+  const perEventSpread: number[] = [];
   const coverage: number[] = [];
 
   for (const s of samples) {
@@ -134,6 +169,8 @@ export async function calibrateGrid(
       }
       const m = median(rets);
       if (m !== null && m > 0) perEventNoise.push(m);
+      const sp = corwinSchultzSpreadPct(before);
+      if (sp !== null) perEventSpread.push(sp);
     } catch { /* точка пропущена */ }
     // покрытие: сколько свечей история реально отдаёт вперёд от события
     try {
@@ -143,6 +180,7 @@ export async function calibrateGrid(
   }
 
   const noisePct = median(perEventNoise);
+  const spreadPct = median(perEventSpread);
   const coverageP25 = percentile25(coverage);
 
   const axes: CalibrationAxes = {};
@@ -177,8 +215,12 @@ export async function calibrateGrid(
     notes.push("покрытие не измерилось — оси горизонтов остаются дефолтными");
   }
 
+  if (spreadPct !== null) notes.push(`спред (Корвин-Шульц) = ${spreadPct.toFixed(4)}%`);
+  else notes.push("спред не измерился — авто-издержки возьмут только комиссию");
+
   return {
     noisePct,
+    spreadPct,
     forwardCoverageMinutes: coverageP25,
     sampledEvents: samples.length,
     axes,

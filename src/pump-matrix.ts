@@ -116,11 +116,13 @@ export class PumpMatrix {
       allow, minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
       notionalQuote, maxLiquidityShare, minPWin, minExpectedPnlPct,
+      acknowledgeUncertified,
     } = this.params.policy;
     return {
       allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
       notionalQuote, maxLiquidityShare, minPWin, minExpectedPnlPct,
+      acknowledgeUncertified,
     };
   }
 
@@ -188,6 +190,29 @@ export class PumpMatrix {
    */
   get certification(): Certification {
     return this.params.meta.certification;
+  }
+
+  /**
+   * ВЕРДИКТ РАЗВЁРТЫВАНИЯ — почему live-методы отдают (или не отдают) сигналы:
+   *  - "trade"   — сертификат зелёный: signals()/plan() работают как есть;
+   *  - "paper"   — сертификат красный: live-методы пусты без acknowledgeUncertified
+   *                (осознанный форвард на бумаге/микро), причины в reasons;
+   *  - "unknown" — модель без сертификата в meta (legacy) — гейт не применяется.
+   */
+  get deployment(): { verdict: "trade" | "paper" | "unknown"; reasons: string[] } {
+    const cert = this.params.meta.certification;
+    if (cert === undefined) {
+      return { verdict: "unknown", reasons: ["сертификат отсутствует в meta (legacy model.json) — гейт не применяется"] };
+    }
+    return cert.certified
+      ? { verdict: "trade", reasons: ["сертификат зелёный (DSR/PBO/SPA/minTRL/nested)"] }
+      : {
+        verdict: "paper",
+        reasons: [
+          "сертификат красный — live-сигналы требуют acknowledgeUncertified (paper/микро-режим):",
+          ...cert.reasons,
+        ],
+      };
   }
 
   /**
@@ -560,6 +585,19 @@ export class PumpMatrix {
   ): TradeSignal | null {
     const ch = v.channel ?? "_matrix";
     const allow = new Set(policy.allow);
+
+    // ── ЧЕСТНОСТЬ ПО УМОЛЧАНИЮ: несертифицированная модель не торгует молча ──
+    // Путь fit→load→plan прикладного кодера не обязан включать walkForward —
+    // поэтому вердикт fit'а исполняется здесь: live-сигналы модели с красным
+    // сертификатом требуют явного acknowledgeUncertified (осознанный paper-режим).
+    // backtest/planForAt (mode="backtest") — исследование, не гейтятся; legacy-модели
+    // без сертификата в meta — тоже (нечем судить). Причины молчания: model.deployment.
+    if (
+      mode === "live" &&
+      this.params.meta.certification !== undefined &&
+      !this.params.meta.certification.certified &&
+      !policy.acknowledgeUncertified
+    ) return null;
 
     // ── АВТО-ТРИАЖ КАНАЛА (channelPlan из fit): drop/invert без участия оператора ──
     // "drop": канал значимо убыточен — сигнал не отдаётся. "invert": механический

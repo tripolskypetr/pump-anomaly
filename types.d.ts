@@ -1259,6 +1259,15 @@ interface SignalPolicy {
      * Тighten-only: max(trained, requested).
      */
     minExpectedPnlPct?: number;
+    /**
+     * ЯВНОЕ СОГЛАСИЕ торговать НЕсертифицированной моделью. Путь fit→load→plan
+     * по умолчанию честен: live-методы (signals/plan/planFor) модели с красным
+     * сертификатом отдают ПУСТО — недоказанный эдж не должен молча открывать
+     * позиции у прикладного кодера, скопировавшего Quick start. true = осознанный
+     * paper/микро-режим (форвард-валидация). backtest()/planForAt() не гейтятся
+     * (исследование прошлого). Модели без сертификата в meta (legacy) не гейтятся.
+     */
+    acknowledgeUncertified?: boolean;
 }
 declare const DEFAULT_POLICY: SignalPolicy;
 /**
@@ -1997,6 +2006,17 @@ declare class PumpMatrix {
      * не доказан — тогда модель торговать НЕ должна.
      */
     get certification(): Certification;
+    /**
+     * ВЕРДИКТ РАЗВЁРТЫВАНИЯ — почему live-методы отдают (или не отдают) сигналы:
+     *  - "trade"   — сертификат зелёный: signals()/plan() работают как есть;
+     *  - "paper"   — сертификат красный: live-методы пусты без acknowledgeUncertified
+     *                (осознанный форвард на бумаге/микро), причины в reasons;
+     *  - "unknown" — модель без сертификата в meta (legacy) — гейт не применяется.
+     */
+    get deployment(): {
+        verdict: "trade" | "paper" | "unknown";
+        reasons: string[];
+    };
     /**
      * Аудит автокалибровки casual-режима: измеренный шум 1m-свечей, доступное
      * форвард-покрытие, и какие оси грида были выведены из данных (с объяснением).

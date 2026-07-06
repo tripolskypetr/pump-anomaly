@@ -203,6 +203,15 @@ export interface SignalPolicy {
    * Тighten-only: max(trained, requested).
    */
   minExpectedPnlPct?: number;
+  /**
+   * ЯВНОЕ СОГЛАСИЕ торговать НЕсертифицированной моделью. Путь fit→load→plan
+   * по умолчанию честен: live-методы (signals/plan/planFor) модели с красным
+   * сертификатом отдают ПУСТО — недоказанный эдж не должен молча открывать
+   * позиции у прикладного кодера, скопировавшего Quick start. true = осознанный
+   * paper/микро-режим (форвард-валидация). backtest()/planForAt() не гейтятся
+   * (исследование прошлого). Модели без сертификата в meta (legacy) не гейтятся.
+   */
+  acknowledgeUncertified?: boolean;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -250,5 +259,8 @@ export function intersectPolicy(
     maxLiquidityShare: tightenMin(trained.maxLiquidityShare, requested?.maxLiquidityShare),
     minPWin: tightenMax(trained.minPWin, requested?.minPWin),
     minExpectedPnlPct: tightenMax(trained.minExpectedPnlPct, requested?.minExpectedPnlPct),
+    // согласие на несертифицированную модель — явное, любой стороной (это не
+    // ослабление обученной политики, а признание статуса модели вызывающим)
+    acknowledgeUncertified: (trained.acknowledgeUncertified || requested?.acknowledgeUncertified) || undefined,
   };
 }

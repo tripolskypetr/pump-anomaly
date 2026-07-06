@@ -147,7 +147,7 @@ describe("range-фича в модели исхода — anti-harvesting выу
     const sigs = m.plan([
       { channel: "ch", symbol: "TIGHTUSDT", direction: "long", ts: freshTs },
       { channel: "ch", symbol: "DEADUSDT", direction: "long", ts: freshTs },
-    ], dict);
+    ], dict, { acknowledgeUncertified: true });
     const tight = sigs.find((s) => s.symbol === "TIGHTUSDT")!;
     const dead = sigs.find((s) => s.symbol === "DEADUSDT")!;
     expect(tight.probability!.pWin).toBeGreaterThan(dead.probability!.pWin);

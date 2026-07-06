@@ -113,7 +113,7 @@ describe("single-режим — fallback работает из коробки", 
     const m = await PumpMatrix.fit(singleChannelData(), gc, { mode: "single", onProgress: silentProgress, grid: { ...smallGrid, minClusters: [1] } });
     expect(m.mode).toBe("single");
     expect(m.modeReason).toContain("single задан явно");
-    const sigs = m.signals(singleChannelData());
+    const sigs = m.signals(singleChannelData(), { acknowledgeUncertified: true });
     expect(Array.isArray(sigs)).toBe(true);
   });
 
@@ -196,7 +196,7 @@ describe("matrix — ЗАРАНЕЕ ИЗВЕСТНЫЙ кластер (стро�
   it("matrix fit ПРОВОДИТ известный кластер до торгового сигнала (board не пуст)", async () => {
     const m = await PumpMatrix.fit(data, gc, { mode: "matrix", onProgress: silentProgress, grid: smallGrid });
     expect(m.mode).toBe("matrix");
-    const sigs = m.signals(data);
+    const sigs = m.signals(data, { acknowledgeUncertified: true });
     // matrix реально выдал сигнал — не пустой board (иначе тест бы врал про "matrix работает")
     expect(sigs.length).toBeGreaterThanOrEqual(1);
     const sol = sigs.find((s) => s.symbol === "SOLUSDT");

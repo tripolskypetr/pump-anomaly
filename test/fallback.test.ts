@@ -85,7 +85,7 @@ describe("train — single-channel fallback может стать reliable", () 
     });
 
     expect(model.mode).toBe("single");
-    const plans = model.signals(items);
+    const plans = model.signals(items, { acknowledgeUncertified: true }); // research: модель не сертифицирована
     expect(plans.length).toBeGreaterThan(0);
     expect(plans.every((p) => p.origin.detector === "single")).toBe(true);
     // exit-план приложен

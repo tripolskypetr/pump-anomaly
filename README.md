@@ -35,23 +35,24 @@ npm install pump-anomaly
 
 ## Quick start
 
+The honest casual path starts with the verdict, not with signals:
+
 ```ts
-import { PumpMatrix } from "pump-anomaly";
+import { assessEdge, PumpMatrix } from "pump-anomaly";
 import * as fs from "fs";
 
-// 1) train once on history (the label comes from a replay of your prod exit)
-const model = await PumpMatrix.fit(history, getCandles);
-fs.writeFileSync("model.json", model.save());
+// 1) один вызов = fit + walk-forward + сертификат + решение
+const a = await assessEdge(history, getCandles, { trainOptions: { roundTripCostPct: 0.15 } });
+console.log(a.verdict, a.reasons); // "trade" | "paper" | "no-edge" + почему
+
+if (a.verdict !== "no-edge") fs.writeFileSync("model.json", a.model.save());
 
 // 2) in prod — no training needed
 const model = PumpMatrix.load(fs.readFileSync("model.json", "utf8"));
 
-// signals() returns ONLY what's executable — veto is already filtered out
-const trades = model.signals(liveItems);
-
-// plan() is the live decision (no look-ahead): adds volRegime + cascade detection
-// from candles STRICTLY BEFORE the signal. Source = a getCandles (async) or a
-// preloaded { symbol: candles } map (sync).
+// plan() is the live decision (no look-ahead): volRegime + cascade + momentum +
+// probability from candles STRICTLY BEFORE the signal. Source = a getCandles
+// (async) or a preloaded { symbol: candles } map (sync).
 const trades = await model.plan(liveItems, getCandles);
 
 for (const s of trades) {
@@ -60,7 +61,15 @@ for (const s of trades) {
 }
 ```
 
-`signals`/`plan` do the thinking: they pick the mode, compute `volRegime`, evaluate the cascade, filter veto, and apply inversion. The application just executes `s.direction` with `s.exit` — no `if` statements about veto, inversion, or mode.
+`signals`/`plan` do the thinking: mode, `volRegime`, cascade, veto, inversion, channel triage, calibrated probability. The application just executes `s.direction` with `s.exit` — no `if` statements.
+
+**Honest by default.** If you skip `assessEdge` and go straight `fit → load → plan`: an **uncertified** model returns *no live signals* — an unproven edge must not silently open positions for someone who copy-pasted three lines. `model.deployment` explains why it's silent (`{ verdict: "trade" | "paper" | "unknown", reasons }`); the explicit opt-in for paper/micro forward-validation is:
+
+```ts
+const paperTrades = await model.plan(liveItems, getCandles, { acknowledgeUncertified: true });
+```
+
+`backtest()`/`planForAt()` are research over the past and are never gated; legacy `model.json` without a certificate in meta is not gated either.
 
 Three execution methods, by what candles they're allowed to see:
 

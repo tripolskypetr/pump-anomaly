@@ -132,8 +132,8 @@ describe("outcome-model e2e — probability в сигнале, гейты minPWi
     const m = PumpMatrix.load(PumpMatrix.load(res.params as never).save()); // переживает save/load
     const freshTs = t0 + 40 * 24 * HOUR;
     const pre = async (sym: string) => ({ [sym]: await gc(sym, "1m", 65, freshTs - 65 * MIN) });
-    const goodSig = m.plan([{ channel: "ch", symbol: "GOODUSDT", direction: "long", ts: freshTs }], await pre("GOODUSDT"));
-    const badSig = m.plan([{ channel: "ch", symbol: "BADUSDT", direction: "long", ts: freshTs }], await pre("BADUSDT"));
+    const goodSig = m.plan([{ channel: "ch", symbol: "GOODUSDT", direction: "long", ts: freshTs }], await pre("GOODUSDT"), { acknowledgeUncertified: true });
+    const badSig = m.plan([{ channel: "ch", symbol: "BADUSDT", direction: "long", ts: freshTs }], await pre("BADUSDT"), { acknowledgeUncertified: true });
     expect(goodSig[0].probability!.pWin).toBeGreaterThan(badSig[0].probability!.pWin);
     expect(goodSig[0].probability!.expectedPnl).toBeGreaterThan(badSig[0].probability!.expectedPnl);
 
@@ -144,7 +144,7 @@ describe("outcome-model e2e — probability в сигнале, гейты minPWi
       { channel: "ch", symbol: "BADUSDT", direction: "long" as const, ts: freshTs },
     ];
     const dict = { ...(await pre("GOODUSDT")), ...(await pre("BADUSDT")) };
-    const gated = m.plan(both, dict, { minPWin: thr });
+    const gated = m.plan(both, dict, { minPWin: thr, acknowledgeUncertified: true });
     expect(gated.map((s) => s.symbol)).toEqual(["GOODUSDT"]);
   }, 30_000);
 });

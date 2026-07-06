@@ -71,7 +71,7 @@ describe("channelPlan — триаж каналов без участия опе
       { channel: "goodhuman", symbol: "GOODUSDT", direction: "long", ts: freshTs },
       { channel: "botdump", symbol: "BADUSDT", direction: "long", ts: freshTs },
       { channel: "sadhuman", symbol: "SADUSDT", direction: "long", ts: freshTs },
-    ]);
+    ], { acknowledgeUncertified: true }); // research-модель без сертификата
     expect(sigs.length).toBe(2); // sadhuman выброшен
     const bot = sigs.find((s) => s.origin.channel === "botdump")!;
     expect(bot.action).toBe("invert");
@@ -87,7 +87,7 @@ describe("channelPlan — триаж каналов без участия опе
     const m = PumpMatrix.load(res.params as never);
     const sigs = m.signals(
       [{ channel: "botdump", symbol: "BADUSDT", direction: "long", ts: t0 + 60 * 24 * HOUR }],
-      { allow: ["enter"] },
+      { allow: ["enter"], acknowledgeUncertified: true },
     );
     expect(sigs.length).toBe(0);
   });

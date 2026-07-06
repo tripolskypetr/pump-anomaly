@@ -222,3 +222,5 @@ export { calibrateGrid } from "./calibrate";
 export type { Calibration, CalibrationAxes } from "./calibrate";
 export { walkForward } from "./walk-forward";
 export type { WalkForwardResult, WalkForwardSlice, WalkForwardOptions } from "./walk-forward";
+export { assessEdge } from "./assess";
+export type { EdgeAssessment, EdgeVerdict, AssessOptions } from "./assess";

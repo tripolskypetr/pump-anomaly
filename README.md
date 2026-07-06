@@ -661,6 +661,23 @@ Matrix signals (`channel: null`, cross-channel confirmation) always pass; a chan
 
 Every signal built with candles carries the **median per-minute quote turnover before the signal** (`median(volume)·close`). An order comparable to this number *is* the pump — there is no edge at that size. The library can't filter for you (it doesn't know your order), so it's advisory: compare `origin.liquidityQuote` with your intended notional and skip or downsize when they're within an order of magnitude.
 
+### Autopilot — the non-obvious logic is inside
+
+Three decisions that used to live in the operator's head are now automated:
+
+- **Channel triage (`channelPlan`)** — at `fit`, every channel with enough trades is judged: significantly loss-making (shrunk score < 0, |t| ≥ 2, n ≥ 10) **and mechanical** (`algoScore ≥ 0.7` — the stop-hunt-bot fingerprint) → `"invert"`, its signals are traded *against* the post automatically (exit from the inverse tensor cell, `origin.invertedFrom` keeps what the channel said); significantly loss-making but human → `"drop"`, its signals are cut. Everything else follows. The plan is part of the model, so **walk-forward validates the triage itself out-of-sample**. Opt out with `channelTriage: false`; inversion respects the `allow` list.
+- **Capacity check (`policy.notionalQuote`)** — instead of "compare `origin.liquidityQuote` with your size yourself": give the policy your order size once, and signals where `notionalQuote > maxLiquidityShare × liquidityQuote` (default 10% of median per-minute turnover) are cut automatically. Tighten-only, candles required.
+- **The go/no-go checklist (`assessEdge`)** — the whole operational sequence "fit → certificate → walk-forward → certified-only slice → decide" is one call:
+
+```ts
+const a = await assessEdge(history, getCandles, { trainOptions: { roundTripCostPct: 0.15 } });
+a.verdict;   // "trade" | "paper" | "no-edge"
+a.reasons;   // человекочитаемо: что выполнено, чего не хватило
+a.model;     // финальная модель на всей истории — её и деплоить при "trade"
+```
+
+`"trade"` requires all of: positive certified-only OOS chain (median and Sharpe > 0), enough trades (`N ≥ minTRL` — data-driven, not a constant), and a green certificate on the final model. `"paper"` = edge visible but unproven (trade micro-size, accumulate forward data). `"no-edge"` = don't. The verdict is auditable, not oracular — `reasons` spell out every gate.
+
 ### Walk-forward — the honest money question
 
 `walkForward(items, getCandles, { slices, trainOptions, policy })` replays real life: fit on the past only → backtest the next time block out-of-sample → roll forward and refit. No test signal is ever visible to the training that trades it. The result is a chronological OOS trade chain — `stats` (median/percentiles), `sharpe`, `equity`, `maxDrawdown` — plus the slice you'd actually run in production: `certifiedOnly`, counting only blocks whose model certified itself on its own past. Nested CV estimates a config on shuffled folds; walk-forward answers "would this have made money, trading it the way I intend to".

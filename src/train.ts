@@ -159,6 +159,11 @@ export interface TrainOptions {
    */
   momentumWindowMinutes?: number;
   /**
+   * Авто-триаж каналов (channelPlan): drop значимо убыточных, invert механических
+   * стоп-хант каналов. По умолчанию включён; false — план не строится (все follow).
+   */
+  channelTriage?: boolean;
+  /**
    * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
    * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
    * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
@@ -267,6 +272,19 @@ export interface TrainedParams {
    * Высокий algoScore + отрицательный score = кандидат на инверсию (habr 1028592).
    */
   channelScore?: Record<string, { score: number; median: number; n: number; algoScore?: number }>;
+  /**
+   * АВТО-ТРИАЖ КАНАЛОВ — неочевидная логика «что делать с каналом» автоматизирована:
+   *  - "drop"   — канал ЗНАЧИМО убыточен (усаженный скор < 0, |t| ≥ 2, n достаточно):
+   *               его сигналы режутся в рантайме;
+   *  - "invert" — значимо убыточен И механического происхождения (algoScore высок):
+   *               паттерн стоп-хант-бота из habr 1028592 — сигналы разворачиваются
+   *               (long поста → short сделка), exit из инверс-ячейки тензора;
+   *  - отсутствие записи = follow (обычное следование).
+   * Решение принимается на fit по бэктест-истории и валидируется walk-forward'ом
+   * как часть модели (OOS-срезы обучают свой план на своём прошлом).
+   * Отключается opts.channelTriage: false. Сериализуется.
+   */
+  channelPlan?: Record<string, "invert" | "drop">;
   /**
    * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
    * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -1299,6 +1317,32 @@ export async function train(
     };
   }
 
+  // ── АВТО-ТРИАЖ КАНАЛОВ: «что делать с каналом» решает статистика, не оператор ──
+  // Константы триажа: TRIAGE_MIN_N — не судим канал по паре сделок (тот же дух,
+  // что n<8 в algo-сигнатуре); |t| ≥ 2 ≈ 95%-значимость убыточности; ALGO_INVERT —
+  // порог «механического» происхождения, при котором анти-предиктивность канала
+  // направленная (стоп-хант бот) и её выгоднее инвертировать, чем выбрасывать.
+  const TRIAGE_MIN_N = 10;
+  const TRIAGE_T = 2;
+  const TRIAGE_ALGO_INVERT = 0.7;
+  const channelPlan: Record<string, "invert" | "drop"> = {};
+  if (opts.channelTriage ?? true) {
+    for (const [ch, pnls] of channelPnls) {
+      if (pnls.length < TRIAGE_MIN_N) continue; // мало данных → follow
+      const n = pnls.length;
+      const mean = pnls.reduce((s, x) => s + x, 0) / n;
+      if (mean >= 0) continue;
+      const variance = pnls.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1);
+      const se = Math.sqrt(variance) / Math.sqrt(n);
+      // se≈0 при одинаковых убытках — значимо по построению
+      const significant = se < Math.abs(mean) * 1e-9 || Math.abs(mean) / se >= TRIAGE_T;
+      if (!significant) continue;
+      channelPlan[ch] = (channelScore[ch].algoScore ?? 0) >= TRIAGE_ALGO_INVERT
+        ? "invert"   // механический анти-предиктивный канал → торгуем против него
+        : "drop";    // просто убыточный автор → не торгуем его вовсе
+    }
+  }
+
   // ── ОБУЧЕННЫЙ momentum-гейт → policy ──
   // Выбранный CV порог вшивается в сериализуемую политику: runtime (signals/plan/
   // backtest) применит его сам, без ручной передачи. Пользовательский порог из
@@ -1319,6 +1363,7 @@ export async function train(
     riskReward: { bySymbol: riskRewardBySymbol, global: riskRewardGlobal },
     pnl: { bySymbol: pnlBySymbol, global: pnlGlobal },
     channelScore,
+    channelPlan,
     history,
     meta: {
       trainedAt: Date.now(), folds, shrinkageK,

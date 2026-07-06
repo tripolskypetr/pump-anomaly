@@ -172,6 +172,19 @@ export interface SignalPolicy {
    * Тighten-only: max(trained, requested). undefined = выкл.
    */
   minChannelScore?: number;
+  /**
+   * ФИЛЬТР ЁМКОСТИ: твой размер ордера в котируемой валюте. Сигнал режется, если
+   * notionalQuote > maxLiquidityShare × liquidityQuote (медианный минутный оборот
+   * до сигнала): ордер, сопоставимый с минутным оборотом, — сам себе памп, эджа
+   * на таком размере нет. Требует свечей (без них подтвердить ёмкость нечем —
+   * режем консервативно). Тighten-only: max(trained, requested). undefined = выкл.
+   */
+  notionalQuote?: number;
+  /**
+   * Максимально допустимая доля минутного оборота под твой ордер (по умолчанию 0.1:
+   * 10% минутного оборота — уже двигаешь цену). Тighten-only: min(trained, requested).
+   */
+  maxLiquidityShare?: number;
 }
 
 export const DEFAULT_POLICY: SignalPolicy = {
@@ -203,6 +216,8 @@ export function intersectPolicy(
   // числовые пороги: только ужесточение (выше = строже), как minRiskReward
   const tightenMax = (a?: number, b?: number): number | undefined =>
     a !== undefined && b !== undefined ? Math.max(a, b) : (b ?? a);
+  const tightenMin = (a?: number, b?: number): number | undefined =>
+    a !== undefined && b !== undefined ? Math.min(a, b) : (b ?? a);
   return {
     allow,
     minRiskReward,
@@ -212,5 +227,8 @@ export function intersectPolicy(
     minMomentum24hPct: tightenMax(trained.minMomentum24hPct, requested?.minMomentum24hPct),
     momentumWindowMinutes: requested?.momentumWindowMinutes ?? trained.momentumWindowMinutes,
     minChannelScore: tightenMax(trained.minChannelScore, requested?.minChannelScore),
+    // ёмкость: больший размер / меньшая доля оборота = строже отбор
+    notionalQuote: tightenMax(trained.notionalQuote, requested?.notionalQuote),
+    maxLiquidityShare: tightenMin(trained.maxLiquidityShare, requested?.maxLiquidityShare),
   };
 }

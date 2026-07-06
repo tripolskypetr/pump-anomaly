@@ -70,6 +70,7 @@ export class PumpMatrix {
     if (!params.riskReward) params.riskReward = { bySymbol: {}, global: { mean: 0, p95: 0, p99: 0, n: 0 } };
     if (!params.pnl) params.pnl = { bySymbol: {}, global: { mean: 0, median: 0, p5: 0, p95: 0, p99: 0, n: 0 } };
     if (!params.channelScore) params.channelScore = {}; // обратная совместимость
+    if (!params.channelPlan) params.channelPlan = {};
     return new PumpMatrix(params, loadPredict(params));
   }
 
@@ -113,10 +114,12 @@ export class PumpMatrix {
     const {
       allow, minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
+      notionalQuote, maxLiquidityShare,
     } = this.params.policy;
     return {
       allow: [...allow], minRiskReward, rrMetric, requireVolumeConfirm,
       minMomentum24hPct, momentumWindowMinutes, minChannelScore,
+      notionalQuote, maxLiquidityShare,
     };
   }
 
@@ -127,6 +130,15 @@ export class PumpMatrix {
    */
   get channelScore(): Record<string, { score: number; median: number; n: number; algoScore?: number }> {
     return { ...(this.params.channelScore ?? {}) };
+  }
+
+  /**
+   * Авто-триаж каналов, принятый на fit: channel → "drop" (значимо убыточен,
+   * сигналы режутся) | "invert" (механический стоп-хант канал, сигналы
+   * разворачиваются). Отсутствие записи = follow. Применяется рантаймом сам.
+   */
+  get channelPlan(): Record<string, "invert" | "drop"> {
+    return { ...(this.params.channelPlan ?? {}) };
   }
 
   /** Надёжна ли модель (хватило ли данных при обучении). */
@@ -546,8 +558,25 @@ export class PumpMatrix {
     mode: "live" | "backtest",
   ): TradeSignal | null {
     const ch = v.channel ?? "_matrix";
-    const dir = v.direction!;
     const allow = new Set(policy.allow);
+
+    // ── АВТО-ТРИАЖ КАНАЛА (channelPlan из fit): drop/invert без участия оператора ──
+    // "drop": канал значимо убыточен — сигнал не отдаётся. "invert": механический
+    // анти-предиктивный канал (стоп-хант бот) — направление разворачивается ЗДЕСЬ,
+    // до резолва exit и гейтов: все downstream-проверки (momentum, каскад, тензор)
+    // работают с направлением, которое мы РЕАЛЬНО торгуем. Matrix (channel=null)
+    // план не затрагивает.
+    let dir = v.direction!;
+    let planInverted: Direction | null = null;
+    if (v.channel !== null) {
+      const plan = this.params.channelPlan?.[v.channel];
+      if (plan === "drop") return null;
+      if (plan === "invert") {
+        if (!allow.has("invert")) return null; // инверсия запрещена → как veto
+        planInverted = dir;
+        dir = dir === "long" ? "short" : "long";
+      }
+    }
 
     // ── readonly RR-фильтр: режем символы с backtest-RR ниже порога ──
     if (policy.minRiskReward !== undefined) {
@@ -598,6 +627,16 @@ export class PumpMatrix {
       }
     }
 
+    // ── ФИЛЬТР ЁМКОСТИ: сверка твоего размера с минутным оборотом — внутри ──
+    // Ордер, сопоставимый с минутным оборотом, сам двигает цену: эджа на таком
+    // размере нет. Раньше сравнение оставалось оператору («смотри liquidityQuote»);
+    // теперь policy.notionalQuote решает автоматически. Нет свечей/оборота →
+    // подтвердить ёмкость нечем → режем консервативно.
+    if (policy.notionalQuote !== undefined) {
+      const share = policy.maxLiquidityShare ?? 0.1;
+      if (liquidityQuote === null || policy.notionalQuote > share * liquidityQuote) return null;
+    }
+
     // ── ПОДТВЕРЖДЕНИЕ РЫНКОМ: пост без аномального объёма на ленте — не памп ──
     // Реальному пампу предшествует набор позиции автором → всплеск объёма ДО поста.
     // calm-лента = пост без рыночной реакции = шум. Нет свечей → подтвердить нечем →
@@ -625,9 +664,12 @@ export class PumpMatrix {
     let exit = resolved.exit;
 
     // ── решение по каскаду → action + (возможно) разворот direction ──
-    let action: SignalAction = "enter";
+    // channelPlan-инверсия уже применена к dir выше: action стартует с "invert",
+    // invertedFrom несёт исходное направление ПОСТА (что говорил канал).
+    let action: SignalAction = planInverted ? "invert" : "enter";
     let finalDir = dir;
-    let invertedFrom: Direction | null = null;
+    let invertedFrom: Direction | null = planInverted;
+    let tightenFired = false;
 
     const fires = sqPressure !== null && sqPressure >= (exit.squeezeThreshold ?? 0.6);
     if (fires) {
@@ -635,7 +677,9 @@ export class PumpMatrix {
       if (pol === "veto") {
         return null; // каскад — НЕ входить. veto не попадает в выдачу.
       }
-      if (pol === "invert") {
+      if (pol === "invert" && !planInverted) {
+        // канальная инверсия ГЛАВНЕЕ: двойной разворот (план + каскад) вернул бы
+        // направление поста, чью анти-предиктивность триаж уже доказал — не делаем.
         if (!allow.has("invert")) return null; // инверсия запрещена → защищаемся как veto
         action = "invert";
         finalDir = dir === "long" ? "short" : "long";
@@ -646,7 +690,10 @@ export class PumpMatrix {
         exit = resolved.exit;
       } else if (pol === "tighten") {
         if (!allow.has("tighten")) return null;
-        action = "tighten";
+        // при канальной инверсии маркер "invert" важнее: ужатие применяем к плану,
+        // но action не затираем (origin.invertedFrom + ужатый trailing в exit)
+        if (!planInverted) action = "tighten";
+        tightenFired = true;
       }
       // pol === "ignore": каскад замечен, но НАМЕРЕННО игнорируется — входим в
       // исходном направлении (action остаётся "enter"). В отличие от veto/invert
@@ -658,7 +705,7 @@ export class PumpMatrix {
     if (action === "enter" && !allow.has("enter")) return null;
 
     const plan = this.flatExit(exit);
-    if (action === "tighten") {
+    if (tightenFired) {
       plan.trailingTake = +(exit.trailingTake * (exit.tightenFactor ?? 0.5)).toFixed(6);
     }
 

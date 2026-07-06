@@ -991,6 +991,19 @@ interface SignalPolicy {
      * Тighten-only: max(trained, requested). undefined = выкл.
      */
     minChannelScore?: number;
+    /**
+     * ФИЛЬТР ЁМКОСТИ: твой размер ордера в котируемой валюте. Сигнал режется, если
+     * notionalQuote > maxLiquidityShare × liquidityQuote (медианный минутный оборот
+     * до сигнала): ордер, сопоставимый с минутным оборотом, — сам себе памп, эджа
+     * на таком размере нет. Требует свечей (без них подтвердить ёмкость нечем —
+     * режем консервативно). Тighten-only: max(trained, requested). undefined = выкл.
+     */
+    notionalQuote?: number;
+    /**
+     * Максимально допустимая доля минутного оборота под твой ордер (по умолчанию 0.1:
+     * 10% минутного оборота — уже двигаешь цену). Тighten-only: min(trained, requested).
+     */
+    maxLiquidityShare?: number;
 }
 declare const DEFAULT_POLICY: SignalPolicy;
 /**
@@ -1372,6 +1385,11 @@ interface TrainOptions {
      */
     momentumWindowMinutes?: number;
     /**
+     * Авто-триаж каналов (channelPlan): drop значимо убыточных, invert механических
+     * стоп-хант каналов. По умолчанию включён; false — план не строится (все follow).
+     */
+    channelTriage?: boolean;
+    /**
      * Конкурентность фазы разметки: сколько labelBurst-запросов держать в полёте.
      * Разметка IO-bound (getCandles на каждого кандидата) — пул из N параллельных
      * запросов режет время стены кратно при живой бирже. Результат ДЕТЕРМИНИРОВАН
@@ -1481,6 +1499,19 @@ interface TrainedParams {
         n: number;
         algoScore?: number;
     }>;
+    /**
+     * АВТО-ТРИАЖ КАНАЛОВ — неочевидная логика «что делать с каналом» автоматизирована:
+     *  - "drop"   — канал ЗНАЧИМО убыточен (усаженный скор < 0, |t| ≥ 2, n достаточно):
+     *               его сигналы режутся в рантайме;
+     *  - "invert" — значимо убыточен И механического происхождения (algoScore высок):
+     *               паттерн стоп-хант-бота из habr 1028592 — сигналы разворачиваются
+     *               (long поста → short сделка), exit из инверс-ячейки тензора;
+     *  - отсутствие записи = follow (обычное следование).
+     * Решение принимается на fit по бэктест-истории и валидируется walk-forward'ом
+     * как часть модели (OOS-срезы обучают свой план на своём прошлом).
+     * Отключается opts.channelTriage: false. Сериализуется.
+     */
+    channelPlan?: Record<string, "invert" | "drop">;
     /**
      * История сигналов выбранной конфигурации (для аналитики сторонним скриптом).
      * Каждая запись — один кандидат-всплеск, размеченный ВЫБРАННЫМ global-exit:
@@ -1646,6 +1677,12 @@ declare class PumpMatrix {
         n: number;
         algoScore?: number;
     }>;
+    /**
+     * Авто-триаж каналов, принятый на fit: channel → "drop" (значимо убыточен,
+     * сигналы режутся) | "invert" (механический стоп-хант канал, сигналы
+     * разворачиваются). Отсутствие записи = follow. Применяется рантаймом сам.
+     */
+    get channelPlan(): Record<string, "invert" | "drop">;
     /** Надёжна ли модель (хватило ли данных при обучении). */
     get reliable(): boolean;
     /** Доверие к модели 0..1. */
@@ -1879,6 +1916,47 @@ interface WalkForwardOptions {
 declare function walkForward(items: ParserItem[], getCandles: GetCandles, opts?: WalkForwardOptions): Promise<WalkForwardResult>;
 
 /**
+ * ASSESS EDGE — операционный чеклист «можно ли этим торговать», автоматизированный.
+ *
+ * Раньше решение собиралось оператором из кусков: прогнать fit → посмотреть
+ * certification → прогнать walkForward → сравнить certified-only срез → решить.
+ * Теперь это ОДИН вызов с одним структурированным вердиктом:
+ *
+ *  - "trade"   — walk-forward OOS в режиме эксплуатации (только сертифицированные
+ *                срезы) положителен, выборка ≥ minTRL, финальная модель на всей
+ *                истории сертифицирована. Можно торговать малым риском.
+ *  - "paper"   — эдж виден (OOS-медиана и Sharpe > 0), но доказательств не хватает:
+ *                мало сделок (< minTRL), срезы не сертифицируются, или финальный
+ *                сертификат красный. Торговать НА БУМАГЕ/микро и копить данные.
+ *  - "no-edge" — OOS-цепочка не положительна. Не торговать; reasons говорят почему.
+ *
+ * Все пороги — уже существующие статистические инструменты (minTRL, сертификат,
+ * walk-forward), никаких новых магических констант. reasons всегда объясняют
+ * вердикт человеческим языком — решение проверяемо, а не оракульно.
+ */
+type EdgeVerdict = "trade" | "paper" | "no-edge";
+interface EdgeAssessment {
+    verdict: EdgeVerdict;
+    /** человекочитаемые причины вердикта (что выполнено, чего не хватило) */
+    reasons: string[];
+    /** финальная модель, обученная на ВСЕЙ истории (её и деплоить при "trade") */
+    model: PumpMatrix;
+    /** полный walk-forward отчёт (кривая, просадка, срезы) — для аудита */
+    walkForward: WalkForwardResult;
+    /** минимальная длина трек-рекорда для значимости OOS-цепочки (Infinity при SR≤0) */
+    minTRL: number;
+    /** сколько OOS-сделок реально есть в оценивавшейся цепочке */
+    oosTrades: number;
+}
+interface AssessOptions {
+    /** опции обучения (grid/costs/mode/…) — общие для срезов walk-forward и финального fit */
+    trainOptions?: TrainOptions;
+    /** опции walk-forward (slices/policy/embargo/…) */
+    walkForward?: Omit<WalkForwardOptions, "trainOptions">;
+}
+declare function assessEdge(items: ParserItem[], getCandles: GetCandles, opts?: AssessOptions): Promise<EdgeAssessment>;
+
+/**
  * Нормализует parser-items в чистые события, отбрасывая лишние поля и мусор
  * (null-строки, нечисловой ts, невалидное направление). Используется и predict,
  * и train: битая запись не должна молча искажать кластеризацию/разметку.
@@ -1900,5 +1978,5 @@ declare function normalizeParserItems(items: ParserItem[]): SignalEvent[];
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
-export type { AlgoSignature, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, algoSignatureOf, alignTs, assessEdge, assessViability, authorInfluence, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, hawkesBurst, hawkesWeight, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, leadershipWeight, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, normalizeParserItems, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, walkForward, windowEvents, winrate, withCandleCache };
+export type { AlgoSignature, AssessOptions, AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, EdgeAssessment, EdgeVerdict, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, HawkesBurst, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures, WalkForwardOptions, WalkForwardResult, WalkForwardSlice };

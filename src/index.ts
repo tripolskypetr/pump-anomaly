@@ -99,11 +99,16 @@ export function predict(
     const directed = lagXCorr(tbl, screened, cfg.lagPeakThreshold, window);
     authors = clusterAuthors(tbl.channels, directed);
     matrixVerdicts = earlyWarning(tbl, authors, cfg, tau);
-    // оценка жизнеспособности матрицы (строгий критерий: явные кластеры + перекрытие)
+    // оценка жизнеспособности матрицы (строгий критерий: явные кластеры + перекрытие).
+    // Порог перекрытия авто-поднимается до границы случайности (Пуассон), если
+    // пользователь не зафиксировал minSharedEvents явно — фикс «3» без плотности
+    // данных был магическим числом.
     viability = assessViability(tbl, directed, authors, {
       ...DEFAULT_VIABILITY,
       ...cfg.viability,
-    });
+      autoOverlap: cfg.viability?.minSharedEvents === undefined
+        && (cfg.viability?.autoOverlap ?? true),
+    }, window);
   }
   const matrixOpens = matrixVerdicts.filter((v) => v.action === "open");
 
@@ -195,3 +200,5 @@ export { stdoutProgress, silentProgress } from "./progress";
 export type { ProgressFn, ProgressEvent } from "./progress";
 export * from "./statistics";
 export * from "./meta-ledger";
+export { calibrateGrid } from "./calibrate";
+export type { Calibration, CalibrationAxes } from "./calibrate";

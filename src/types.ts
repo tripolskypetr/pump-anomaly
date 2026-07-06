@@ -13,10 +13,19 @@ export type DetectorMode = "auto" | "matrix" | "single";
 
 /** Пороги жизнеспособности матрицы авторства (строгий критерий для auto-режима). */
 export interface ViabilityConfig {
+  /** нижняя граница общих событий; при autoOverlap поднимается до порога случайности */
   minSharedEvents: number;
   minPeakShare: number;
   minStrongEdges: number;
   minStructure: number;
+  /**
+   * Авто-порог перекрытия: вместо фиксированного minSharedEvents требовать
+   * «значимо больше совпадений, чем даёт случай» — λ + 2√λ, где λ — ожидаемое
+   * число случайных коинциденций (Пуассон) при данной плотности событий и окне.
+   * На плотной истории планка растёт сама; на разреженной остаётся minSharedEvents.
+   * Включается автоматически, когда minSharedEvents не задан пользователем явно.
+   */
+  autoOverlap?: boolean;
 }
 
 /** Отчёт о жизнеспособности матрицы — почему auto выбрал matrix или single. */
@@ -28,6 +37,8 @@ export interface ViabilityReport {
   multiChannelClusters: number;
   clusterCount: number;
   reason: string;
+  /** фактически применённый порог перекрытия (поднят Пуассоном при autoOverlap) */
+  minSharedEventsUsed?: number;
 }
 
 /** Строка из коллекции parser-items (вход публичного API). */

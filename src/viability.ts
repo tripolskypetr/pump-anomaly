@@ -19,21 +19,35 @@ export const DEFAULT_VIABILITY: ViabilityConfig = {
   minStructure: 2,
 };
 
-/** Считает макс. событийное перекрытие среди всех пар каналов по общим ключам. */
-function maxSharedEvents(tbl: EventTable): number {
+/**
+ * Макс. событийное перекрытие среди пар каналов + ожидаемое СЛУЧАЙНОЕ число
+ * коинциденций (λ) для пары-рекордсмена. λ по Пуассону: два независимых канала
+ * с n_a и n_b событиями по ключу на интервале T дают ≈ n_a·n_b·(2·window/T)
+ * случайных совпадений в пределах ±window. Наблюдаемое перекрытие, не превышающее
+ * λ + 2√λ, объяснимо случаем — «3 общих события» на плотной истории ничего не значат.
+ */
+function overlapStats(tbl: EventTable, windowMs?: number): { maxShared: number; lambdaAtMax: number } {
   const ch = tbl.channels;
+  const first = tbl.events[0]?.ts ?? 0;
+  const last = tbl.events[tbl.events.length - 1]?.ts ?? 0;
+  const span = Math.max(last - first, 1);
   let max = 0;
+  let lambdaAtMax = 0;
   for (let i = 0; i < ch.length; i++)
     for (let j = i + 1; j < ch.length; j++) {
       let shared = 0;
+      let lambda = 0;
       for (const k of tbl.byKey.keys()) {
         const a = tbl.byChannelKey.get(`${ch[i]}|${k}`);
         const b = tbl.byChannelKey.get(`${ch[j]}|${k}`);
-        if (a && b) shared += Math.min(a.length, b.length);
+        if (a && b) {
+          shared += Math.min(a.length, b.length);
+          if (windowMs) lambda += a.length * b.length * Math.min((2 * windowMs) / span, 1);
+        }
       }
-      if (shared > max) max = shared;
+      if (shared > max) { max = shared; lambdaAtMax = lambda; }
     }
-  return max;
+  return { maxShared: max, lambdaAtMax };
 }
 
 export function assessViability(
@@ -41,9 +55,16 @@ export function assessViability(
   directed: DirectedEdge[],
   authors: AuthorMap,
   cfg: ViabilityConfig = DEFAULT_VIABILITY,
+  /** окно синхронности для оценки случайного перекрытия (нужно при autoOverlap) */
+  windowMs?: number,
 ): ViabilityReport {
   const channels = tbl.channels.length;
-  const maxShared = maxSharedEvents(tbl);
+  const { maxShared, lambdaAtMax } = overlapStats(tbl, windowMs);
+  // порог перекрытия: фиксированный ИЛИ поднятый до границы случайности (λ + 2√λ).
+  // Безразмерного «3» не существует: на плотной истории 3 совпадения — фон.
+  const minSharedUsed = cfg.autoOverlap && windowMs
+    ? Math.max(cfg.minSharedEvents, Math.ceil(lambdaAtMax + 2 * Math.sqrt(lambdaAtMax)))
+    : cfg.minSharedEvents;
   const strongEdges = directed.filter((e) => e.peakShare >= cfg.minPeakShare).length;
 
   // структура графа: размеры кластеров
@@ -54,22 +75,26 @@ export function assessViability(
 
   // СТРОГИЙ критерий: все условия одновременно
   const enoughChannels = channels >= 2;
-  const enoughOverlap = maxShared >= cfg.minSharedEvents;
+  const enoughOverlap = maxShared >= minSharedUsed;
   const enoughEdges = strongEdges >= cfg.minStrongEdges;
   // нетривиальность: либо найдены братья (кластер >1), либо ≥minStructure независимых кластеров
   const nontrivial = multiChannelClusters >= 1 || clusterCount >= cfg.minStructure;
 
   const viable = enoughChannels && enoughOverlap && enoughEdges && nontrivial;
 
+  const thrNote = minSharedUsed > cfg.minSharedEvents
+    ? `${minSharedUsed} (порог случайности: λ=${lambdaAtMax.toFixed(1)})`
+    : `${minSharedUsed}`;
   let reason: string;
   if (!enoughChannels) reason = `один канал — корреляция невозможна`;
-  else if (!enoughOverlap) reason = `мало общих событий (макс ${maxShared} < ${cfg.minSharedEvents}) — перекрытие шумовое`;
+  else if (!enoughOverlap) reason = `мало общих событий (макс ${maxShared} < ${thrNote}) — перекрытие шумовое`;
   else if (!enoughEdges) reason = `нет связей с острым пиком (${strongEdges} < ${cfg.minStrongEdges}) — корреляция случайна`;
   else if (!nontrivial) reason = `граф тривиален (кластеров >1: ${multiChannelClusters}, всего: ${clusterCount})`;
-  else reason = `матрица жизнеспособна: ${strongEdges} острых связей, перекрытие ${maxShared}, кластеров >1: ${multiChannelClusters}`;
+  else reason = `матрица жизнеспособна: ${strongEdges} острых связей, перекрытие ${maxShared} ≥ ${thrNote}, кластеров >1: ${multiChannelClusters}`;
 
   return {
     viable, channels, maxSharedEvents: maxShared, strongEdges,
     multiChannelClusters, clusterCount, reason,
+    minSharedEventsUsed: minSharedUsed,
   };
 }

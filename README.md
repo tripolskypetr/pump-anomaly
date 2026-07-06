@@ -100,6 +100,31 @@ Tuned `TrainGrid`s per asset live in [`config/`](config/) — one `*-grid.mjs` e
 
 ---
 
+## Casual mode — self-calibration instead of magic numbers
+
+Hand-written per-asset grids are the expert path. The casual path is `PumpMatrix.fit(history, getCandles)` with **no grid at all** — dimensional constants are then derived from the data, because a number like "hardStop 2%" means nothing without the asset's scale (it's a wide stop on a calm major and inside one candle's noise on a meme-coin, where the stop hunt is guaranteed):
+
+- **%-axes from measured noise.** The library samples 1m candles *before* a spread of events (double median: per candle, then per event — robust to pumps and outliers) and gets the asset's noise scale, `noisePct`. Exit axes become dimensionless multiples of it: `hardStop = noise × {20,40,80}`, `trailingTake = noise × {10,20,40}`, `stalenessSinceProfit = noise × {10,20}`, with sanity clamps. On a calm asset (noise ≈ 0.05%) that reproduces the classic [1, 2, 4]%; on a wild one the grid widens itself.
+- **Horizon axes from actual coverage.** A `staleMinutes` value the history cannot label (not enough forward candles after events — every label truncated) is a dead axis: pure compute waste. Coverage is probed, unlabelable horizons are dropped; staleness timers ≥ the surviving life-cap (which can never fire) are dropped too.
+- **Overlap threshold from chance level.** Matrix viability no longer demands a fixed "3 shared events": with `autoOverlap` (on by default unless you pin `minSharedEvents`) the bar is `max(3, λ + 2√λ)` where λ is the Poisson-expected number of *random* coincidences at the observed event density and window. On a dense history 3 coincidences are background, and the bar rises by itself; on a sparse one it stays 3.
+- τ (sibling lag), the burst window, and all detector/exit thresholds were already data-driven (`selfTuneLag` + CV grid search).
+
+What deliberately **stays** constant: the certificate's α-levels (DSR 0.95 / PBO 0.10 / SPA 0.05 — statistical conventions; "tuning" the judge is how you overfit past it), the sanity clamps, and the dimensionless noise multipliers themselves. Constants don't disappear — they move up one level, from dimensional (percent, minutes) to scale-free, and the data supplies the scale.
+
+Everything measured is serialized for audit:
+
+```ts
+const model = await PumpMatrix.fit(history, getCandles); // no numbers anywhere
+model.calibration;
+// { noisePct: 0.19, forwardCoverageMinutes: 460, sampledEvents: 8,
+//   axes: { hardStop: [3.8, 7.6, 12], trailingTake: [1.9, 3.8, 7.6], ... },
+//   reason: "шум 1m = 0.19% → hardStop [...]; покрытие p25 = 460м → staleMinutes [60, 240]" }
+```
+
+A partial grid is expert mode: your axes always win, and calibration only fills the ones you left out if you pass `autoCalibrate: true` (with a full explicit grid nothing is calibrated — old behavior). The one number the data cannot know is your execution cost: pass `roundTripCostPct` yourself.
+
+---
+
 ## Input contract
 
 ### `ParserItem` (channel signal)

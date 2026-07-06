@@ -20,6 +20,7 @@ import {
 } from "./train";
 import { Certification } from "./statistics";
 import { MetaLedgerState } from "./meta-ledger";
+import { Calibration } from "./calibrate";
 
 /**
  * Casual-фасад с ЕДИНЫМ стабильным контрактом ввода-вывода.
@@ -158,6 +159,16 @@ export class PumpMatrix {
    */
   get certification(): Certification {
     return this.params.meta.certification;
+  }
+
+  /**
+   * Аудит автокалибровки casual-режима: измеренный шум 1m-свечей, доступное
+   * форвард-покрытие, и какие оси грида были выведены из данных (с объяснением).
+   * null = fit шёл с явным grid (калибровка не запускалась) или модель из load()
+   * старого формата.
+   */
+  get calibration(): Calibration | null {
+    return this.params.meta.calibration ?? null;
   }
 
   /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */

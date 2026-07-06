@@ -24,6 +24,7 @@ import {
   MetaLedgerState, MetaPolicy, effectiveTrials, fitAttemptCount,
   canRefit, recordAttempt, emptyLedger,
 } from "./meta-ledger";
+import { Calibration, calibrateGrid } from "./calibrate";
 import { SelectionConfig, DEFAULT_SELECTION, isMoreConservative } from "./selection";
 import {
   computeReliability,
@@ -127,6 +128,15 @@ export interface TrainOptions {
   metaPolicy?: MetaPolicy;
   /** явное отключение cadence-guard (осознанный обход, например в тестах/ресёрче) */
   ignoreCadence?: boolean;
+  /**
+   * Автокалибровка осей грида по данным (casual-режим). По умолчанию включается,
+   * когда grid НЕ передан: %-оси (hardStop/trailingTake/stalenessSinceProfit)
+   * масштабируются измеренным шумом 1m-свечей, оси горизонтов фильтруются по
+   * реальному покрытию истории. Явное true — калибровать и при частичном grid
+   * (только оси, которые пользователь не задал); false — никогда.
+   * Итог замеров сериализуется в meta.calibration (полный аудит).
+   */
+  autoCalibrate?: boolean;
   /**
    * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
    * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -247,6 +257,12 @@ export interface TrainedParams {
       /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
       errors: Record<string, number>;
     };
+    /**
+     * Аудит автокалибровки (casual-режим): измеренный шум 1m-свечей, доступное
+     * форвард-покрытие и какие оси грида были выведены из данных. null =
+     * калибровка не запускалась (передан явный grid без autoCalibrate).
+     */
+    calibration?: Calibration | null;
   };
 }
 
@@ -304,6 +320,27 @@ export async function train(
   }
 
   const grid: TrainGrid = { ...DEFAULT_GRID, ...opts.grid };
+
+  // ── АВТОКАЛИБРОВКА (casual): размер осей из данных, а не из головы ──
+  // %-оси масштабируются измеренным шумом 1m-свечей (проценты без масштаба актива
+  // бессмысленны), горизонты фильтруются по доступному покрытию (нечитаемая ось =
+  // мёртвый перебор). Пользовательские оси НЕ трогаем: casual — это когда grid
+  // не передан; частичный grid калибруется только по явному autoCalibrate: true.
+  let calibration: Calibration | null = null;
+  const wantCalibration = opts.autoCalibrate ?? (opts.grid == null);
+  if (wantCalibration) {
+    calibration = await calibrateGrid(items, getCandles, {
+      staleMinutes: grid.staleMinutes,
+      stalenessSinceMinutes: grid.stalenessSinceMinutes,
+    });
+    const a = calibration.axes;
+    if (opts.grid?.hardStop == null && a.hardStop) grid.hardStop = a.hardStop;
+    if (opts.grid?.trailingTake == null && a.trailingTake) grid.trailingTake = a.trailingTake;
+    if (opts.grid?.stalenessSinceProfit == null && a.stalenessSinceProfit) grid.stalenessSinceProfit = a.stalenessSinceProfit;
+    if (opts.grid?.staleMinutes == null && a.staleMinutes) grid.staleMinutes = a.staleMinutes;
+    if (opts.grid?.stalenessSinceMinutes == null && a.stalenessSinceMinutes) grid.stalenessSinceMinutes = a.stalenessSinceMinutes;
+  }
+
   const folds = opts.folds ?? 4;
   const shrinkageK = opts.shrinkageK ?? 5;
   const selection: SelectionConfig = { ...DEFAULT_SELECTION, ...opts.selection };
@@ -330,7 +367,9 @@ export async function train(
     const probeAuthors = clusterAuthors(probeTbl.channels, probeDirected);
     const v = assessViability(probeTbl, probeDirected, probeAuthors, {
       ...DEFAULT_VIABILITY, ...opts.viability,
-    });
+      autoOverlap: opts.viability?.minSharedEvents === undefined
+        && (opts.viability?.autoOverlap ?? true),
+    }, probeWin);
     effMode = v.viable ? "matrix" : "single";
     // честная авто-диагностика: ПОЧЕМУ выбран режим (видно в meta.modeReason)
     modeReason = `auto → ${effMode}: ${v.reason}`;
@@ -908,6 +947,7 @@ export async function train(
         outcomes: Object.fromEntries(outcomeTally) as Partial<Record<LabelOutcome, number>>,
         errors: Object.fromEntries(errorTally),
       },
+      calibration,
     },
   };
 

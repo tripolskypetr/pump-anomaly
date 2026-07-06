@@ -10,10 +10,19 @@ type Direction = "long" | "short";
 type DetectorMode = "auto" | "matrix" | "single";
 /** Пороги жизнеспособности матрицы авторства (строгий критерий для auto-режима). */
 interface ViabilityConfig {
+    /** нижняя граница общих событий; при autoOverlap поднимается до порога случайности */
     minSharedEvents: number;
     minPeakShare: number;
     minStrongEdges: number;
     minStructure: number;
+    /**
+     * Авто-порог перекрытия: вместо фиксированного minSharedEvents требовать
+     * «значимо больше совпадений, чем даёт случай» — λ + 2√λ, где λ — ожидаемое
+     * число случайных коинциденций (Пуассон) при данной плотности событий и окне.
+     * На плотной истории планка растёт сама; на разреженной остаётся minSharedEvents.
+     * Включается автоматически, когда minSharedEvents не задан пользователем явно.
+     */
+    autoOverlap?: boolean;
 }
 /** Отчёт о жизнеспособности матрицы — почему auto выбрал matrix или single. */
 interface ViabilityReport {
@@ -24,6 +33,8 @@ interface ViabilityReport {
     multiChannelClusters: number;
     clusterCount: number;
     reason: string;
+    /** фактически применённый порог перекрытия (поднят Пуассоном при autoOverlap) */
+    minSharedEventsUsed?: number;
 }
 /** Строка из коллекции parser-items (вход публичного API). */
 interface ParserItem {
@@ -268,7 +279,9 @@ declare function singleChannelSignals(tbl: EventTable, cfg: DetectorConfig, tau:
  * событийном перекрытии; иначе — откат в single.
  */
 declare const DEFAULT_VIABILITY: ViabilityConfig;
-declare function assessViability(tbl: EventTable, directed: DirectedEdge[], authors: AuthorMap, cfg?: ViabilityConfig): ViabilityReport;
+declare function assessViability(tbl: EventTable, directed: DirectedEdge[], authors: AuthorMap, cfg?: ViabilityConfig, 
+/** окно синхронности для оценки случайного перекрытия (нужно при autoOverlap) */
+windowMs?: number): ViabilityReport;
 
 /**
  * Объёмная математика детектора каскада ликвидаций. ПОЛНОСТЬЮ СИММЕТРИЧНА по
@@ -1014,6 +1027,55 @@ declare function effectiveTrials(ledger: MetaLedgerState, currentInnerTrials: nu
 declare function fitAttemptCount(ledger: MetaLedgerState): number;
 
 /**
+ * АВТОКАЛИБРОВКА ГРИДА — casual-режим без магических констант.
+ *
+ * Проблема размерных констант: hardStop «2%» ничего не значит сам по себе —
+ * на ликвидной паре это широченный стоп, на мем-коине — внутри минутного шума
+ * (стоп-хант гарантирован). То же с горизонтами: ось 720 минут мертва, если
+ * история не покрывает столько свечей после событий (все метки truncated).
+ *
+ * Решение: РАЗМЕР берём из данных, в коде остаются только БЕЗРАЗМЕРНЫЕ величины:
+ *  - масштаб шума = медианный |1m-ретёрн| по свечам ДО событий (медиана двойная:
+ *    по свечам события и по событиям — устойчива к пампам и выбросам);
+ *  - оси процентов = шум × безразмерные множители (сколько «минутных шумов»
+ *    должен пережить стоп/трейлинг), с клампами вменяемости;
+ *  - оси горизонтов = только те значения, которые история физически может
+ *    разметить (замер доступного форвард-покрытия от событий);
+ *  - staleness-минуты ≥ life-cap отбрасываются (никогда не сработают — мёртвая ось).
+ *
+ * Финальный выбор внутри осей остаётся за CV-перебором train — калибровка лишь
+ * ставит сетку в правильный масштаб и убирает заведомо мёртвые значения.
+ */
+interface CalibrationAxes {
+    hardStop?: number[];
+    trailingTake?: number[];
+    stalenessSinceProfit?: number[];
+    staleMinutes?: number[];
+    stalenessSinceMinutes?: number[];
+}
+interface Calibration {
+    /** медианный |1m-ретёрн| в %, масштаб шума данных; null = свечи не удалось получить */
+    noisePct: number | null;
+    /** p25 доступного форвард-покрытия от событий, минут; null = не измерено */
+    forwardCoverageMinutes: number | null;
+    /** сколько (symbol, ts)-точек реально просэмплировано */
+    sampledEvents: number;
+    /** какие оси заменены и на что (только заменённые) */
+    axes: CalibrationAxes;
+    /** человекочитаемое объяснение, что и почему выбрано */
+    reason: string;
+}
+/**
+ * Калибрует оси грида по данным. Ошибки getCandles на отдельных точках не роняют
+ * калибровку (точка пропускается); если не измерилось ничего — оси не заменяются,
+ * reason честно говорит о фолбэке на дефолт.
+ */
+declare function calibrateGrid(items: ParserItem[], getCandles: GetCandles, baseHorizons: {
+    staleMinutes: number[];
+    stalenessSinceMinutes: number[];
+}): Promise<Calibration>;
+
+/**
  * Параметры выбора конфигурации и валидации. Вынесены в одно место, чтобы в логике
  * train не было магических литералов — каждое число здесь именовано и объяснено.
  */
@@ -1123,6 +1185,15 @@ interface TrainOptions {
     metaPolicy?: MetaPolicy;
     /** явное отключение cadence-guard (осознанный обход, например в тестах/ресёрче) */
     ignoreCadence?: boolean;
+    /**
+     * Автокалибровка осей грида по данным (casual-режим). По умолчанию включается,
+     * когда grid НЕ передан: %-оси (hardStop/trailingTake/stalenessSinceProfit)
+     * масштабируются измеренным шумом 1m-свечей, оси горизонтов фильтруются по
+     * реальному покрытию истории. Явное true — калибровать и при частичном grid
+     * (только оси, которые пользователь не задал); false — никогда.
+     * Итог замеров сериализуется в meta.calibration (полный аудит).
+     */
+    autoCalibrate?: boolean;
     /**
      * Издержки исполнения round-trip (комиссии+проскальзывание), % от нотионала.
      * КОНСТАНТА СРЕДЫ, не ось grid: штампуется в каждый exit-набор, так что метки,
@@ -1238,6 +1309,12 @@ interface TrainedParams {
             /** уникальные тексты getCandles-исключений → счётчик (для adapter-error). */
             errors: Record<string, number>;
         };
+        /**
+         * Аудит автокалибровки (casual-режим): измеренный шум 1m-свечей, доступное
+         * форвард-покрытие и какие оси грида были выведены из данных. null =
+         * калибровка не запускалась (передан явный grid без autoCalibrate).
+         */
+        calibration?: Calibration | null;
     };
 }
 interface TrainResult {
@@ -1349,6 +1426,13 @@ declare class PumpMatrix {
      * не доказан — тогда модель торговать НЕ должна.
      */
     get certification(): Certification;
+    /**
+     * Аудит автокалибровки casual-режима: измеренный шум 1m-свечей, доступное
+     * форвард-покрытие, и какие оси грида были выведены из данных (с объяснением).
+     * null = fit шёл с явным grid (калибровка не запускалась) или модель из load()
+     * старого формата.
+     */
+    get calibration(): Calibration | null;
     /** Эмпирический импакт-горизонт поста в минутах (global-уровень). */
     get impactHorizonMinutes(): number;
     /**
@@ -1488,5 +1572,5 @@ declare class PumpMatrix {
  */
 declare function predict(parserItems: ParserItem[], config?: Partial<DetectorConfig>): PredictionResult;
 
-export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
-export type { AuthorMap, BacktestResult, BacktestSignal, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };
+export { CASCADE_AGGRESSION, DEFAULT_CONFIG, DEFAULT_GRID, DEFAULT_META_POLICY, DEFAULT_POLICY, DEFAULT_RELIABILITY, DEFAULT_SELECTION, DEFAULT_VIABILITY, MAX_CANDLES_PER_CHUNK, PumpMatrix, STEP_MS, alignTs, assessViability, buildTable, buildWindowedTable, calibrateGrid, canRefit, cascadeAggressionOf, certifyStrategy, clusterAuthors, computeReliability, conservatismKey, deflatedSharpe, earlyWarning, effectiveTrials, emptyLedger, entryStartTs, enumerateBursts, enumeratePosts, exitKey, expectedMaxSharpe, fetchCandlesChunked, fitAttemptCount, intersectPolicy, isMoreConservative, jaccardPair, jaccardScreen, kurtosis, labelBurst, lagXCorr, loadPredict, mean, minTrackRecordLength, mulberry32, normalCdf, normalInv, oneStandardErrorSelect, percentile, pnlStats, predict, probabilityOfBacktestOverfitting, realityCheckPValue, recordAttempt, replayExit, resolveExit, resolveExitNoRegime, riskRewardStats, selfTuneLag, sharpe, shrinkageExpectancy, silentProgress, singleChannelSignals, skewness, squeezePressure, standardError, stationaryBootstrapResample, stdev, stdoutProgress, train, variance, volRegimeOf, volumeFeatures, volumeZScore, windowEvents, winrate };
+export type { AuthorMap, BacktestResult, BacktestSignal, Calibration, CalibrationAxes, CandleInterval, Certification, CertificationInput, DetectorConfig, DetectorMode, Direction, ExitParams, ExitPlan, ExitReason, ExitTensor, FitAttempt, GetCandles, ICandleData, LabeledBurst, MetaLedgerState, MetaPolicy, ParserItem, PnlStats, PredictionResult, ProgressEvent, ProgressFn, PumpVerdict, Reliability, ReliabilityConfig, ReliabilityInput, ReplayResult, ResolveSource, ResolvedExit, RiskRewardStats, SelectionConfig, SignalAction, SignalEvent, SignalOrigin, SignalPolicy, SignalRecord, TradeSignal, TrainGrid, TrainOptions, TrainResult, TrainedParams, ViabilityConfig, ViabilityReport, VolRegime, VolumeFeatures };

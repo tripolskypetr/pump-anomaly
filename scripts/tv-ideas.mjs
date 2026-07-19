@@ -77,18 +77,31 @@ async function* iterIdeas(params, { maxPages = 5, delay = 800 } = {}) {
       per_page: "24",
       locale: "en",
     });
-    const res = await fetch(`${API}?${qs}`, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "application/json",
-        Referer: "https://www.tradingview.com/",
-      },
-    });
-    if (res.status === 429) {
-      // Cloudflare rate-limit — подождать и повторить ту же страницу
-      await sleep(5000);
-      page--;
-      continue;
+    // Анти-хэнг: у каждого запроса дедлайн (fetch без таймаута = неявная ∞),
+    // у ретраев — кап (вечный `page--` при перманентном блоке = вечный цикл).
+    let res = null;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        res = await fetch(`${API}?${qs}`, {
+          headers: {
+            "User-Agent": UA,
+            Accept: "application/json",
+            Referer: "https://www.tradingview.com/",
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
+      } catch (e) {
+        if (attempt >= 5) throw new Error(`сеть не ответила на стр. ${page} после 5 попыток: ${e.message}`);
+        await sleep(2000 * attempt);
+        continue;
+      }
+      if (res.status === 429) {
+        // Cloudflare rate-limit — подождать и повторить, но не вечно
+        if (attempt >= 5) throw new Error(`rate-limit на стр. ${page} после 5 попыток`);
+        await sleep(5000 * attempt);
+        continue;
+      }
+      break;
     }
     if (!res.ok) throw new Error(`HTTP ${res.status} on page ${page}`);
     const data = await res.json();

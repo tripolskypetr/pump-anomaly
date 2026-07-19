@@ -483,7 +483,18 @@ interface Edge {
  * канала в пределах |Δ| ≤ window. Симметризованный Jaccard.
  */
 declare function jaccardPair(tbl: EventTable, a: string, b: string, window: number): number;
-/** Слой 2 — грубое сито: все пары каналов с Jaccard ≥ threshold. */
+/**
+ * Слой 2 — грубое сито: все пары каналов с Jaccard ≥ threshold.
+ *
+ * НЕ полный перебор C² пар (2250 каналов → 2.5 млн пар × скан всех ключей =
+ * миллиарды lookup'ов, часы CPU). Два ТОЧНЫХ отсечения, не меняющих результат:
+ *  1) пара без общих (symbol,dir)-ключей имеет jaccard = 0 < threshold —
+ *     кандидаты генерируются только из со-активности на общих ключах;
+ *  2) верхняя граница jaccard ≤ 2·min(nA,nB)/(nA+nB) (Σ min по ключам
+ *     субаддитивна): скальпер×редкий автор отсекаются одной проверкой целых.
+ * Точный two-pointer считается только для выживших пар и только по ключам
+ * МЕНЬШЕГО канала (не по всем ключам таблицы).
+ */
 declare function jaccardScreen(tbl: EventTable, window: number, threshold: number): Edge[];
 
 interface DirectedEdge extends Edge {

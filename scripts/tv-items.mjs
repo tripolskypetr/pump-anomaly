@@ -34,12 +34,17 @@ export async function binanceSymbols() {
  *  (EURUSDT существует!), но это FX-прокси, не крипта — пампы не про них */
 const FIAT_BASES = new Set(["EUR", "GBP", "AUD", "NZD", "JPY", "CHF", "CAD", "TRY", "XAU", "XAG", "XTI", "XPT"]);
 
+/** переименованные монеты: идеи со старым тикером → текущий символ Binance
+ *  (историю до ре-листинга свечной кэш сам тянет под старым символом) */
+const TICKER_RENAMES = { TON: "GRAM", MATIC: "POL", FTM: "S" };
+
 /** BTCUSD / BTCUSD.P / BTCUSDT / BTCUSDC → BTCUSDT (кандидат; валидность решает биржа) */
 export function toBinanceSymbol(shortName) {
   const s = String(shortName ?? "").toUpperCase().replace(/\.P[S]?$/, "");
   const m = s.match(/^([A-Z0-9]{2,15}?)(USDT|USDC|USD)$/);
   if (!m || FIAT_BASES.has(m[1])) return null;
-  return `${m[1]}USDT`;
+  const base = TICKER_RENAMES[m[1]] ?? m[1];
+  return `${base}USDT`;
 }
 
 /** архив → ParserItem[]; отчёт о причинах отсева — вторым полем */

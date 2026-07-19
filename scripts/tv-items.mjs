@@ -30,11 +30,16 @@ export async function binanceSymbols() {
   return new Set(list);
 }
 
+/** фиат/сырьё: форекс-идеи (EURUSD и т.п.) мапятся на реальные Binance-пары
+ *  (EURUSDT существует!), но это FX-прокси, не крипта — пампы не про них */
+const FIAT_BASES = new Set(["EUR", "GBP", "AUD", "NZD", "JPY", "CHF", "CAD", "TRY", "XAU", "XAG", "XTI", "XPT"]);
+
 /** BTCUSD / BTCUSD.P / BTCUSDT / BTCUSDC → BTCUSDT (кандидат; валидность решает биржа) */
 export function toBinanceSymbol(shortName) {
   const s = String(shortName ?? "").toUpperCase().replace(/\.P[S]?$/, "");
   const m = s.match(/^([A-Z0-9]{2,15}?)(USDT|USDC|USD)$/);
-  return m ? `${m[1]}USDT` : null;
+  if (!m || FIAT_BASES.has(m[1])) return null;
+  return `${m[1]}USDT`;
 }
 
 /** архив → ParserItem[]; отчёт о причинах отсева — вторым полем */

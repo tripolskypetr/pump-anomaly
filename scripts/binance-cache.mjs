@@ -55,10 +55,12 @@ async function fetchKlines(symbol, startTime, limit) {
   throw new Error("binance rate-limited после 5 попыток");
 }
 
+const filePathOf = (symbol, dayStart) =>
+  `${CACHE}/${symbol}-${new Date(dayStart).toISOString().slice(0, 10)}.json`;
+
 /** день [dayStart, dayStart+24h) → 1440 компактных свечей [ts,o,h,l,c,v] */
 async function loadDay(symbol, dayStart) {
-  const key = `${symbol}-${new Date(dayStart).toISOString().slice(0, 10)}`;
-  const file = `${CACHE}/${key}.json`;
+  const file = filePathOf(symbol, dayStart);
   if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
   // переименованный тикер: за историей до ре-листинга идём под старым символом
   const ren = RENAMES[symbol];
@@ -76,11 +78,74 @@ async function loadDay(symbol, dayStart) {
   return rows;
 }
 
-const mem = new Map(); // in-memory поверх диска
+// In-memory LRU поверх диска. КАП обязателен: 30-40k (symbol,день)-пар по
+// ~150КБ распарсенных свечей — это гигабайты; диск — истина, память — окно.
+const MEM_CAP = 2048;
+const mem = new Map();
 async function dayOf(symbol, dayStart) {
   const key = `${symbol}|${dayStart}`;
-  if (!mem.has(key)) mem.set(key, loadDay(symbol, dayStart));
-  return mem.get(key);
+  const hit = mem.get(key);
+  if (hit) { // LRU: освежить позицию
+    mem.delete(key);
+    mem.set(key, hit);
+    return hit;
+  }
+  const p = loadDay(symbol, dayStart);
+  mem.set(key, p);
+  if (mem.size > MEM_CAP) mem.delete(mem.keys().next().value);
+  return p;
+}
+
+/** только гарантирует файл на диске — БЕЗ удержания свечей в памяти (для префетча) */
+async function ensureDay(symbol, dayStart) {
+  if (existsSync(filePathOf(symbol, dayStart))) return;
+  await loadDay(symbol, dayStart);
+}
+
+/**
+ * ПРЕФЕТЧ: скачать все (symbol, день)-пары ЗАРАНЕЕ с параллелизмом, чтобы фаза
+ * математики не дёргала event loop сетевыми await'ами. Разметка с холодным кэшем
+ * перемежает IO и CPU — воркеры ждут сеть по одному запросу, процессор простаивает;
+ * префетч насыщает сеть N параллельными загрузками, затем математика идёт без
+ * единого сетевого ожидания. Идемпотентен (диск-кэш) — прерванный перезапускается.
+ */
+export async function prefetchDays(pairs, { concurrency = 12, onProgress } = {}) {
+  // дедуп по (symbol, day)
+  const uniq = new Map();
+  for (const p of pairs) uniq.set(`${p.symbol}|${p.day}`, p);
+  const queue = [...uniq.values()];
+  let done = 0;
+  const failedSymbols = new Set();
+  const worker = async () => {
+    for (;;) {
+      const p = queue.pop();
+      if (!p) return;
+      try {
+        await ensureDay(p.symbol, p.day); // диск наполняется, память не растёт
+      } catch (e) {
+        // битый символ/день не валит префетч: разметка честно получит ту же
+        // ошибку как adapter-error. Смерть сети убивает процесс в fetchKlines.
+        if (!failedSymbols.has(p.symbol)) {
+          failedSymbols.add(p.symbol);
+          console.error(`префетч ${p.symbol}: ${e.message}`);
+        }
+      }
+      done++;
+      if (onProgress && done % 500 === 0) onProgress(done, uniq.size);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, queue.length || 1) }, worker));
+  if (onProgress) onProgress(done, uniq.size);
+  return { days: uniq.size, failedSymbols: [...failedSymbols] };
+}
+
+/** (symbol, ts-диапазон) → список дней для префетча */
+export function daysForRange(symbol, fromTs, toTs) {
+  const out = [];
+  for (let d = Math.floor(fromTs / DAY) * DAY; d <= toTs; d += DAY) {
+    out.push({ symbol, day: d });
+  }
+  return out;
 }
 
 /** GetCandles-контракт либы: align вниз, ровно limit свечей от sDate (или меньше у края) */

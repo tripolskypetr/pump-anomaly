@@ -5,7 +5,7 @@
  * Свечи — дисковый день-кэш Binance (scripts/binance-cache.mjs).
  */
 import { writeFileSync } from "node:fs";
-import { getCandles, requestCount } from "./binance-cache.mjs";
+import { getCandles, requestCount, prefetchDays, daysForRange } from "./binance-cache.mjs";
 import { loadTvItems } from "./tv-items.mjs";
 import { train, calibrateGrid, DEFAULT_GRID, PumpMatrix, inspectItems } from "../build/index.mjs";
 
@@ -33,6 +33,26 @@ const grid = {
   ...cal.axes,
 };
 
+// ── ФАЗА 1: ПРЕФЕТЧ — все свечи скачиваются ДО математики ──
+// Разметка с холодным кэшем перемежает IO и CPU (воркеры ждут сеть, процессор
+// простаивает). Считаем полный набор (symbol, день) под окна разметки:
+// назад — momentum/пре-фичи (1440м) и фон BTC, вперёд — жизнь метки (2·stale+5).
+const MIN_MS = 60_000;
+const staleMax = Math.max(...grid.staleMinutes);
+const momBack = 1440 + 5;
+const pairs = [];
+for (const it of items) {
+  pairs.push(...daysForRange(it.symbol, it.ts - momBack * MIN_MS, it.ts + (2 * staleMax + 5) * MIN_MS));
+  pairs.push(...daysForRange("BTCUSDT", it.ts - momBack * MIN_MS, it.ts)); // market-фон
+}
+const tPre = Date.now();
+const pre = await prefetchDays(pairs, {
+  concurrency: 12,
+  onProgress: (d, total) => console.log(`[префетч ${((Date.now() - tPre) / 60000).toFixed(1)}м] ${d}/${total} дней (req=${requestCount()})`),
+});
+console.log(`префетч: ${pre.days} (symbol,день)-пар за ${((Date.now() - tPre) / 60000).toFixed(1)} мин; битые символы: ${pre.failedSymbols.length ? pre.failedSymbols.join(",") : "нет"}`);
+
+// ── ФАЗА 2: МАТЕМАТИКА — по горячему кэшу, без сетевых ожиданий ──
 const t0 = Date.now();
 const res = await train(items, getCandles, {
   grid, // mode auto: viability сама решит matrix vs single

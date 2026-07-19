@@ -1012,7 +1012,6 @@ interface LabelResult {
     /** текст брошенного getCandles исключения (только при outcome="adapter-error"). */
     error?: string;
 }
-/** Стабильный строковый ключ exit-набора для кэша/grid. */
 declare const exitKey: (p: ExitParams) => string;
 /**
  * Достаёт 1m-свечи от события вперёд на покрытие максимального life-cap и

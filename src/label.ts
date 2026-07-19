@@ -36,11 +36,24 @@ export interface LabelResult {
   error?: string;
 }
 
-/** Стабильный строковый ключ exit-набора для кэша/grid. */
-export const exitKey = (p: ExitParams): string =>
-  `tt${p.trailingTake}|hs${p.hardStop}|sp${p.stalenessSinceProfit}|sm${p.stalenessSinceMinutes}|life${p.staleMinutes}` +
-  `|vz${p.volZThreshold ?? "_"}|pol${p.squeezePolicy ?? "none"}|sqt${p.squeezeThreshold ?? "_"}|bw${p.volBaselineWindow ?? "_"}|cw${p.cascadeWindowMinutes ?? "_"}` +
-  `|tf${p.tightenFactor ?? "_"}|rc${p.roundTripCostPct ?? "_"}|sl${p.slippageRangeFrac ?? "_"}`; // tightenFactor/издержки меняют replay — без них разные exit коллизируют в одном ключе
+/**
+ * Стабильный строковый ключ exit-набора для кэша/grid.
+ * ИНТЕРНИРОВАН по объекту (WeakMap): exit-наборы шарятся между всеми кандидатами,
+ * и без мемо каждый кандидат строил СВОИ копии тех же ~3.5k строк-ключей — на 17k
+ * кандидатов это 59 млн строк и гигабайты. С мемо ключей ровно столько, сколько
+ * уникальных наборов; Map разметки ссылаются на одни и те же строки.
+ */
+const exitKeyMemo = new WeakMap<ExitParams, string>();
+export const exitKey = (p: ExitParams): string => {
+  const hit = exitKeyMemo.get(p);
+  if (hit !== undefined) return hit;
+  const k =
+    `tt${p.trailingTake}|hs${p.hardStop}|sp${p.stalenessSinceProfit}|sm${p.stalenessSinceMinutes}|life${p.staleMinutes}` +
+    `|vz${p.volZThreshold ?? "_"}|pol${p.squeezePolicy ?? "none"}|sqt${p.squeezeThreshold ?? "_"}|bw${p.volBaselineWindow ?? "_"}|cw${p.cascadeWindowMinutes ?? "_"}` +
+    `|tf${p.tightenFactor ?? "_"}|rc${p.roundTripCostPct ?? "_"}|sl${p.slippageRangeFrac ?? "_"}`; // tightenFactor/издержки меняют replay — без них разные exit коллизируют в одном ключе
+  exitKeyMemo.set(p, k);
+  return k;
+};
 
 /**
  * Достаёт 1m-свечи от события вперёд на покрытие максимального life-cap и
@@ -98,6 +111,9 @@ export async function labelBurst(
       `|${p.volBaselineWindow ?? "_"}|${p.cascadeWindowMinutes ?? "_"}|${p.tightenFactor ?? "_"}|${p.roundTripCostPct ?? "_"}|${p.slippageRangeFrac ?? "_"}|${pol}|${sqt}`;
   };
   const memo = new Map<string, ReplayResult>();
+  // режимные варианты пути тоже шарятся: {…base, volRegime} на КАЖДЫЙ набор
+  // плодил бы копии полного ReplayResult — на больших гридах это гигабайты
+  const variants = new Map<string, ReplayResult>();
   const byExit = new Map<string, ReplayResult>();
   for (const ex of exitSets) {
     const mk = pathKey(ex);
@@ -109,7 +125,16 @@ export async function labelBurst(
     // volRegime зависит от volZThreshold данного набора — выводим из общего volZ
     // (та же формула, что внутри replayExit; результат побитово эквивалентен).
     const regime = volRegimeOf(base.volZ, ex.volZThreshold ?? 2.0);
-    const r = regime === base.volRegime ? base : { ...base, volRegime: regime };
+    let r = base;
+    if (regime !== base.volRegime) {
+      const vk = `${mk}|${regime}`;
+      let v = variants.get(vk);
+      if (!v) {
+        v = { ...base, volRegime: regime };
+        variants.set(vk, v);
+      }
+      r = v;
+    }
     // отбрасываем метку с НЕПОЛНЫМ горизонтом: в боковике вход случился поздно,
     // и после него не хватило свечей на полный life-cap. Иначе 24ч-горизонт
     // сравнивался бы с 1ч-горизонтом по обрезанному до пары часов пути — это
@@ -119,7 +144,10 @@ export async function labelBurst(
     byExit.set(exitKey(ex), r);
   }
 
-  const anyEntered = [...byExit.values()].some((r) => r.entered);
+  let anyEntered = false;
+  for (const r of byExit.values()) {
+    if (r.entered) { anyEntered = true; break; }
+  }
   if (byExit.size === 0 || !anyEntered) {
     return { outcome: "no-entry", burst: null };
   }

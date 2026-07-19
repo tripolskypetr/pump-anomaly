@@ -735,12 +735,21 @@ export async function train(
         // veto-вход (entered=false, reason=cascade-veto) тоже несёт сигнал: его pnl=0,
         // и он ДОЛЖЕН учитываться как «не вошли и не потеряли», иначе policy=veto нечестно
         // сравнивать с policy=none. Поэтому храним и не-entered, помечая флагом.
+        // ДЕДУП по ссылке на источник: labelBurst шарит ReplayResult между
+        // exit-наборами с одинаковым путём — копия на КАЖДЫЙ набор разрывала
+        // шаринг (3.5k объектов на кандидата вместо сотен уникальных путей).
+        const recOf = new Map<import("./replay").ReplayResult, ExitRec>();
         for (const [k, r] of burst.byExit) {
-          byExit.set(k, {
-            pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
-            entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
-            heldMinutes: r.heldMinutes, peak: r.peak, trough: r.trough, inverted: r.inverted,
-          });
+          let rec = recOf.get(r);
+          if (!rec) {
+            rec = {
+              pnl: r.pnl, volRegime: r.volRegime, entered: r.entered,
+              entryPrice: r.entryPrice, exitPrice: r.exitPrice, reason: r.reason,
+              heldMinutes: r.heldMinutes, peak: r.peak, trough: r.trough, inverted: r.inverted,
+            };
+            recOf.set(r, rec);
+          }
+          byExit.set(k, rec);
         }
         if (byExit.size === 0) continue;
         const pre = await preFeaturesOf(b.symbol, b.ts);
